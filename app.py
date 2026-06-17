@@ -12,8 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import db
+from ask_router import answer_question
 from extractor import parse_and_save
-from query import answer_question
 
 load_dotenv()
 
