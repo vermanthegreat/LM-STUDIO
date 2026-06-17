@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 import db
 from llm import chat_completion, call_lmstudio_for_text
 
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
 
 @dataclass(frozen=True)
 class AskIntent:
@@ -43,7 +45,7 @@ _STOPWORDS = {
     "find", "show", "list", "give", "lead", "leads", "agency", "agencies",
     "company", "companies", "koje", "koja", "koji", "rade", "radi", "agencije",
     "agencija", "kompanije", "klijenti", "daj", "nadji", "prikazi", "imamo", "ima",
-    "bazi", "preko", "iznad",
+    "bazi", "preko", "iznad", "mail", "email", "kontakt", "contact",
 }
 
 
@@ -97,7 +99,10 @@ def _deterministic_intent(question: str) -> AskIntent:
         if q.startswith(prefix):
             return AskIntent("summarize_company", company=question[len(prefix):].strip(), confidence=1.0)
 
-    if any(term in q for term in ("product description", "opis proizvoda", "opisi proizvoda", "seo", "copywriting", "content")):
+    if any(term in q for term in (
+        "product description", "opis proizvoda", "opisi proizvoda", "seo", "copywriting", "content",
+        "email", "mail", "contact", "kontakt",
+    )):
         return AskIntent(
             "search_leads",
             query=question,
@@ -122,9 +127,10 @@ Allowed intents:
 - search_leads
 - unknown
 
-Use search_leads for free-form filtering by service, location, industry, partner tier, score, status, company text, description, or contact availability.
+Use search_leads for free-form filtering by service, location, industry, partner tier, score, status, company text, description, email/contact requests, or contact availability.
 
-Available lead fields: company_name, website, partner_tier, rating, review_count, primary_location, services, locations, industries, description, fit_score, status, people_count, has_decision_maker.
+Available lead fields: company_name, website, company_email, partner_tier, rating, review_count, primary_location, services, locations, industries, description, fit_score, status, people_count, has_decision_maker.
+Raw pasted sources can also contain email addresses even when company_email is empty.
 
 JSON schema:
 {{
@@ -198,11 +204,11 @@ def _execute_intent(intent: AskIntent, **kwargs) -> Dict[str, Any]:
 
     if intent.name == "top_leads":
         leads = db.get_top_leads(intent.limit, **kwargs)
-        return {"intent": intent.name, "answer": _format_leads(leads, "Top leads:"), "data": {"leads": leads}}
+        return {"intent": intent.name, "answer": _format_leads(leads, "Top leads:", **kwargs), "data": {"leads": _attach_contact_fields(leads, **kwargs)}}
 
     if intent.name == "leads_without_contacts":
         leads = db.get_leads_without_contacts(**kwargs)
-        return {"intent": intent.name, "answer": _format_leads(leads, "Leads without contacts:"), "data": {"leads": leads}}
+        return {"intent": intent.name, "answer": _format_leads(leads, "Leads without contacts:", **kwargs), "data": {"leads": _attach_contact_fields(leads, **kwargs)}}
 
     if intent.name == "followups_due":
         items = db.get_followups_due(**kwargs)
@@ -220,15 +226,17 @@ def _execute_intent(intent: AskIntent, **kwargs) -> Dict[str, Any]:
         if not rows:
             return {"intent": intent.name, "answer": f"Nema leada za '{intent.company}'.", "data": {}}
         lead = db.get_lead(rows[0]["id"], **kwargs)
+        lead = _attach_contact_fields([lead], **kwargs)[0] if lead else lead
         return {"intent": intent.name, "answer": _summarize_lead(lead), "data": {"lead": lead}}
 
     if intent.name == "search_leads":
         leads = db.list_leads(**kwargs)
         matches = _search_leads(leads, intent)
+        hydrated = _attach_contact_fields(matches, **kwargs)
         return {
             "intent": intent.name,
-            "answer": _format_search(matches, intent),
-            "data": {"leads": matches, "parsed_query": intent.query, "filters": intent.filters or {}, "confidence": intent.confidence},
+            "answer": _format_search(hydrated, intent),
+            "data": {"leads": hydrated, "parsed_query": intent.query, "filters": intent.filters or {}, "confidence": intent.confidence},
         }
 
     return _unknown(**kwargs)
@@ -328,12 +336,58 @@ def _basic_filters(q: str) -> Dict[str, Any]:
     return filters
 
 
-def _format_leads(leads: List[Dict[str, Any]], header: str) -> str:
-    if not leads:
+def _attach_contact_fields(leads: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
+    result = []
+    for lead in leads:
+        enriched = dict(lead or {})
+        lead_id = enriched.get("id")
+        detail = None
+        if lead_id is not None:
+            try:
+                detail = db.get_lead(int(lead_id), **kwargs)
+            except Exception:
+                detail = None
+        if detail:
+            enriched.update({k: v for k, v in detail.items() if k not in enriched or enriched.get(k) in (None, "", [], {})})
+        emails = _collect_emails(enriched)
+        enriched["emails"] = emails
+        enriched["email_display"] = ", ".join(emails) if emails else "n/a"
+        result.append(enriched)
+    return result
+
+
+def _collect_emails(lead: Dict[str, Any]) -> List[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        if not value:
+            return
+        for match in EMAIL_RE.findall(str(value)):
+            low = match.lower()
+            if low.endswith(("shopify.com", "myshopify.com")) or low in seen:
+                continue
+            seen.add(low)
+            found.append(match)
+
+    add(lead.get("company_email"))
+    for source in lead.get("raw_sources") or []:
+        if isinstance(source, dict):
+            add(source.get("raw_text"))
+            add(source.get("parsed_json"))
+    return found
+
+
+def _format_leads(leads: List[Dict[str, Any]], header: str, **kwargs) -> str:
+    enriched = _attach_contact_fields(leads, **kwargs)
+    if not enriched:
         return f"{header}\n(none)"
     lines = [header]
-    for lead in leads[:20]:
-        lines.append(f"- {lead.get('company_name') or '?'} (fit={lead.get('fit_score', 0)}, status={lead.get('status')})")
+    for lead in enriched[:20]:
+        lines.append(
+            f"- {lead.get('company_name') or '?'} "
+            f"(fit={lead.get('fit_score', 0)}, status={lead.get('status')}, email={lead.get('email_display')})"
+        )
     return "\n".join(lines)
 
 
@@ -351,7 +405,8 @@ def _format_search(leads: List[Dict[str, Any]], intent: AskIntent) -> str:
             f"- {lead.get('company_name') or '?'} "
             f"(fit={lead.get('fit_score', 0)}, status={lead.get('status')}, "
             f"tier={lead.get('partner_tier') or 'n/a'}, location={location}, "
-            f"services={service_text}, website={lead.get('website') or 'n/a'})"
+            f"services={service_text}, website={lead.get('website') or 'n/a'}, "
+            f"email={lead.get('email_display') or 'n/a'})"
         )
     return "\n".join(lines)
 
@@ -364,6 +419,7 @@ def _summarize_lead(lead: Optional[Dict[str, Any]]) -> str:
     lines = [
         f"**{lead.get('company_name')}**",
         f"Website: {lead.get('website') or 'n/a'}",
+        f"Email: {lead.get('email_display') or 'n/a'}",
         f"Partner tier: {lead.get('partner_tier') or 'n/a'}",
         f"Fit score: {lead.get('fit_score', 0)}",
         f"Status: {lead.get('status')}",
@@ -388,7 +444,7 @@ def _unknown(**kwargs) -> Dict[str, Any]:
 def _polish_answer(question: str, answer: str, data: Dict[str, Any]) -> Optional[str]:
     return chat_completion(
         [
-            {"role": "system", "content": "Summarize database results. Use only provided data. Do not invent."},
+            {"role": "system", "content": "Summarize database results. Use only provided data. Do not invent. Preserve email fields exactly."},
             {"role": "user", "content": f"Question: {question}\n\nAnswer draft:\n{answer}\n\nData:\n{data}"},
         ],
         temperature=0.0,
@@ -405,7 +461,7 @@ def _filter_terms(filters: Dict[str, Any]) -> List[str]:
 
 def _blob(lead: Dict[str, Any]) -> str:
     values: list[str] = []
-    for key in ("company_name", "website", "partner_tier", "primary_location", "description", "status"):
+    for key in ("company_name", "website", "company_email", "partner_tier", "primary_location", "description", "status"):
         if lead.get(key):
             values.append(str(lead.get(key)))
     for key in ("services", "locations", "industries", "supported_locations", "languages"):
