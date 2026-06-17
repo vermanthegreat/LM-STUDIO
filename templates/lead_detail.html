@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ lead.company_name }} — LM Studio</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>{{ lead.company_name }}</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/ask">Ask Database</a>
+    </nav>
+  </header>
+  <main>
+    {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+
+    <div class="card grid-2">
+      <div>
+        <h2>Company</h2>
+        <p><strong>Website:</strong> {{ lead.website or 'n/a' }}</p>
+        <p><strong>Email:</strong> {{ lead.company_email or 'n/a' }}</p>
+        <p><strong>Phone:</strong> {{ lead.company_phone or 'n/a' }}</p>
+        <p><strong>Primary location:</strong> {{ lead.primary_location or 'n/a' }}</p>
+        <p><strong>Supported locations:</strong> {{ (lead.supported_locations or [])|join(', ') or 'n/a' }}</p>
+        <p><strong>Languages:</strong> {{ (lead.languages or [])|join(', ') or 'n/a' }}</p>
+        <p><strong>Rating / reviews:</strong>
+          {% if lead.rating is not none %}{{ lead.rating }}{% else %}n/a{% endif %}
+          {% if lead.review_count is not none %} ({{ lead.review_count }} reviews){% endif %}
+        </p>
+        <p><strong>Partner since:</strong> {{ lead.partner_since or 'n/a' }}</p>
+        <p><strong>Extracted tier:</strong> {{ lead.partner_tier or 'n/a' }}</p>
+        <p><strong>Plus Partner signal:</strong> {{ 'yes' if lead.plus_partner_signal else 'no' }}</p>
+        <p><strong>Source filter tier:</strong> {{ lead.source_filter_tier or 'n/a' }}</p>
+        <p><strong>Fit score:</strong> {{ lead.fit_score }}</p>
+        <p><strong>Status:</strong> {{ lead.status }}</p>
+        <p><strong>Services:</strong> {{ (lead.services or [])|join(', ') or 'n/a' }}</p>
+        <p><strong>Industries:</strong> {{ (lead.industries or [])|join(', ') or 'n/a' }}</p>
+        {% if lead.description %}<p><strong>Description:</strong> {{ lead.description }}</p>{% endif %}
+      </div>
+      <div>
+        <h2>Stats</h2>
+        <p>People: {{ lead.people|length }}</p>
+        <p>Interactions: {{ lead.interactions|length }}</p>
+        <p>Tasks: {{ lead.tasks|length }}</p>
+        <p>Raw sources: {{ lead.raw_sources|length }}</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>People</h2>
+      <table>
+        <thead><tr><th>Name</th><th>Title</th><th>LinkedIn</th><th>DM</th><th>Relevant</th></tr></thead>
+        <tbody>
+          {% for p in lead.people %}
+          <tr>
+            <td>{{ p.name }}</td>
+            <td>{{ p.title or '—' }}</td>
+            <td>{% if p.linkedin_url %}<a href="{{ p.linkedin_url }}" target="_blank">link</a>{% else %}—{% endif %}</td>
+            <td>{{ 'yes' if p.is_decision_maker else 'no' }}</td>
+            <td>{{ 'yes' if p.is_relevant_contact else 'no' }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5">No contacts yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Interactions / Emails</h2>
+      {% for i in lead.interactions %}
+      <div style="margin-bottom:1rem;border-bottom:1px solid #eee;padding-bottom:0.75rem;">
+        <strong>{{ i.subject or i.type }}</strong>
+        {% if i.reply_needed %}<span class="badge warn">reply needed</span>{% endif %}
+        <p>{{ i.summary or '' }}</p>
+        <small>Deadline: {{ i.deadline or '—' }} | Next: {{ i.next_action or '—' }}</small>
+      </div>
+      {% else %}
+      <p>No interactions.</p>
+      {% endfor %}
+    </div>
+
+    <div class="card">
+      <h2>Tasks</h2>
+      <table>
+        <thead><tr><th>Title</th><th>Due</th><th>Priority</th><th>Status</th></tr></thead>
+        <tbody>
+          {% for t in lead.tasks %}
+          <tr>
+            <td>{{ t.title }}</td>
+            <td>{{ t.due_date or '—' }}</td>
+            <td>{{ t.priority or '—' }}</td>
+            <td>{{ t.status }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4">No tasks.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Sources</h2>
+      {% if lead.raw_sources %}
+      <div class="source-canonical" style="margin-bottom:1rem;">
+        <h3>Latest parsed source</h3>
+        <p>
+          <span class="badge">{{ lead.canonical_source.source_type }}</span>
+          {{ lead.canonical_source.created_at[:19] }}
+          ({{ lead.canonical_source.extraction_status }})
+          {% if lead.canonical_source.source_filter_tier %}
+          <span class="badge">filter: {{ lead.canonical_source.source_filter_tier }}</span>
+          {% endif %}
+        </p>
+        {% if lead.canonical_source.parsed_json %}
+        <details open>
+          <summary>Parsed fields</summary>
+          <pre style="white-space:pre-wrap;font-size:0.85rem;">{{ lead.canonical_source.parsed_json | tojson(indent=2) }}</pre>
+        </details>
+        {% endif %}
+        <details>
+          <summary>Raw text</summary>
+          <pre style="white-space:pre-wrap;font-size:0.85rem;">{{ lead.canonical_source.raw_text[:4000] }}{% if lead.canonical_source.raw_text|length > 4000 %}...{% endif %}</pre>
+        </details>
+      </div>
+      {% else %}
+      <p>No raw sources linked.</p>
+      {% endif %}
+
+      {% if lead.source_history %}
+      <details>
+        <summary>Older source history ({{ lead.source_history|length }})</summary>
+        {% for rs in lead.source_history %}
+        <details style="margin:0.75rem 0;">
+          <summary>{{ rs.source_type }} — {{ rs.created_at[:19] }} ({{ rs.extraction_status }})</summary>
+          {% if rs.source_filter_tier %}<p><small>Source filter tier: {{ rs.source_filter_tier }}</small></p>{% endif %}
+          <pre style="white-space:pre-wrap;font-size:0.85rem;">{{ rs.raw_text[:2000] }}{% if rs.raw_text|length > 2000 %}...{% endif %}</pre>
+        </details>
+        {% endfor %}
+      </details>
+      {% endif %}
+    </div>
+  </main>
+</body>
+</html>

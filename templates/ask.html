@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ask Database — LM Studio</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Ask Database</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/ask">Ask Database</a>
+      <a href="/export/csv">CSV Export</a>
+    </nav>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Natural language query</h2>
+      <p>Ask in plain language. LM Studio reads PostgreSQL via read-only database tools and returns an answer.</p>
+      <ul>
+        <li>How many companies do we have?</li>
+        <li>show top leads / top companies by fit score</li>
+        <li>companies without contacts</li>
+        <li>find contacts at Acme Agency</li>
+        <li>summarize company Shero Commerce</li>
+      </ul>
+      <form method="post" action="/ask">
+        <label for="question">Question</label>
+        <input type="text" name="question" id="question" required
+               value="{{ result.question if result else '' }}"
+               placeholder="How many companies do we have?">
+        <label><input type="checkbox" name="use_llm" value="true" checked> Use LM Studio (recommended)</label>
+        <button type="submit">Ask</button>
+      </form>
+    </div>
+
+    {% if result %}
+    <div class="card">
+      <h2>Answer <span class="badge">{{ result.intent }}</span></h2>
+      <pre class="answer">{{ result.answer }}</pre>
+    </div>
+    {% endif %}
+  </main>
+</body>
+</html>

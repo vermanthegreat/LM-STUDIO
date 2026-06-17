@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paste Lead — LM Studio</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Lead Intelligence (Manual Paste)</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/ask">Ask Database</a>
+      <a href="/export/csv">CSV Export</a>
+    </nav>
+  </header>
+  <main>
+    {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+    <div class="card">
+      <h2>Paste source text</h2>
+      <p>Copy Shopify Partner Directory, LinkedIn, website, or email text manually (Ctrl+A / Ctrl+C), then paste below.</p>
+      <form method="post" action="/parse">
+        <label for="source_type">Source type</label>
+        <select name="source_type" id="source_type">
+          <option value="shopify_directory">Shopify Partner Directory</option>
+          <option value="linkedin_company">LinkedIn Company</option>
+          <option value="linkedin_person">LinkedIn Person</option>
+          <option value="website">Website</option>
+          <option value="email">Email</option>
+          <option value="note">Note</option>
+        </select>
+
+        <label for="source_url">Source URL (optional)</label>
+        <input type="url" name="source_url" id="source_url" placeholder="https://...">
+
+        <label for="attach_to_lead_id">Attach to company (optional)</label>
+        <select name="attach_to_lead_id" id="attach_to_lead_id">
+          <option value="">— auto-detect —</option>
+          {% for l in leads %}
+          <option value="{{ l.id }}">{{ l.company_name }}</option>
+          {% endfor %}
+        </select>
+
+        <label for="raw_text">Pasted text</label>
+        <textarea name="raw_text" id="raw_text" required placeholder="Paste copied page text here..."></textarea>
+
+        <button type="submit">Parse &amp; Save</button>
+      </form>
+    </div>
+  </main>
+</body>
+</html>

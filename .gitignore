@@ -1,0 +1,8 @@
+.env
+*.db
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+workspace/
+*.log
