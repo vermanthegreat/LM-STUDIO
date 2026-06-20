@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import db
+
+_active_sqlite_tx: ContextVar[tuple[Path, Any] | None] = ContextVar("_active_sqlite_tx", default=None)
 
 
 class SqliteContactStore:
@@ -14,12 +17,14 @@ class SqliteContactStore:
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
-        self._conn = None
 
     def _kwargs(self) -> dict[str, Any]:
         kw: dict[str, Any] = {"db_path": self.database_path}
-        if self._conn is not None:
-            kw["conn"] = self._conn
+        active = _active_sqlite_tx.get()
+        if active is not None:
+            db_path, conn = active
+            if db_path == self.database_path:
+                kw["conn"] = conn
         return kw
 
     def init_db(self) -> None:
@@ -28,11 +33,11 @@ class SqliteContactStore:
     @contextmanager
     def transaction(self):
         with db.get_conn(self.database_path) as conn:
-            self._conn = conn
+            token = _active_sqlite_tx.set((self.database_path, conn))
             try:
                 yield
             finally:
-                self._conn = None
+                _active_sqlite_tx.reset(token)
 
     def get_all_leads_simple(self) -> List[Dict[str, Any]]:
         return db.get_all_leads_simple(**self._kwargs())
