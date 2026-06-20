@@ -21,7 +21,7 @@ from ask_router import (
     list_pending_write_proposals_route,
 )
 from config import AppConfig
-from errors import AppError, ValidationError
+from errors import AppError, ValidationError, parse_command_id
 from extractor import parse_and_save
 from intake import validate_parse_intake
 from repositories.factory import get_contact_store
@@ -178,10 +178,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.post("/ask/commands/{command_id}/approve")
     def ask_approve_command(request: Request, command_id: str):
         assert_safe_mutation_request(request, port=cfg.port)
-        from uuid import UUID
-
         result = approve_write_proposal_route(
-            UUID(command_id),
+            parse_command_id(command_id),
             store=request.app.state.store,
         )
         status_code = 200 if result["status"] == "ok" else 409
@@ -190,10 +188,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.post("/ask/commands/{command_id}/apply")
     def ask_apply_command(request: Request, command_id: str):
         assert_safe_mutation_request(request, port=cfg.port)
-        from uuid import UUID
-
         result = apply_write_proposal_route(
-            UUID(command_id),
+            parse_command_id(command_id),
             store=request.app.state.store,
         )
         status_code = 200 if result["status"] == "ok" else 409
@@ -206,10 +202,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @application.get("/ask/commands/{command_id}")
     def ask_get_write_proposal_detail(request: Request, command_id: str):
-        from uuid import UUID
-
         result = get_write_proposal_detail_route(
-            UUID(command_id),
+            parse_command_id(command_id),
             store=request.app.state.store,
         )
         status_code = 200 if result["status"] == "ok" else 404
