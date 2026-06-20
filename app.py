@@ -152,8 +152,22 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             {"request": request, "result": None},
         )
 
-    @application.post("/ask", response_class=HTMLResponse)
-    def ask_submit(request: Request, question: str = Form(...), use_llm: bool = Form(False)):
+    @application.post("/ask")
+    async def ask_submit(request: Request):
+        content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if content_type == "application/json":
+            assert_safe_mutation_request(request, port=cfg.port)
+            body = await request.json()
+            result = answer_question(
+                str(body.get("question") or ""),
+                use_llm=bool(body.get("use_llm", False)),
+                store=request.app.state.store,
+                planner_payload=body.get("planner_payload"),
+            )
+            return JSONResponse(content=result)
+        form = await request.form()
+        question = str(form.get("question") or "")
+        use_llm = str(form.get("use_llm", "")).lower() in ("true", "1", "on", "yes")
         assert_safe_mutation_request(request, port=cfg.port)
         result = answer_question(question, use_llm=use_llm, store=request.app.state.store)
         return templates.TemplateResponse(
