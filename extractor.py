@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 import db
 from llm import EXTRACTION_SYSTEM, extract_structured
+from extraction_schema import extraction_to_dict, try_validate_extraction
 from scoring import classify_person_title, compute_fit_score
 
 
@@ -916,14 +917,18 @@ def parse_and_save(
     )
     extraction_status = "ok"
     confidence = 0.0
+    llm_attempted = bool(llm_raw)
 
-    if parsed and isinstance(parsed, dict):
-        confidence = float(parsed.get("confidence") or 0.7)
+    validated = try_validate_extraction(parsed) if parsed and isinstance(parsed, dict) else None
+    if validated is not None:
+        parsed = extraction_to_dict(validated)
+        confidence = validated.confidence
+        extraction_status = "ok"
     else:
         parsed = deterministic_parse(source_type, raw_text)
         extraction_status = "fallback"
         confidence = float(parsed.get("confidence") or 0.4)
-        if llm_raw:
+        if llm_attempted:
             extraction_status = "needs_review"
 
     if "raw_text" not in parsed:
