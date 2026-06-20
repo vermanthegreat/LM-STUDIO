@@ -53,18 +53,19 @@
     <div class="card">
       <h2>People</h2>
       <table>
-        <thead><tr><th>Name</th><th>Title</th><th>LinkedIn</th><th>DM</th><th>Relevant</th></tr></thead>
+        <thead><tr><th>Name</th><th>Title</th><th>Email</th><th>LinkedIn</th><th>DM</th><th>Relevant</th></tr></thead>
         <tbody>
           {% for p in lead.people %}
           <tr>
             <td>{{ p.name }}</td>
             <td>{{ p.title or '—' }}</td>
+            <td>{{ p.email or '—' }}</td>
             <td>{% if p.linkedin_url %}<a href="{{ p.linkedin_url }}" target="_blank">link</a>{% else %}—{% endif %}</td>
             <td>{{ 'yes' if p.is_decision_maker else 'no' }}</td>
             <td>{{ 'yes' if p.is_relevant_contact else 'no' }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="5">No contacts yet.</td></tr>
+          <tr><td colspan="6">No contacts yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

@@ -1,0 +1,23 @@
+---
+description: Architecture, safety, and workflow rules for CommerceGov Contacts
+alwaysApply: true
+---
+
+# CommerceGov Contacts
+
+Before editing, read `AGENTS.md` and the authoritative files under `docs/` that
+it lists. Follow the active phase in `docs/implementation-roadmap.md`.
+
+- Keep the application local-first on `127.0.0.1:8025`.
+- Treat the LLM as an untrusted planner/extractor.
+- Use typed application tools; never model-generated write SQL.
+- Preserve provenance and verification state for every contact method.
+- Use explicit transactions and isolated test databases.
+- Preserve unrelated working-tree changes.
+- Add tests for behavior changes and report unverified behavior.
+- Do not introduce later-phase features into an earlier-phase patch.
+- Never add generic scraping, browsing, email sending, n8n, or CRM scope.
+
+When a request conflicts with these boundaries, explain the conflict and
+implement the closest safe in-scope behavior.
+

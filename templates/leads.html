@@ -24,6 +24,7 @@
           <tr>
             <th>Company</th>
             <th>Website</th>
+            <th>Email</th>
             <th>Tier</th>
             <th>Services</th>
             <th>Fit</th>
@@ -41,6 +42,7 @@
               {% if l.possible_duplicate %}<span class="badge warn">dup?</span>{% endif %}
             </td>
             <td>{{ l.website or '—' }}</td>
+            <td>{{ l.company_email or '—' }}</td>
             <td>{{ l.partner_tier or '—' }}</td>
             <td>{{ (l.services or [])|join(', ') or '—' }}</td>
             <td>{{ l.fit_score }}</td>
@@ -51,7 +53,7 @@
             <td>{{ l.next_deadline or '—' }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="10">No leads yet. <a href="/">Paste your first source</a>.</td></tr>
+          <tr><td colspan="11">No leads yet. <a href="/">Paste your first source</a>.</td></tr>
           {% endfor %}
         </tbody>
       </table>

@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import db
 from llm import chat_completion, call_lmstudio_for_text
+from repositories.sqlite_store import SqliteContactStore
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
@@ -29,13 +30,20 @@ class AskIntent:
     filters: Dict[str, Any] | None = None
     confidence: float = 0.0
 
+    @property
+    def intent(self) -> str:
+        return self.name
+
 
 _ALLOWED_INTENTS = {
     "count_leads",
     "top_leads",
     "leads_without_contacts",
+    "leads_without_email",
     "followups_due",
     "summarize_company",
+    "contact_summary",
+    "list_emails",
     "search_leads",
     "unknown",
 }
@@ -49,13 +57,14 @@ _STOPWORDS = {
 }
 
 
-def answer_question(question: str, use_llm: bool = False, db_path=None) -> Dict[str, Any]:
+def answer_question(question: str, use_llm: bool = False, db_path=None, store=None) -> Dict[str, Any]:
     """Answer a free-form Ask Database question from SQLite."""
     q = (question or "").strip()
     if not q:
         return {"question": q, "intent": "empty", "answer": "Unesi pitanje.", "data": None}
 
-    kwargs = {"db_path": db_path} if db_path is not None else {}
+    if store is None:
+        store = SqliteContactStore(db_path or db.DB_PATH)
     intent = _deterministic_intent(q)
 
     if intent.name == "unknown" and use_llm:
@@ -64,7 +73,7 @@ def answer_question(question: str, use_llm: bool = False, db_path=None) -> Dict[
     if intent.name == "unknown":
         intent = _fallback_search_intent(q)
 
-    result = _execute_intent(intent, **kwargs)
+    result = _execute_intent(intent, store=store)
     answer = result["answer"]
 
     if use_llm and result.get("data"):
@@ -84,9 +93,26 @@ def _deterministic_intent(question: str) -> AskIntent:
     q = _norm(question)
 
     if any(term in q for term in ("how many", "koliko", "count", "broj")):
+        if any(term in q for term in ("email", "contact", "kontakt")):
+            return AskIntent("contact_summary", confidence=1.0)
         return AskIntent("count_leads", confidence=1.0)
 
-    if any(term in q for term in ("top leads", "best leads", "najbolj", "top klijenti")):
+    if any(term in q for term in (
+        "all email", "list email", "print email", "show email", "email addresses",
+        "emails from", "svi email", "prikazi email", "ispisi email",
+    )):
+        return AskIntent("list_emails", limit=_clamp_limit(_extract_limit(q, default=50), default=50, maximum=100), confidence=1.0)
+
+    if any(term in q for term in (
+        "contact summary", "contact info", "contact information", "available contact",
+        "kontakt", "email coverage", "contact overview",
+    )):
+        return AskIntent("contact_summary", confidence=1.0)
+
+    if any(term in q for term in ("without email", "no email", "missing email", "bez email", "bez maila")):
+        return AskIntent("leads_without_email", confidence=1.0)
+
+    if any(term in q for term in ("top leads", "best leads", "najbolj", "top klijenti", "top leadove")):
         return AskIntent("top_leads", limit=_extract_limit(q), confidence=1.0)
 
     if "without contact" in q or "bez kontakt" in q:
@@ -122,10 +148,16 @@ Allowed intents:
 - count_leads
 - top_leads
 - leads_without_contacts
+- leads_without_email
 - followups_due
 - summarize_company
+- contact_summary
+- list_emails
 - search_leads
 - unknown
+
+Use contact_summary for questions about available contact info, email coverage, or company/contact counts together.
+Use list_emails for listing stored email addresses.
 
 Use search_leads for free-form filtering by service, location, industry, partner tier, score, status, company text, description, email/contact requests, or contact availability.
 
@@ -197,21 +229,53 @@ def _fallback_search_intent(question: str) -> AskIntent:
     )
 
 
-def _execute_intent(intent: AskIntent, **kwargs) -> Dict[str, Any]:
+def _execute_intent(intent: AskIntent, *, store) -> Dict[str, Any]:
     if intent.name == "count_leads":
-        count = db.count_potential_clients(**kwargs)
+        count = store.count_potential_clients()
         return {"intent": intent.name, "answer": f"Imamo {count} potencijalnih klijenata u bazi.", "data": {"count": count}}
 
     if intent.name == "top_leads":
-        leads = db.get_top_leads(intent.limit, **kwargs)
-        return {"intent": intent.name, "answer": _format_leads(leads, "Top leads:", **kwargs), "data": {"leads": _attach_contact_fields(leads, **kwargs)}}
+        leads = store.get_top_leads(intent.limit)
+        enriched = _attach_contact_fields(leads, store=store)
+        return {
+            "intent": intent.name,
+            "answer": _format_leads(enriched, "Top leads:"),
+            "data": {"leads": enriched},
+        }
 
     if intent.name == "leads_without_contacts":
-        leads = db.get_leads_without_contacts(**kwargs)
-        return {"intent": intent.name, "answer": _format_leads(leads, "Leads without contacts:", **kwargs), "data": {"leads": _attach_contact_fields(leads, **kwargs)}}
+        leads = store.get_leads_without_contacts()
+        enriched = _attach_contact_fields(leads, store=store)
+        return {
+            "intent": intent.name,
+            "answer": _format_leads(enriched, "Leads without contacts:"),
+            "data": {"leads": enriched},
+        }
+
+    if intent.name == "leads_without_email":
+        leads = store.get_leads_without_email()
+        return {"intent": intent.name, "answer": _format_leads(leads, "Companies missing email:"), "data": {"leads": leads}}
+
+    if intent.name == "contact_summary":
+        summary = store.get_contact_summary()
+        lines = [
+            "Contact overview:",
+            f"- Companies: {summary['companies']}",
+            f"- With company email: {summary['with_company_email']}",
+            f"- With people on file: {summary['with_people']}",
+            f"- With person email: {summary['with_person_email']}",
+            f"- With any email (required): {summary['with_any_email']}",
+            f"- Missing email: {summary['without_email']}",
+            f"- Saved email threads: {summary['email_interactions']}",
+        ]
+        return {"intent": intent.name, "answer": "\n".join(lines), "data": summary}
+
+    if intent.name == "list_emails":
+        rows = store.list_contact_emails(intent.limit)
+        return {"intent": intent.name, "answer": _format_emails(rows, intent.limit), "data": {"emails": rows}}
 
     if intent.name == "followups_due":
-        items = db.get_followups_due(**kwargs)
+        items = store.get_followups_due()
         lines = ["Follow-ups due:"]
         for item in items[:10]:
             lines.append(f"- {item.get('company_name')}: {item.get('title') or item.get('subject')} (due {item.get('due_date')})")
@@ -221,25 +285,25 @@ def _execute_intent(intent: AskIntent, **kwargs) -> Dict[str, Any]:
 
     if intent.name == "summarize_company":
         if not intent.company:
-            return _unknown(**kwargs)
-        rows = db.search_lead_by_name(intent.company, **kwargs)
+            return _unknown(store=store)
+        rows = store.search_lead_by_name(intent.company)
         if not rows:
             return {"intent": intent.name, "answer": f"Nema leada za '{intent.company}'.", "data": {}}
-        lead = db.get_lead(rows[0]["id"], **kwargs)
-        lead = _attach_contact_fields([lead], **kwargs)[0] if lead else lead
+        lead = store.get_lead(rows[0]["id"])
+        lead = _attach_contact_fields([lead], store=store)[0] if lead else lead
         return {"intent": intent.name, "answer": _summarize_lead(lead), "data": {"lead": lead}}
 
     if intent.name == "search_leads":
-        leads = db.list_leads(**kwargs)
+        leads = store.list_leads()
         matches = _search_leads(leads, intent)
-        hydrated = _attach_contact_fields(matches, **kwargs)
+        hydrated = _attach_contact_fields(matches, store=store)
         return {
             "intent": intent.name,
             "answer": _format_search(hydrated, intent),
             "data": {"leads": hydrated, "parsed_query": intent.query, "filters": intent.filters or {}, "confidence": intent.confidence},
         }
 
-    return _unknown(**kwargs)
+    return _unknown(store=store)
 
 
 def _search_leads(leads: List[Dict[str, Any]], intent: AskIntent) -> List[Dict[str, Any]]:
@@ -336,7 +400,7 @@ def _basic_filters(q: str) -> Dict[str, Any]:
     return filters
 
 
-def _attach_contact_fields(leads: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
+def _attach_contact_fields(leads: List[Dict[str, Any]], *, store) -> List[Dict[str, Any]]:
     result = []
     for lead in leads:
         enriched = dict(lead or {})
@@ -344,7 +408,7 @@ def _attach_contact_fields(leads: List[Dict[str, Any]], **kwargs) -> List[Dict[s
         detail = None
         if lead_id is not None:
             try:
-                detail = db.get_lead(int(lead_id), **kwargs)
+                detail = store.get_lead(int(lead_id))
             except Exception:
                 detail = None
         if detail:
@@ -378,12 +442,27 @@ def _collect_emails(lead: Dict[str, Any]) -> List[str]:
     return found
 
 
-def _format_leads(leads: List[Dict[str, Any]], header: str, **kwargs) -> str:
-    enriched = _attach_contact_fields(leads, **kwargs)
-    if not enriched:
+def _format_emails(rows: List[Dict[str, Any]], limit: int) -> str:
+    header = "Stored email addresses:"
+    if not rows:
         return f"{header}\n(none)"
     lines = [header]
-    for lead in enriched[:20]:
+    for row in rows[:limit]:
+        company = row.get("company_name") or "?"
+        email = row.get("email") or "?"
+        if row.get("source") == "person":
+            who = row.get("person_name") or "contact"
+            lines.append(f"- {company} | {who} <{email}>")
+        else:
+            lines.append(f"- {company} | {email}")
+    return "\n".join(lines)
+
+
+def _format_leads(leads: List[Dict[str, Any]], header: str) -> str:
+    if not leads:
+        return f"{header}\n(none)"
+    lines = [header]
+    for lead in leads[:20]:
         lines.append(
             f"- {lead.get('company_name') or '?'} "
             f"(fit={lead.get('fit_score', 0)}, status={lead.get('status')}, email={lead.get('email_display')})"
@@ -432,8 +511,8 @@ def _summarize_lead(lead: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _unknown(**kwargs) -> Dict[str, Any]:
-    count = db.count_potential_clients(**kwargs)
+def _unknown(*, store) -> Dict[str, Any]:
+    count = store.count_potential_clients()
     return {
         "intent": "unknown",
         "answer": f"Nisam siguran na pitanje. Trenutno imamo {count} potencijalnih klijenata.",
@@ -487,9 +566,9 @@ def _as_list(value: Any) -> List[str]:
     return [text] if text else []
 
 
-def _extract_limit(text: str) -> int:
+def _extract_limit(text: str, default: int = 10) -> int:
     match = re.search(r"\b(\d{1,2})\b", text)
-    return _clamp_limit(match.group(1) if match else None)
+    return _clamp_limit(match.group(1) if match else None, default=default)
 
 
 def _clamp_limit(value: Any, default: int = 10, maximum: int = 25) -> int:
@@ -502,3 +581,56 @@ def _clamp_limit(value: Any, default: int = 10, maximum: int = 25) -> int:
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).lower()).strip()
+
+
+def route_question(question: str, db_path=None, use_llm: bool = True, store=None) -> Dict[str, Any]:
+    """Classify question and run SQLite query. Returns structured result."""
+    q = (question or "").strip()
+    if store is None:
+        store = SqliteContactStore(db_path or db.DB_PATH)
+    intent = _deterministic_intent(q)
+    if intent.name == "unknown" and use_llm:
+        intent = _llm_intent(q)
+    if intent.name == "unknown":
+        intent = _fallback_search_intent(q)
+    result = _execute_intent(intent, store=store)
+    return {**result, "question": q}
+
+
+def deterministic_ask_intent(question: str) -> Optional[AskIntent]:
+    intent = _deterministic_intent(question)
+    if intent.name == "unknown":
+        return None
+    return intent
+
+
+def parse_llm_intent_payload(raw_text: str) -> AskIntent:
+    try:
+        payload = json.loads((raw_text or "").strip())
+    except json.JSONDecodeError:
+        return AskIntent("unknown")
+
+    if not isinstance(payload, dict):
+        return AskIntent("unknown")
+
+    name = str(payload.get("intent") or "unknown").strip().lower()
+    if name not in _ALLOWED_INTENTS:
+        name = "unknown"
+
+    try:
+        confidence = float(payload.get("confidence") if payload.get("confidence") is not None else 1.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if confidence < 0.60 and name != "unknown":
+        name = "unknown"
+
+    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+    return AskIntent(
+        name=name,
+        query=str(payload.get("query") or "").strip(),
+        company=str(payload.get("company") or "").strip(),
+        limit=_clamp_limit(payload.get("limit")),
+        filters=filters,
+        confidence=confidence,
+    )

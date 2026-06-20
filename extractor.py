@@ -742,6 +742,42 @@ def _parse_website(text: str) -> Dict[str, Any]:
     }
 
 
+def _parse_header_contacts(text: str) -> List[Dict[str, Any]]:
+    """Extract name/email pairs from Gmail-style From/To/Cc lines."""
+    people: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in text.splitlines()[:40]:
+        stripped = line.strip()
+        low = stripped.lower()
+        if not any(low.startswith(prefix) for prefix in ("from:", "to:", "cc:", "reply-to:")):
+            continue
+        rest = stripped.split(":", 1)[1].strip()
+        angle = re.search(r"<([^>]+@[^>]+)>", rest)
+        if angle:
+            email = _email_value(angle.group(1))
+            name = rest[: angle.start()].strip().strip('"').strip("'")
+        else:
+            em = EMAIL_RE.search(rest)
+            if not em:
+                continue
+            email = em.group(0)
+            name = rest.replace(email, "").strip().strip('"').strip("'")
+        norm = db.normalize_email(email)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        people.append({"name": name or None, "email": email})
+    return people
+
+
+def _pick_company_email(candidates: List[str]) -> Optional[str]:
+    for token in candidates:
+        email = _email_value(token)
+        if db.is_business_email(email):
+            return email
+    return None
+
+
 def _parse_email(text: str) -> Dict[str, Any]:
     lines = _lines(text)
     subject = None
@@ -763,25 +799,29 @@ def _parse_email(text: str) -> Dict[str, Any]:
     dm = DATE_RE.search(text)
     if dm:
         deadline = dm.group(1)
+
+    people = _parse_header_contacts(text)
+    candidates = _extract_email_candidates(text)
+    company_email = _pick_company_email(candidates)
+
     company = None
-    for ln in lines:
-        if "@" not in ln:
-            continue
-        parts = ln.split()
-        for p in parts:
-            if "@" in p:
-                domain = p.split("@")[-1].lower()
-                if domain not in ("gmail.com", "yahoo.com", "hotmail.com", "outlook.com"):
-                    company = domain.split(".")[0].title()
+    for token in candidates:
+        email = _email_value(token)
+        if db.is_business_email(email):
+            domain = db.email_domain(email)
+            company = domain.split(".")[0].title() if domain else None
+            break
+
     return {
         "company_name": company,
+        "company_email": company_email,
         "website": None,
         "partner_tier": None,
         "services": [],
         "locations": [],
         "industries": [],
         "description": None,
-        "people": [],
+        "people": people,
         "interaction": {
             "subject": subject,
             "summary": body[:300] if body else None,
@@ -823,18 +863,52 @@ def deterministic_parse(source_type: str, raw_text: str) -> Dict[str, Any]:
     return parser(raw_text)
 
 
+def _merge_email_fields(parsed: Dict[str, Any], raw_text: str) -> None:
+    """Keep Gmail/Outlook address fields when LLM extraction drops them."""
+    email_parsed = _parse_email(raw_text)
+    if email_parsed.get("company_email") and not parsed.get("company_email"):
+        parsed["company_email"] = email_parsed["company_email"]
+    if not parsed.get("interaction") and email_parsed.get("interaction"):
+        parsed["interaction"] = email_parsed["interaction"]
+
+    email_people = email_parsed.get("people") or []
+    by_email = {
+        db.normalize_email(p["email"]): p
+        for p in email_people
+        if p.get("email")
+    }
+    people = list(parsed.get("people") or [])
+    for person in people:
+        if person.get("email"):
+            continue
+        for ep in email_people:
+            if not ep.get("email"):
+                continue
+            if person.get("name") and ep.get("name") and person["name"].lower() == ep["name"].lower():
+                person["email"] = ep["email"]
+                break
+    known = {db.normalize_email(p.get("email")) for p in people if p.get("email")}
+    for ep in email_people:
+        em = db.normalize_email(ep.get("email"))
+        if em and em not in known:
+            people.append(ep)
+            known.add(em)
+    parsed["people"] = people
+
+
 def parse_and_save(
     source_type: str,
     raw_text: str,
     source_url: Optional[str] = None,
     attach_to_lead_id: Optional[int] = None,
     db_path=None,
+    store=None,
 ) -> Dict[str, Any]:
     """Main entry: parse pasted text, persist everything, return summary."""
-    if db_path is None:
-        db_path = db.DB_PATH
+    if store is None:
+        from repositories.sqlite_store import SqliteContactStore
 
-    kwargs = {"db_path": db_path} if db_path != db.DB_PATH else {}
+        store = SqliteContactStore(db_path or db.DB_PATH)
 
     parsed, llm_raw = extract_structured(
         EXTRACTION_SYSTEM,
@@ -855,137 +929,145 @@ def parse_and_save(
     if "raw_text" not in parsed:
         parsed["raw_text"] = raw_text
 
+    if source_type == "email":
+        _merge_email_fields(parsed, raw_text)
+
     source_filter_tier = parse_source_filter_tier(source_url)
 
-    lead_id = attach_to_lead_id
-    if not lead_id and parsed.get("company_name"):
-        matches = db.find_matching_leads(
-            parsed.get("company_name"),
-            parsed.get("website"),
-            db_path=db_path,
-        )
-        if matches:
-            lead_id = matches[0]["id"]
+    with store.transaction():
+        lead_id = attach_to_lead_id
+        if not lead_id and parsed.get("company_name"):
+            matches = store.find_matching_leads(
+                parsed.get("company_name"),
+                parsed.get("website"),
+            )
+            if matches:
+                lead_id = matches[0]["id"]
 
-    website_fallback = None
-    if source_url and not _is_directory_listing_url(source_url):
-        website_fallback = source_url
+        if not lead_id and source_type == "email":
+            for token in _extract_email_candidates(raw_text):
+                matches = store.find_leads_by_email(_email_value(token))
+                if matches:
+                    lead_id = matches[0]["id"]
+                    break
 
-    lead = None
-    if lead_id or parsed.get("company_name") or source_type in (
-        "shopify_directory", "linkedin_company", "website", "note"
-    ):
-        lead_data = {
-            "company_name": db.sanitize_company_name(parsed.get("company_name"))
-            or (f"Unknown ({source_type})" if not lead_id else None),
-            "website": parsed.get("website") or website_fallback,
-            "company_email": parsed.get("company_email"),
-            "company_phone": parsed.get("company_phone"),
-            "partner_tier": parsed.get("partner_tier"),
-            "plus_partner_signal": parsed.get("plus_partner_signal"),
-            "rating": parsed.get("rating"),
-            "review_count": parsed.get("review_count"),
-            "partner_since": parsed.get("partner_since"),
-            "primary_location": parsed.get("primary_location"),
-            "supported_locations": parsed.get("supported_locations") or [],
-            "languages": parsed.get("languages") or [],
-            "featured_work": parsed.get("featured_work") or [],
-            "services": parsed.get("services") or [],
-            "locations": parsed.get("locations") or parsed.get("supported_locations") or [],
-            "industries": parsed.get("industries") or [],
-            "description": parsed.get("description"),
-            "confidence": confidence,
-            "extraction_status": extraction_status,
-        }
-        if lead_id:
-            lead, _ = db.upsert_lead(lead_data, lead_id=lead_id, db_path=db_path)
-        elif lead_data.get("company_name"):
-            lead, _ = db.upsert_lead(lead_data, db_path=db_path)
-            lead_id = lead["id"]
+        website_fallback = None
+        if source_url and not _is_directory_listing_url(source_url):
+            website_fallback = source_url
 
-    raw_source = db.create_raw_source(
-        source_type=source_type,
-        raw_text=raw_text,
-        source_url=source_url,
-        source_filter_tier=source_filter_tier,
-        parsed_json=parsed,
-        extraction_status=extraction_status,
-        confidence=confidence,
-        lead_id=lead_id,
-        **kwargs,
-    )
-
-    if lead_id and raw_source.get("lead_id") != lead_id:
-        db.link_raw_source_to_lead(raw_source["id"], lead_id, db_path=db_path)
-        raw_source["lead_id"] = lead_id
-
-    people_saved = []
-    for person in parsed.get("people") or []:
-        if not person.get("name"):
-            continue
-        if not lead_id:
-            continue
-        cls = classify_person_title(person.get("title"))
-        p = db.add_person(
-            lead_id,
-            {
-                **person,
-                **cls,
+        lead = None
+        if lead_id or parsed.get("company_name") or source_type in (
+            "shopify_directory", "linkedin_company", "website", "note"
+        ):
+            lead_data = {
+                "company_name": store.sanitize_company_name(parsed.get("company_name"))
+                or (f"Unknown ({source_type})" if not lead_id else None),
+                "website": parsed.get("website") or website_fallback,
+                "company_email": parsed.get("company_email"),
+                "company_phone": parsed.get("company_phone"),
+                "partner_tier": parsed.get("partner_tier"),
+                "plus_partner_signal": parsed.get("plus_partner_signal"),
+                "rating": parsed.get("rating"),
+                "review_count": parsed.get("review_count"),
+                "partner_since": parsed.get("partner_since"),
+                "primary_location": parsed.get("primary_location"),
+                "supported_locations": parsed.get("supported_locations") or [],
+                "languages": parsed.get("languages") or [],
+                "featured_work": parsed.get("featured_work") or [],
+                "services": parsed.get("services") or [],
+                "locations": parsed.get("locations") or parsed.get("supported_locations") or [],
+                "industries": parsed.get("industries") or [],
+                "description": parsed.get("description"),
                 "confidence": confidence,
-            },
-            raw_source_id=raw_source["id"],
-            db_path=db_path,
-        )
-        people_saved.append(p)
+                "extraction_status": extraction_status,
+            }
+            if lead_id:
+                if source_type == "email":
+                    lead_data.pop("company_name", None)
+                lead, _ = store.upsert_lead(lead_data, lead_id=lead_id)
+            elif lead_data.get("company_name"):
+                lead, _ = store.upsert_lead(lead_data)
+                lead_id = lead["id"]
 
-    interaction_saved = None
-    task_saved = None
-    interaction = parsed.get("interaction")
-    if interaction and lead_id:
-        interaction_saved = db.add_interaction(
-            lead_id,
-            {
-                "type": "email" if source_type == "email" else "note",
-                "subject": interaction.get("subject"),
-                "body": raw_text if source_type == "email" else None,
-                "summary": interaction.get("summary"),
-                "reply_needed": interaction.get("reply_needed", False),
-                "deadline": interaction.get("deadline"),
-                "priority": "high" if interaction.get("reply_needed") else "normal",
-                "next_action": interaction.get("next_action"),
-            },
-            raw_source_id=raw_source["id"],
-            db_path=db_path,
+        raw_source = store.create_raw_source(
+            source_type=source_type,
+            raw_text=raw_text,
+            source_url=source_url,
+            source_filter_tier=source_filter_tier,
+            parsed_json=parsed,
+            extraction_status=extraction_status,
+            confidence=confidence,
+            lead_id=lead_id,
         )
-        if interaction.get("reply_needed") or interaction.get("deadline"):
-            task_saved = db.add_task(
+
+        if lead_id and raw_source.get("lead_id") != lead_id:
+            store.link_raw_source_to_lead(raw_source["id"], lead_id)
+            raw_source["lead_id"] = lead_id
+
+        people_saved = []
+        for person in parsed.get("people") or []:
+            if not person.get("name") and not person.get("email"):
+                continue
+            if not lead_id:
+                continue
+            cls = classify_person_title(person.get("title"))
+            p = store.add_person(
                 lead_id,
                 {
-                    "title": interaction.get("next_action") or interaction.get("subject") or "Follow up",
-                    "due_date": interaction.get("deadline"),
-                    "priority": "high" if interaction.get("reply_needed") else "normal",
-                    "source_interaction_id": interaction_saved["id"],
+                    **person,
+                    **cls,
+                    "confidence": confidence,
                 },
-                db_path=db_path,
+                raw_source_id=raw_source["id"],
             )
+            people_saved.append(p)
 
-    if lead_id:
-        lead_row = db.get_lead(lead_id, db_path=db_path)
-        if lead_row:
-            fit = compute_fit_score(
+        interaction_saved = None
+        task_saved = None
+        interaction = parsed.get("interaction")
+        if interaction and lead_id:
+            interaction_saved = store.add_interaction(
+                lead_id,
                 {
-                    "company_name": lead_row.get("company_name"),
-                    "website": lead_row.get("website"),
-                    "domain": lead_row.get("domain"),
-                    "partner_tier": lead_row.get("partner_tier"),
-                    "services": lead_row.get("services"),
-                    "industries": lead_row.get("industries"),
-                    "description": lead_row.get("description"),
+                    "type": "email" if source_type == "email" else "note",
+                    "subject": interaction.get("subject"),
+                    "body": raw_text if source_type == "email" else None,
+                    "summary": interaction.get("summary"),
+                    "reply_needed": interaction.get("reply_needed", False),
+                    "deadline": interaction.get("deadline"),
+                    "priority": "high" if interaction.get("reply_needed") else "normal",
+                    "next_action": interaction.get("next_action"),
                 },
-                lead_row.get("people"),
+                raw_source_id=raw_source["id"],
             )
-            db.update_lead_fit_score(lead_id, fit, db_path=db_path)
-            lead_row["fit_score"] = fit
+            if interaction.get("reply_needed") or interaction.get("deadline"):
+                task_saved = store.add_task(
+                    lead_id,
+                    {
+                        "title": interaction.get("next_action") or interaction.get("subject") or "Follow up",
+                        "due_date": interaction.get("deadline"),
+                        "priority": "high" if interaction.get("reply_needed") else "normal",
+                        "source_interaction_id": interaction_saved["id"],
+                    },
+                )
+
+        if lead_id:
+            lead_row = store.get_lead(lead_id)
+            if lead_row:
+                fit = compute_fit_score(
+                    {
+                        "company_name": lead_row.get("company_name"),
+                        "website": lead_row.get("website"),
+                        "domain": lead_row.get("domain"),
+                        "partner_tier": lead_row.get("partner_tier"),
+                        "services": lead_row.get("services"),
+                        "industries": lead_row.get("industries"),
+                        "description": lead_row.get("description"),
+                    },
+                    lead_row.get("people"),
+                )
+                store.update_lead_fit_score(lead_id, fit)
+                lead_row["fit_score"] = fit
 
     return {
         "extraction_status": extraction_status,

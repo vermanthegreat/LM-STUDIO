@@ -11,7 +11,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open http://127.0.0.1:8000
+Open http://127.0.0.1:8025
 
 Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://localhost:1234/v1/chat/completions`. If LM Studio is unavailable, deterministic fallback parsers still save pasted text.
 
@@ -39,6 +39,9 @@ Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://l
 ## Ask database examples
 
 - `koliko imamo potencijalnih klijenata?`
+- `contact summary` — companies, people, and email coverage
+- `print all emails` / `list email addresses`
+- `companies without email`
 - `show top leads`
 - `show leads without contacts`
 - `show follow-ups due`
@@ -57,7 +60,36 @@ Older CLI tools (`agent.py`, `ingest_raw.py`) used PostgreSQL via `db_postgres.p
 ## Environment (optional)
 
 ```
-LMSTUDIO_ENDPOINT=http://localhost:1234/v1/chat/completions
+APP_HOST=127.0.0.1
+PORT=8025
+DATABASE_PATH=./leads.db
+MAX_PASTE_CHARS=200000
+LMSTUDIO_BASE_URL=http://localhost:1234/v1
 LMSTUDIO_MODEL=local-model
-PORT=8000
+LMSTUDIO_TIMEOUT=60
+LOG_LEVEL=INFO
+```
+
+Copy `.env.example` to `.env` and adjust paths for your machine. Never commit real credentials.
+
+### PostgreSQL (Phase 1)
+
+When `DATABASE_URL` is set, the app uses PostgreSQL via the repository layer instead of SQLite.
+
+```bash
+# Create schema (first run)
+python -c "from persistence.session import init_schema; import os; init_schema(os.environ['DATABASE_URL'])"
+
+# Migrate existing SQLite data (dry run first)
+python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL" --dry-run
+python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL"
+
+# Alembic baseline (future migrations)
+DATABASE_URL=... alembic upgrade head
+```
+
+PostgreSQL integration tests (optional, requires disposable `TEST_DATABASE_URL`):
+
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test python -m pytest tests/test_pg_integration.py -v
 ```
