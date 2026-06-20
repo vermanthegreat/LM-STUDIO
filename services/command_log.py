@@ -8,6 +8,8 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
+from services.write_proposal_constants import WRITE_PROPOSAL_TOOL_NAMES
+
 
 class CommandStatus(str, Enum):
     RECEIVED = "received"
@@ -109,3 +111,14 @@ class InMemoryCommandLog:
     def update(self, entry: CommandLogEntry) -> None:
         entry.updated_at = datetime.now(timezone.utc)
         self._entries[entry.id] = entry
+
+    def list_pending_write_proposals(self) -> list[CommandLogEntry]:
+        tool_names = tuple(sorted(WRITE_PROPOSAL_TOOL_NAMES))
+        entries = [
+            entry
+            for entry in self._entries.values()
+            if entry.status == CommandStatus.AWAITING_APPROVAL
+            and entry.requires_approval
+            and entry.tool_name in tool_names
+        ]
+        return sorted(entries, key=lambda item: item.created_at, reverse=True)

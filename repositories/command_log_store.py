@@ -13,6 +13,7 @@ from persistence.models import CommandLog as CommandLogModel
 from persistence.session import init_schema, session_scope
 from repositories import ContactStore
 from services.command_log import CommandLogEntry, CommandStatus, InMemoryCommandLog
+from services.write_proposal_constants import WRITE_PROPOSAL_TOOL_NAMES
 
 
 @runtime_checkable
@@ -22,6 +23,8 @@ class CommandLogStore(Protocol):
     def get(self, command_id: UUID) -> Optional[CommandLogEntry]: ...
 
     def update(self, entry: CommandLogEntry) -> None: ...
+
+    def list_pending_write_proposals(self) -> list[CommandLogEntry]: ...
 
 
 def get_command_log_store(store: ContactStore) -> CommandLogStore:
@@ -166,6 +169,21 @@ class SqliteCommandLogStore:
             )
 
 
+    def list_pending_write_proposals(self) -> list[CommandLogEntry]:
+        placeholders = ", ".join("?" for _ in WRITE_PROPOSAL_TOOL_NAMES)
+        sql = f"""
+            SELECT * FROM command_log
+            WHERE status = ?
+              AND requires_approval = 1
+              AND tool_name IN ({placeholders})
+            ORDER BY created_at DESC
+        """
+        params = [CommandStatus.AWAITING_APPROVAL.value, *sorted(WRITE_PROPOSAL_TOOL_NAMES)]
+        with db.get_conn(self.database_path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_sqlite_row_to_entry(row) for row in rows]
+
+
 def _model_to_entry(row: CommandLogModel) -> CommandLogEntry:
     return CommandLogEntry(
         id=row.id,
@@ -241,3 +259,16 @@ class PostgresCommandLogStore:
                 row = CommandLogModel(id=entry.id, command_text=entry.command_text)
                 session.add(row)
             _apply_entry_to_model(entry, row)
+
+    def list_pending_write_proposals(self) -> list[CommandLogEntry]:
+        from sqlalchemy import select
+
+        with session_scope(self.database_url) as session:
+            rows = session.scalars(
+                select(CommandLogModel)
+                .where(CommandLogModel.status == CommandStatus.AWAITING_APPROVAL.value)
+                .where(CommandLogModel.requires_approval.is_(True))
+                .where(CommandLogModel.tool_name.in_(sorted(WRITE_PROPOSAL_TOOL_NAMES)))
+                .order_by(CommandLogModel.created_at.desc())
+            ).all()
+            return [_model_to_entry(row) for row in rows]

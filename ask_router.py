@@ -588,6 +588,67 @@ def apply_write_proposal_route(
     }
 
 
+def list_pending_write_proposals_route(
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """List write proposals awaiting operator approval."""
+    from services.write_proposal_operator import (
+        format_write_proposal_list_item,
+        list_pending_write_proposals,
+    )
+
+    service = command_service or CommandService(store)
+    pending = list_pending_write_proposals(service)
+    items = [format_write_proposal_list_item(entry) for entry in pending]
+    return {
+        "status": "ok",
+        "intent": "write_proposals_pending",
+        "answer": f"Found {len(items)} pending write proposal(s).",
+        "data": {
+            "proposals": items,
+            "count": len(items),
+        },
+    }
+
+
+def get_write_proposal_detail_route(
+    command_id: UUID,
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """Return operator detail for one write proposal command."""
+    from services.write_proposal_operator import (
+        WRITE_PROPOSAL_TOOL_NAMES,
+        format_write_proposal_detail,
+    )
+
+    service = command_service or CommandService(store)
+    entry = service.get_command(command_id)
+    if entry is None:
+        return _command_route_error(
+            command_id,
+            error_code="command_not_found",
+            message=f"Command {command_id} was not found.",
+        )
+    if entry.tool_name not in WRITE_PROPOSAL_TOOL_NAMES:
+        return _command_route_error(
+            command_id,
+            error_code="not_write_proposal",
+            message=f"Command {command_id} is not a write proposal.",
+            command_status=entry.status.value,
+            tool_name=entry.tool_name,
+        )
+    return {
+        "status": "ok",
+        "intent": "write_proposal_detail",
+        "answer": format_write_proposal_detail(entry).get("summary") or "Write proposal detail.",
+        "data": format_write_proposal_detail(entry),
+    }
+
+
 def _command_route_error(
     command_id: UUID,
     *,

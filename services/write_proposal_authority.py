@@ -5,12 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from services.command_log import CommandLogEntry
+from services.write_proposal_constants import SUPPORTED_WRITE_PROPOSAL_TOOLS
 from tools.write_handlers import WriteProposalError
 
-_SUPPORTED_WRITE_PROPOSAL_TOOLS: dict[str, str] = {
-    "propose_create_followup": "create_followup",
-    "propose_contact_update": "update_contact_field",
-}
+_SUPPORTED_WRITE_PROPOSAL_TOOLS = SUPPORTED_WRITE_PROPOSAL_TOOLS
 
 _ALLOWED_CONTACT_FIELDS = frozenset({"company_email", "company_phone", "website"})
 

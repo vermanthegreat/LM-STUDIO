@@ -13,7 +13,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from ask_router import answer_question, apply_write_proposal_route, approve_write_proposal_route
+from ask_router import (
+    answer_question,
+    apply_write_proposal_route,
+    approve_write_proposal_route,
+    get_write_proposal_detail_route,
+    list_pending_write_proposals_route,
+)
 from config import AppConfig
 from errors import AppError, ValidationError
 from extractor import parse_and_save
@@ -177,6 +183,22 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             store=request.app.state.store,
         )
         status_code = 200 if result["status"] == "ok" else 409
+        return JSONResponse(status_code=status_code, content=result)
+
+    @application.get("/ask/commands/pending")
+    def ask_list_pending_write_proposals(request: Request):
+        result = list_pending_write_proposals_route(store=request.app.state.store)
+        return JSONResponse(content=result)
+
+    @application.get("/ask/commands/{command_id}")
+    def ask_get_write_proposal_detail(request: Request, command_id: str):
+        from uuid import UUID
+
+        result = get_write_proposal_detail_route(
+            UUID(command_id),
+            store=request.app.state.store,
+        )
+        status_code = 200 if result["status"] == "ok" else 404
         return JSONResponse(status_code=status_code, content=result)
 
     @application.get("/export/csv")
