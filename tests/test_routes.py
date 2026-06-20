@@ -135,6 +135,33 @@ def test_unsafe_origin_blocked_on_parse(tmp_path):
         _close_client(client)
 
 
+def test_unsafe_origin_wrong_port_loopback_blocked(tmp_path):
+    client, _, _ = _client(tmp_path)
+    try:
+        response = client.post(
+            "/parse",
+            data={"raw_text": "hello", "source_type": "note"},
+            headers={"Origin": "http://127.0.0.1:9999"},
+        )
+        assert response.status_code == 403
+        assert response.json()["error_code"] == "unsafe_origin"
+    finally:
+        _close_client(client)
+
+
+def test_safe_origin_correct_port_allowed(tmp_path):
+    client, _, _ = _client(tmp_path)
+    try:
+        response = client.post(
+            "/parse",
+            data={"raw_text": "hello", "source_type": "note"},
+            headers={"Origin": "http://127.0.0.1:8025"},
+        )
+        assert response.status_code != 403
+    finally:
+        _close_client(client)
+
+
 def test_csv_formula_hardening(tmp_path):
     client, db_path, _ = _client(tmp_path)
     try:

@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import Request
 
 from errors import ValidationError
 
 _LOOPBACK_HOST_PREFIXES = ("127.0.0.1", "localhost", "[::1]")
-_LOOPBACK_ORIGIN_PREFIXES = (
-    "http://127.0.0.1",
-    "http://localhost",
-    "https://127.0.0.1",
-    "https://localhost",
-)
 
 
 def _host_is_loopback(host: str) -> bool:
     host = host.split(":")[0].strip().lower()
     return any(host == prefix or host.startswith(prefix) for prefix in _LOOPBACK_HOST_PREFIXES)
+
+
+def _origin_is_safe_loopback(origin: str, *, port: int) -> bool:
+    parsed = urlparse(origin)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if not _host_is_loopback(hostname):
+        return False
+    origin_port = parsed.port
+    if origin_port is None:
+        origin_port = 443 if parsed.scheme == "https" else 80
+    return origin_port == port
 
 
 def assert_safe_mutation_request(request: Request, *, port: int) -> None:
@@ -40,7 +49,7 @@ def assert_safe_mutation_request(request: Request, *, port: int) -> None:
                 )
 
     origin = (request.headers.get("origin") or "").strip()
-    if origin and not any(origin.startswith(prefix) for prefix in _LOOPBACK_ORIGIN_PREFIXES):
+    if origin and not _origin_is_safe_loopback(origin, port=port):
         raise ValidationError(
             error_code="unsafe_origin",
             message="Cross-origin mutations are not allowed.",
