@@ -16,7 +16,12 @@ class RiskClass(str, Enum):
     @property
     def requires_approval(self) -> bool:
         return self in {
+            RiskClass.WRITE,
             RiskClass.BULK_WRITE,
             RiskClass.DESTRUCTIVE,
             RiskClass.EXTERNAL,
         }
+
+    @property
+    def creates_write_proposal(self) -> bool:
+        return self == RiskClass.PROPOSE

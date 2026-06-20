@@ -30,6 +30,16 @@ def test_approval_path():
     transition(entry, CommandStatus.SUCCEEDED)
 
 
+def test_propose_tool_awaits_approval_after_preview():
+    log = InMemoryCommandLog()
+    entry = log.create("propose follow-up")
+    transition(entry, CommandStatus.PLANNED)
+    transition(entry, CommandStatus.EXECUTING)
+    transition(entry, CommandStatus.AWAITING_APPROVAL)
+    transition(entry, CommandStatus.EXECUTING)
+    transition(entry, CommandStatus.SUCCEEDED)
+
+
 def test_invalid_transition_rejected():
     log = InMemoryCommandLog()
     entry = log.create("bad path")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
@@ -13,10 +14,12 @@ from services.command_log import (
     CommandStatus,
     transition,
 )
+from services.write_proposals import apply_write_proposal
 from tools.envelope import ToolResult
 from tools.planner import PlannerClarify, PlannerToolCall
 from tools.registry import ToolRegistry, ToolRegistryError, UnknownToolError, build_default_registry
 from tools.risk import RiskClass
+from tools.write_handlers import WriteProposalError
 
 
 class CommandService:
@@ -50,9 +53,10 @@ class CommandService:
         if not entry.tool_name:
             raise CommandLogError("Command has no planned tool")
         spec = self.registry.get(entry.tool_name)
-        if spec.risk_class.requires_approval:
+        if spec.risk_class.requires_approval and not spec.risk_class.creates_write_proposal:
             transition(entry, CommandStatus.AWAITING_APPROVAL)
             entry.requires_approval = True
+            entry.risk_class = spec.risk_class.value
             self.command_log.update(entry)
             raise CommandLogError("Tool requires approval before execution")
 
@@ -65,7 +69,44 @@ class CommandService:
                 entry.tool_name,
                 entry.tool_arguments or {},
             )
-        except ToolRegistryError as exc:
+        except (ToolRegistryError, WriteProposalError) as exc:
+            transition(entry, CommandStatus.FAILED)
+            entry.error_code = type(exc).__name__
+            entry.error_message = str(exc)
+            self.command_log.update(entry)
+            raise
+
+        if spec.risk_class.creates_write_proposal:
+            return self._store_write_proposal(entry, result)
+
+        transition(entry, CommandStatus.SUCCEEDED)
+        entry.result_summary = result.model_dump(mode="json")
+        self.command_log.update(entry)
+        result.command_id = entry.id
+        return result
+
+    def approve_command(self, entry: CommandLogEntry) -> CommandLogEntry:
+        if entry.status != CommandStatus.AWAITING_APPROVAL:
+            raise CommandLogError("Command is not awaiting approval")
+        if not entry.requires_approval:
+            raise CommandLogError("Command does not require approval")
+        entry.approved_at = datetime.now(timezone.utc)
+        self.command_log.update(entry)
+        return entry
+
+    def apply_approved_command(self, entry: CommandLogEntry) -> ToolResult:
+        if entry.status != CommandStatus.AWAITING_APPROVAL:
+            raise CommandLogError("Command is not awaiting approval")
+        if not entry.requires_approval:
+            raise CommandLogError("Command does not require approval")
+        if entry.approved_at is None:
+            raise CommandLogError("Command has not been approved")
+
+        transition(entry, CommandStatus.EXECUTING)
+        self.command_log.update(entry)
+        try:
+            result = apply_write_proposal(self.store, entry)
+        except WriteProposalError as exc:
             transition(entry, CommandStatus.FAILED)
             entry.error_code = type(exc).__name__
             entry.error_message = str(exc)
@@ -73,7 +114,22 @@ class CommandService:
             raise
 
         transition(entry, CommandStatus.SUCCEEDED)
-        entry.result_summary = result.model_dump(mode="json")
+        summary = dict(entry.result_summary or {})
+        summary["applied_result"] = result.model_dump(mode="json")
+        entry.result_summary = summary
+        self.command_log.update(entry)
+        result.command_id = entry.id
+        return result
+
+    def _store_write_proposal(self, entry: CommandLogEntry, result: ToolResult) -> ToolResult:
+        transition(entry, CommandStatus.AWAITING_APPROVAL)
+        entry.requires_approval = True
+        prior = dict(entry.result_summary or {})
+        entry.result_summary = {
+            **prior,
+            "proposal": result.proposal,
+            "proposal_preview": result.model_dump(mode="json"),
+        }
         self.command_log.update(entry)
         result.command_id = entry.id
         return result

@@ -22,6 +22,8 @@ from tools.read_inputs import (
     SearchContactsInput,
 )
 from tools.risk import RiskClass
+from tools.write_handlers import handle_propose_create_followup
+from tools.write_inputs import ProposeCreateFollowupInput
 
 
 class ToolRegistryError(Exception):
@@ -120,6 +122,15 @@ def build_default_registry() -> ToolRegistry:
             input_model=CalculatePipelineAnalyticsInput,
             handler=handle_calculate_pipeline_analytics,
             description="Read-only deterministic pipeline metrics.",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="propose_create_followup",
+            risk_class=RiskClass.PROPOSE,
+            input_model=ProposeCreateFollowupInput,
+            handler=handle_propose_create_followup,
+            description="Propose a follow-up task without committing it.",
         )
     )
     return registry

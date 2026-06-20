@@ -46,6 +46,7 @@ _ALLOWED_TRANSITIONS: dict[CommandStatus, set[CommandStatus]] = {
     },
     CommandStatus.EXECUTING: {
         CommandStatus.SUCCEEDED,
+        CommandStatus.AWAITING_APPROVAL,
         CommandStatus.FAILED,
     },
     CommandStatus.SUCCEEDED: set(),
