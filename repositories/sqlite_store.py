@@ -78,6 +78,25 @@ class SqliteContactStore:
     def list_contact_emails(self, limit: int = 50) -> List[Dict[str, Any]]:
         return db.list_contact_emails(limit, **self._kwargs())
 
+    def list_contact_method_records(self) -> List[Dict[str, Any]]:
+        leads = {lead["id"]: lead for lead in db.list_leads(**self._kwargs())}
+        records: List[Dict[str, Any]] = []
+        for row in db.list_contact_emails(10_000, **self._kwargs()):
+            lead = leads.get(row["lead_id"], {})
+            records.append(
+                {
+                    "lead_id": row["lead_id"],
+                    "company_name": row["company_name"],
+                    "person_name": row.get("person_name"),
+                    "kind": "email",
+                    "value": row["email"],
+                    "verification_status": "unverified",
+                    "organization_status": lead.get("status"),
+                    "fit_score": int(lead.get("fit_score") or 0),
+                }
+            )
+        return records
+
     def get_followups_due(self) -> List[Dict[str, Any]]:
         return db.get_followups_due(**self._kwargs())
 

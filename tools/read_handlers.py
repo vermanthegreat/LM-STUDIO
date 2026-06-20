@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from pydantic import BaseModel
@@ -12,6 +13,7 @@ from tools.read_inputs import (
     CalculatePipelineAnalyticsInput,
     FindCompaniesMissingEmailInput,
     ListDueFollowupsInput,
+    ListUnverifiedContactMethodsInput,
     MissingEmailDefinition,
     PipelineMetric,
     SearchContactsInput,
@@ -19,6 +21,10 @@ from tools.read_inputs import (
 
 
 _SQLITE_VERIFICATION_WARNING = "sqlite_backend_verification_not_tracked"
+_VERIFIED_CONTACT_STATUS = "verified"
+_NON_VERIFIED_CONTACT_STATUSES = frozenset(
+    {"unverified", "syntax_valid", "source_confirmed"},
+)
 
 
 def _sqlite_verification_warnings(store: ContactStore, *, uses_verified_semantics: bool) -> list[str]:
@@ -125,15 +131,29 @@ def handle_find_companies_missing_email(store: ContactStore, args: BaseModel) ->
 
 def handle_list_due_followups(store: ContactStore, args: BaseModel) -> ToolResult:
     params = ListDueFollowupsInput.model_validate(args)
+    cutoff = params.due_on_or_before or date.today()
     records = store.get_followups_due()
     filtered: list[dict[str, Any]] = []
     for item in records:
-        if params.status and item.get("status") != params.status:
+        if params.item_type and item.get("item_type") != params.item_type:
+            continue
+        item_status = str(item.get("status") or "open")
+        if params.status and item_status != params.status:
             continue
         if params.priority and item.get("priority") != params.priority:
             continue
+        due_raw = item.get("due_date")
+        if due_raw:
+            due_value = date.fromisoformat(str(due_raw)[:10])
+            if due_value > cutoff:
+                continue
         filtered.append(item)
     page = filtered[: params.limit]
+    warnings = [f"due_on_or_before={cutoff.isoformat()}"]
+    if params.item_type:
+        warnings.append(f"item_type={params.item_type}")
+    if params.priority:
+        warnings.append(f"priority={params.priority}")
     return ToolResult(
         tool_name="list_due_followups",
         status="ok",
@@ -141,6 +161,52 @@ def handle_list_due_followups(store: ContactStore, args: BaseModel) -> ToolResul
         records=page,
         record_count=len(filtered),
         provenance=["repository:get_followups_due"],
+        warnings=warnings,
+    )
+
+
+def handle_list_unverified_contact_methods(store: ContactStore, args: BaseModel) -> ToolResult:
+    params = ListUnverifiedContactMethodsInput.model_validate(args)
+    records: list[dict[str, Any]] = []
+    for row in store.list_contact_method_records():
+        status = str(row.get("verification_status") or "unverified")
+        if status == _VERIFIED_CONTACT_STATUS:
+            continue
+        if status not in _NON_VERIFIED_CONTACT_STATUSES:
+            continue
+        if params.verification_status and status != params.verification_status.value:
+            continue
+        if params.kind and row.get("kind") != params.kind.value:
+            continue
+        if params.organization_status and row.get("organization_status") != params.organization_status:
+            continue
+        if params.minimum_relevance is not None and int(row.get("fit_score") or 0) < params.minimum_relevance:
+            continue
+        records.append(
+            {
+                "lead_id": row.get("lead_id"),
+                "company_name": row.get("company_name"),
+                "person_name": row.get("person_name"),
+                "kind": row.get("kind"),
+                "value": row.get("value"),
+                "verification_status": status,
+            }
+        )
+    page = records[: params.limit]
+    warnings = ["verification_scope=non_verified_only"]
+    warnings.extend(_sqlite_verification_warnings(store, uses_verified_semantics=True))
+    if params.kind:
+        warnings.append(f"kind={params.kind.value}")
+    if params.verification_status:
+        warnings.append(f"verification_status={params.verification_status.value}")
+    return ToolResult(
+        tool_name="list_unverified_contact_methods",
+        status="ok",
+        summary=f"Found {len(records)} unverified contact method(s).",
+        records=page,
+        record_count=len(records),
+        provenance=["repository:list_contact_method_records"],
+        warnings=warnings,
     )
 
 

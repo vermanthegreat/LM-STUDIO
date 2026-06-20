@@ -301,6 +301,40 @@ class PostgresContactStore:
             if self._session is None:
                 session.close()
 
+    def list_contact_method_records(self) -> List[Dict[str, Any]]:
+        session = self._active_session()
+        try:
+            records: List[Dict[str, Any]] = []
+            methods = session.scalars(select(ContactMethod)).all()
+            for method in methods:
+                org = None
+                person_name = None
+                if method.organization_id:
+                    org = session.get(Organization, method.organization_id)
+                elif method.person_id:
+                    person = session.get(Person, method.person_id)
+                    if person:
+                        person_name = person.name
+                        org = person.organization
+                if org is None:
+                    continue
+                records.append(
+                    {
+                        "lead_id": org.legacy_lead_id,
+                        "company_name": org.name,
+                        "person_name": person_name,
+                        "kind": method.kind,
+                        "value": method.value,
+                        "verification_status": method.verification_status,
+                        "organization_status": org.status,
+                        "fit_score": int(org.relevance_score or 0),
+                    }
+                )
+            return records
+        finally:
+            if self._session is None:
+                session.close()
+
     def get_followups_due(self) -> List[Dict[str, Any]]:
         session = self._active_session()
         try:

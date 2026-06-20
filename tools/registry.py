@@ -13,12 +13,14 @@ from tools.read_handlers import (
     handle_calculate_pipeline_analytics,
     handle_find_companies_missing_email,
     handle_list_due_followups,
+    handle_list_unverified_contact_methods,
     handle_search_contacts,
 )
 from tools.read_inputs import (
     CalculatePipelineAnalyticsInput,
     FindCompaniesMissingEmailInput,
     ListDueFollowupsInput,
+    ListUnverifiedContactMethodsInput,
     SearchContactsInput,
 )
 from tools.risk import RiskClass
@@ -113,6 +115,15 @@ def build_default_registry() -> ToolRegistry:
             input_model=ListDueFollowupsInput,
             handler=handle_list_due_followups,
             description="Read-only open follow-up tasks.",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="list_unverified_contact_methods",
+            risk_class=RiskClass.READ,
+            input_model=ListUnverifiedContactMethodsInput,
+            handler=handle_list_unverified_contact_methods,
+            description="Read-only unverified contact methods with filterable kind and status.",
         )
     )
     registry.register(
