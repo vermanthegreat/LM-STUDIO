@@ -63,6 +63,7 @@ class Person(Base, TimestampMixin):
     is_decision_maker: Mapped[bool] = mapped_column(Boolean, default=False)
     relevance_score: Mapped[int] = mapped_column(Integer, default=0)
     relevance_reason: Mapped[Optional[str]] = mapped_column(Text)
+    legacy_person_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True)
     legacy_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
 
     organization: Mapped[Optional[Organization]] = relationship(back_populates="people")
