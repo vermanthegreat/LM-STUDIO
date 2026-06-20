@@ -274,6 +274,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE people ADD COLUMN email TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_people_email ON people(email)")
 
+    task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "created_by_command_id" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN created_by_command_id TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_created_by_command_id "
+        "ON tasks(created_by_command_id) WHERE created_by_command_id IS NOT NULL"
+    )
+
 
 def _json_dumps(obj: Any) -> Optional[str]:
     if obj is None:
@@ -618,13 +626,26 @@ def add_task(
     conn: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
     now = _now()
+    created_by_command_id = data.get("created_by_command_id")
+
+    def _find_existing(c: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+        if not created_by_command_id:
+            return None
+        row = c.execute(
+            "SELECT * FROM tasks WHERE created_by_command_id = ?",
+            (str(created_by_command_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
     def _run(c: sqlite3.Connection) -> Dict[str, Any]:
+        existing = _find_existing(c)
+        if existing is not None:
+            return existing
         cur = c.execute(
             """INSERT INTO tasks
                (lead_id, person_id, title, due_date, priority, status,
-                source_interaction_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_interaction_id, created_at, created_by_command_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 lead_id,
                 data.get("person_id"),
@@ -634,10 +655,29 @@ def add_task(
                 data.get("status", "open"),
                 data.get("source_interaction_id"),
                 now,
+                str(created_by_command_id) if created_by_command_id else None,
             ),
         )
         row = c.execute("SELECT * FROM tasks WHERE id = ?", (cur.lastrowid,)).fetchone()
         return dict(row)
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def find_task_by_created_by_command_id(
+    command_id: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[Dict[str, Any]]:
+    def _run(c: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+        row = c.execute(
+            "SELECT * FROM tasks WHERE created_by_command_id = ?",
+            (str(command_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
     if conn is not None:
         return _run(conn)

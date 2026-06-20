@@ -12,6 +12,7 @@ import db
 from persistence.models import CommandLog as CommandLogModel
 from persistence.session import init_schema, session_scope
 from repositories import ContactStore
+from repositories.sqlite_store import get_active_sqlite_connection
 from services.command_log import CommandLogEntry, CommandStatus, InMemoryCommandLog
 from services.write_proposal_constants import WRITE_PROPOSAL_TOOL_NAMES
 
@@ -86,6 +87,46 @@ class SqliteCommandLogStore:
         self.database_path = database_path
         db.init_db(database_path)
 
+    def _resolve_conn(self):
+        return get_active_sqlite_connection(self.database_path)
+
+    def _update_on_conn(self, conn, entry: CommandLogEntry) -> None:
+        conn.execute(
+            """
+            UPDATE command_log SET
+                command_text = ?,
+                intent = ?,
+                tool_name = ?,
+                tool_arguments_json = ?,
+                risk_class = ?,
+                status = ?,
+                requires_approval = ?,
+                approved_at = ?,
+                result_summary_json = ?,
+                error_code = ?,
+                error_message = ?,
+                correlation_id = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                entry.command_text,
+                entry.intent,
+                entry.tool_name,
+                _json_dumps(entry.tool_arguments),
+                entry.risk_class,
+                entry.status.value,
+                int(entry.requires_approval),
+                _dt_to_str(entry.approved_at),
+                _json_dumps(entry.result_summary),
+                entry.error_code,
+                entry.error_message,
+                entry.correlation_id,
+                _dt_to_str(entry.updated_at),
+                str(entry.id),
+            ),
+        )
+
     def create(self, command_text: str, *, correlation_id: Optional[str] = None) -> CommandLogEntry:
         entry = CommandLogEntry(
             id=uuid4(),
@@ -122,6 +163,13 @@ class SqliteCommandLogStore:
         return entry
 
     def get(self, command_id: UUID) -> Optional[CommandLogEntry]:
+        conn = self._resolve_conn()
+        if conn is not None:
+            row = conn.execute(
+                "SELECT * FROM command_log WHERE id = ?",
+                (str(command_id),),
+            ).fetchone()
+            return _sqlite_row_to_entry(row) if row else None
         with db.get_conn(self.database_path) as conn:
             row = conn.execute(
                 "SELECT * FROM command_log WHERE id = ?",
@@ -131,42 +179,12 @@ class SqliteCommandLogStore:
 
     def update(self, entry: CommandLogEntry) -> None:
         entry.updated_at = datetime.now(timezone.utc)
+        conn = self._resolve_conn()
+        if conn is not None:
+            self._update_on_conn(conn, entry)
+            return
         with db.get_conn(self.database_path) as conn:
-            conn.execute(
-                """
-                UPDATE command_log SET
-                    command_text = ?,
-                    intent = ?,
-                    tool_name = ?,
-                    tool_arguments_json = ?,
-                    risk_class = ?,
-                    status = ?,
-                    requires_approval = ?,
-                    approved_at = ?,
-                    result_summary_json = ?,
-                    error_code = ?,
-                    error_message = ?,
-                    correlation_id = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    entry.command_text,
-                    entry.intent,
-                    entry.tool_name,
-                    _json_dumps(entry.tool_arguments),
-                    entry.risk_class,
-                    entry.status.value,
-                    int(entry.requires_approval),
-                    _dt_to_str(entry.approved_at),
-                    _json_dumps(entry.result_summary),
-                    entry.error_code,
-                    entry.error_message,
-                    entry.correlation_id,
-                    _dt_to_str(entry.updated_at),
-                    str(entry.id),
-                ),
-            )
+            self._update_on_conn(conn, entry)
 
 
     def list_pending_write_proposals(self) -> list[CommandLogEntry]:

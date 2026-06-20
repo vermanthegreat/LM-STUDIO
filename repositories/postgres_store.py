@@ -8,6 +8,7 @@ import io
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
 
 import db as sqlite_db
 from persistence.models import (
@@ -745,6 +746,18 @@ class PostgresContactStore:
             org = self._org_by_lead_id(session, lead_id)
             if not org:
                 raise ValueError(f"Lead {lead_id} not found")
+            created_by_command_id = data.get("created_by_command_id")
+            if created_by_command_id:
+                existing = session.scalar(
+                    select(Task).where(Task.created_by_command_id == UUID(str(created_by_command_id)))
+                )
+                if existing is not None:
+                    return {
+                        "id": existing.legacy_task_id,
+                        "lead_id": lead_id,
+                        "title": existing.title,
+                        "status": existing.status,
+                    }
             due = data.get("due_date")
             due_at = None
             if due:
@@ -755,6 +768,7 @@ class PostgresContactStore:
                 priority=data.get("priority"),
                 status=data.get("status", "open"),
                 due_at=due_at,
+                created_by_command_id=UUID(str(created_by_command_id)) if created_by_command_id else None,
                 legacy_task_id=self._next_legacy_task_id(session),
                 legacy_metadata={
                     "source_interaction_id": data.get("source_interaction_id"),

@@ -12,6 +12,15 @@ import db
 _active_sqlite_tx: ContextVar[tuple[Path, Any] | None] = ContextVar("_active_sqlite_tx", default=None)
 
 
+def get_active_sqlite_connection(database_path: Path) -> Any | None:
+    active = _active_sqlite_tx.get()
+    if active is not None:
+        db_path, conn = active
+        if db_path == database_path:
+            return conn
+    return None
+
+
 class SqliteContactStore:
     backend = "sqlite"
 

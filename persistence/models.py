@@ -194,7 +194,7 @@ class Task(Base, TimestampMixin):
     priority: Mapped[Optional[str]] = mapped_column(String(32))
     due_at: Mapped[Optional[datetime]] = mapped_column()
     completed_at: Mapped[Optional[datetime]] = mapped_column()
-    created_by_command_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    created_by_command_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), unique=True)
     legacy_task_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True)
     legacy_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
 
