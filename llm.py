@@ -65,11 +65,16 @@ def chat_completion(
         return None
 
 
-def call_lmstudio_for_text(prompt: str, timeout_s: float = 8.0) -> Optional[str]:
+def call_lmstudio_for_text(
+    prompt: str,
+    timeout_s: float = 8.0,
+    *,
+    system_prompt: str = "You are an intent classifier.",
+) -> Optional[str]:
     """Call LM Studio for short text with quick timeout. Returns raw or None on error."""
     try:
         messages = [
-            {"role": "system", "content": "You are an intent classifier."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
         payload = {

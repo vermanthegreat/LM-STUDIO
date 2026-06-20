@@ -20,7 +20,7 @@ from llm import chat_completion, call_lmstudio_for_text
 from repositories.sqlite_store import SqliteContactStore
 from services.command_log import CommandLogError, CommandStatus
 from services.command_service import CommandService
-from tools.planner import PlannerToolCall
+from tools.planner import PlannerClarify, PlannerToolCall
 from tools.registry import ToolRegistryError, ToolValidationError, UnknownToolError
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -100,6 +100,23 @@ def answer_question(
     intent = _deterministic_intent(q)
 
     if intent.name == "unknown" and use_llm:
+        from services.llm_planner import plan_question_with_local_llm
+
+        plan = plan_question_with_local_llm(q)
+        if isinstance(plan, PlannerToolCall):
+            return execute_planner_tool_route(
+                q,
+                plan.model_dump(mode="json"),
+                store=store,
+                command_service=command_service,
+            )
+        if isinstance(plan, PlannerClarify):
+            return {
+                "question": q,
+                "intent": "clarify",
+                "answer": plan.question,
+                "data": {"action": "clarify"},
+            }
         intent = _llm_intent(q)
 
     if intent.name == "unknown":
