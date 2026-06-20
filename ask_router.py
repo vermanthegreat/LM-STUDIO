@@ -2,8 +2,8 @@
 
 Flow:
 1. Receive a free-form user question.
-2. Use LM Studio, when enabled, only to decode the request into a safe intent.
-3. Execute read-only SQLite queries against leads.db.
+2. Map deterministic intents to typed read tools when registered.
+3. Fall back to legacy repository intents, then optional LLM intent decode.
 4. Return database-grounded results; optional LLM polish never invents data.
 """
 
@@ -17,6 +17,9 @@ from typing import Any, Dict, List, Optional
 import db
 from llm import chat_completion, call_lmstudio_for_text
 from repositories.sqlite_store import SqliteContactStore
+from services.command_service import CommandService
+from tools.planner import PlannerToolCall
+from tools.registry import ToolRegistryError, ToolValidationError, UnknownToolError
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
@@ -48,6 +51,17 @@ _ALLOWED_INTENTS = {
     "unknown",
 }
 
+_TOOL_ROUTED_INTENTS: dict[str, tuple[str, Any]] = {
+    "leads_without_email": (
+        "find_companies_missing_email",
+        lambda intent: {"missing_definition": "any"},
+    ),
+    "followups_due": (
+        "list_due_followups",
+        lambda intent: {"limit": 50},
+    ),
+}
+
 _STOPWORDS = {
     "and", "are", "for", "from", "that", "the", "with", "who", "which", "what",
     "find", "show", "list", "give", "lead", "leads", "agency", "agencies",
@@ -57,7 +71,13 @@ _STOPWORDS = {
 }
 
 
-def answer_question(question: str, use_llm: bool = False, db_path=None, store=None) -> Dict[str, Any]:
+def answer_question(
+    question: str,
+    use_llm: bool = False,
+    db_path=None,
+    store=None,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
     """Answer a free-form Ask Database question from SQLite."""
     q = (question or "").strip()
     if not q:
@@ -72,6 +92,26 @@ def answer_question(question: str, use_llm: bool = False, db_path=None, store=No
 
     if intent.name == "unknown":
         intent = _fallback_search_intent(q)
+
+    if intent.name in _TOOL_ROUTED_INTENTS:
+        tool_name, args_builder = _TOOL_ROUTED_INTENTS[intent.name]
+        tool_response = execute_tool_route(
+            q,
+            tool_name,
+            args_builder(intent),
+            store=store,
+            command_service=command_service,
+        )
+        if tool_response.get("intent") != "tool_error":
+            answer = tool_response["answer"]
+            if use_llm and tool_response.get("data"):
+                polished = _polish_answer(q, answer, tool_response["data"])
+                if polished:
+                    answer = polished
+            return {
+                **tool_response,
+                "answer": answer,
+            }
 
     result = _execute_intent(intent, store=store)
     answer = result["answer"]
@@ -304,6 +344,105 @@ def _execute_intent(intent: AskIntent, *, store) -> Dict[str, Any]:
         }
 
     return _unknown(store=store)
+
+
+def execute_tool_route(
+    question: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """Execute a registered read tool with command-log audit for /ask routing."""
+    service = command_service or CommandService(store)
+    entry = service.receive(question)
+    try:
+        service.registry.get(tool_name)
+        validated = service.registry.validate_arguments(tool_name, arguments)
+        payload = validated.model_dump(mode="json")
+    except (UnknownToolError, ToolValidationError) as exc:
+        service.reject(entry, code=type(exc).__name__, message=str(exc))
+        return {
+            "question": question,
+            "intent": "tool_error",
+            "answer": str(exc),
+            "data": {
+                "command_id": str(entry.id),
+                "command_status": entry.status.value,
+                "tool_name": tool_name,
+            },
+        }
+
+    service.plan_tool_call(
+        entry,
+        PlannerToolCall(
+            tool_name=tool_name,
+            arguments=payload,
+            reason="Deterministic /ask route.",
+        ),
+    )
+    try:
+        result = service.execute_planned_tool(entry)
+    except ToolRegistryError as exc:
+        updated = service.get_command(entry.id)
+        return {
+            "question": question,
+            "intent": "tool_error",
+            "answer": str(exc),
+            "data": {
+                "command_id": str(entry.id),
+                "command_status": updated.status.value if updated else "failed",
+                "tool_name": tool_name,
+            },
+        }
+
+    return _tool_result_to_ask_response(question, tool_name, result, entry)
+
+
+def _tool_result_to_ask_response(
+    question: str,
+    tool_name: str,
+    result,
+    entry,
+) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "command_id": str(entry.id),
+        "command_status": entry.status.value,
+        "tool_name": tool_name,
+        "record_count": result.record_count,
+    }
+    if tool_name == "find_companies_missing_email":
+        data["leads"] = result.records
+        return {
+            "question": question,
+            "intent": "leads_without_email",
+            "answer": _format_leads(result.records, "Companies missing email:"),
+            "data": data,
+        }
+    if tool_name == "list_due_followups":
+        data["items"] = result.records
+        lines = ["Follow-ups due:"]
+        for item in result.records[:10]:
+            lines.append(
+                f"- {item.get('company_name')}: {item.get('title') or item.get('subject')} "
+                f"(due {item.get('due_date')})"
+            )
+        if len(lines) == 1:
+            lines.append("(none)")
+        return {
+            "question": question,
+            "intent": "followups_due",
+            "answer": "\n".join(lines),
+            "data": data,
+        }
+    data["records"] = result.records
+    return {
+        "question": question,
+        "intent": tool_name,
+        "answer": result.summary,
+        "data": data,
+    }
 
 
 def _search_leads(leads: List[Dict[str, Any]], intent: AskIntent) -> List[Dict[str, Any]]:
