@@ -918,8 +918,16 @@ def parse_and_save(
     extraction_status = "ok"
     confidence = 0.0
     llm_attempted = bool(llm_raw)
+    pg_proposal_mode = getattr(store, "backend", None) == "postgresql"
 
     validated = try_validate_extraction(parsed) if parsed and isinstance(parsed, dict) else None
+    contact_proposal_fields: dict[str, Any] = {}
+    if isinstance(parsed, dict):
+        contact_proposal_fields = {
+            "company_email": parsed.get("company_email"),
+            "company_phone": parsed.get("company_phone"),
+            "people": parsed.get("people") or [],
+        }
     if validated is not None:
         parsed = extraction_to_dict(validated)
         confidence = validated.confidence
@@ -930,6 +938,10 @@ def parse_and_save(
         confidence = float(parsed.get("confidence") or 0.4)
         if llm_attempted:
             extraction_status = "needs_review"
+    if pg_proposal_mode:
+        for key, value in contact_proposal_fields.items():
+            if value:
+                parsed[key] = value
 
     if "raw_text" not in parsed:
         parsed["raw_text"] = raw_text
@@ -986,6 +998,9 @@ def parse_and_save(
                 "confidence": confidence,
                 "extraction_status": extraction_status,
             }
+            if pg_proposal_mode:
+                lead_data.pop("company_email", None)
+                lead_data.pop("company_phone", None)
             if lead_id:
                 if source_type == "email":
                     lead_data.pop("company_name", None)
@@ -1010,22 +1025,23 @@ def parse_and_save(
             raw_source["lead_id"] = lead_id
 
         people_saved = []
-        for person in parsed.get("people") or []:
-            if not person.get("name") and not person.get("email"):
-                continue
-            if not lead_id:
-                continue
-            cls = classify_person_title(person.get("title"))
-            p = store.add_person(
-                lead_id,
-                {
-                    **person,
-                    **cls,
-                    "confidence": confidence,
-                },
-                raw_source_id=raw_source["id"],
-            )
-            people_saved.append(p)
+        if not pg_proposal_mode:
+            for person in parsed.get("people") or []:
+                if not person.get("name") and not person.get("email"):
+                    continue
+                if not lead_id:
+                    continue
+                cls = classify_person_title(person.get("title"))
+                p = store.add_person(
+                    lead_id,
+                    {
+                        **person,
+                        **cls,
+                        "confidence": confidence,
+                    },
+                    raw_source_id=raw_source["id"],
+                )
+                people_saved.append(p)
 
         interaction_saved = None
         task_saved = None

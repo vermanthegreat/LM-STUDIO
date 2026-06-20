@@ -59,12 +59,21 @@ def test_postgres_extraction_proposal_and_contact_methods(pg_store):
     source = pg_store.create_raw_source(
         source_type="note",
         raw_text="Contact: Jane Doe <jane@extraction.example>",
-        parsed_json={"company_name": "Extraction Co", "confidence": 0.8},
+        parsed_json={
+            "company_name": "Extraction Co",
+            "confidence": 0.8,
+            "people": [{"name": "Jane Doe", "email": "jane@extraction.example", "title": "CEO"}],
+        },
         extraction_status="needs_review",
         confidence=0.8,
         lead_id=lead["id"],
     )
     assert source["id"] is not None
+    assert pg_store.get_extraction_status_for_source(source["id"]) == "proposed"
+
+    detail = pg_store.get_lead(lead["id"])
+    assert detail is not None
+    assert len(detail["people"]) == 0
 
     pg_store.add_person(
         lead["id"],

@@ -328,9 +328,74 @@ class PostgresContactStore:
                         "verification_status": method.verification_status,
                         "organization_status": org.status,
                         "fit_score": int(org.relevance_score or 0),
+                        "proposal": False,
                     }
                 )
+            records.extend(self._proposed_contact_records_from_extractions(session))
             return records
+        finally:
+            if self._session is None:
+                session.close()
+
+    def _proposed_contact_records_from_extractions(self, session: Session) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        extractions = session.scalars(select(Extraction).where(Extraction.status == "proposed")).all()
+        for extraction in extractions:
+            source = session.get(Source, extraction.source_id)
+            if source is None or source.organization_id is None:
+                continue
+            org = session.get(Organization, source.organization_id)
+            if org is None:
+                continue
+            output = extraction.structured_output if isinstance(extraction.structured_output, dict) else {}
+            company_email = (output.get("company_email") or "").strip()
+            if company_email:
+                records.append(
+                    {
+                        "lead_id": org.legacy_lead_id,
+                        "company_name": org.name,
+                        "person_name": None,
+                        "kind": "email",
+                        "value": company_email,
+                        "verification_status": "unverified",
+                        "organization_status": org.status,
+                        "fit_score": int(org.relevance_score or 0),
+                        "proposal": True,
+                    }
+                )
+            for person in output.get("people") or []:
+                if not isinstance(person, dict):
+                    continue
+                email = (person.get("email") or "").strip()
+                if not email:
+                    continue
+                records.append(
+                    {
+                        "lead_id": org.legacy_lead_id,
+                        "company_name": org.name,
+                        "person_name": person.get("name"),
+                        "kind": "email",
+                        "value": email,
+                        "verification_status": "unverified",
+                        "organization_status": org.status,
+                        "fit_score": int(org.relevance_score or 0),
+                        "proposal": True,
+                    }
+                )
+        return records
+
+    def get_extraction_status_for_source(self, raw_source_id: int) -> Optional[str]:
+        session = self._active_session()
+        try:
+            source = self._source_by_legacy_id(session, raw_source_id)
+            if source is None:
+                return None
+            extraction = session.scalar(
+                select(Extraction)
+                .where(Extraction.source_id == source.id)
+                .order_by(Extraction.created_at.desc())
+            )
+            return extraction.status if extraction else None
         finally:
             if self._session is None:
                 session.close()
@@ -549,6 +614,8 @@ class PostgresContactStore:
             )
         )
         if existing:
+            if existing.verification_status == "verified":
+                return
             existing.value = value
             return
         session.add(
@@ -604,7 +671,6 @@ class PostgresContactStore:
             )
             session.add(extraction)
             session.flush()
-            self._approve_extraction(session, extraction, org)
 
             if own_session:
                 session.commit()
