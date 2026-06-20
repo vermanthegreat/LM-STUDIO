@@ -7,10 +7,11 @@ import os
 import db
 import pytest
 from persistence.models import ContactMethod, Organization
-from persistence.session import get_engine, init_schema, reset_cached_engines, session_scope
+from persistence.session import get_engine, reset_cached_engines, session_scope
 from repositories.postgres_store import PostgresContactStore
 from repositories.sqlite_store import SqliteContactStore
 from sqlalchemy import select
+from tests.pg_support import run_alembic_upgrade
 from tools.registry import build_default_registry
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -76,8 +77,9 @@ def test_sqlite_verified_email_coverage_is_zero(tmp_path):
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL is not configured")
 def test_postgres_verified_email_missing_and_coverage():
     reset_cached_engines()
-    init_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
     store = PostgresContactStore(TEST_DATABASE_URL)
+    store.init_db()
     registry = build_default_registry()
 
     verified_lead, _ = store.upsert_lead(

@@ -8,12 +8,11 @@ from pathlib import Path
 
 import db
 import pytest
-from alembic import command
-from alembic.config import Config
 from persistence.models import Base, Interaction, Organization, Person, Task
 from persistence.session import get_engine, reset_cached_engines
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
+from tests.pg_support import reset_public_schema, run_alembic_upgrade
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,21 +27,6 @@ pytestmark = pytest.mark.skipif(
     not TEST_DATABASE_URL,
     reason="TEST_DATABASE_URL is not configured",
 )
-
-
-def _alembic_config(database_url: str) -> Config:
-    cfg = Config(str(ROOT / "alembic.ini"))
-    cfg.set_main_option("script_location", str(ROOT / "migrations"))
-    os.environ["DATABASE_URL"] = database_url
-    return cfg
-
-
-def _reset_public_schema(database_url: str) -> None:
-    engine = get_engine(database_url)
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE"))
-        conn.execute(text("CREATE SCHEMA public"))
-    reset_cached_engines()
 
 
 def _seed_sqlite(db_path: Path) -> dict[str, int]:
@@ -98,8 +82,8 @@ def test_migration_is_repeatable_for_people_interactions_tasks(tmp_path):
     sqlite_path = tmp_path / "legacy.db"
     ids = _seed_sqlite(sqlite_path)
 
-    _reset_public_schema(TEST_DATABASE_URL)
-    command.upgrade(_alembic_config(TEST_DATABASE_URL), "head")
+    reset_public_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
 
     first = migrate(sqlite_path, TEST_DATABASE_URL)
     assert first.migrated_organizations == 1

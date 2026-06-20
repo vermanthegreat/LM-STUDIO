@@ -95,21 +95,21 @@ Only enable PostgreSQL for disposable development or test databases:
 # Optional: switch runtime (experimental)
 export DATABASE_URL=postgresql://user:password@localhost:5432/contacts_dev
 
-# Create schema (first run on a disposable DB)
-python -c "from persistence.session import init_schema; import os; init_schema(os.environ['DATABASE_URL'])"
+# Initialize schema with Alembic (required before first use)
+DATABASE_URL=postgresql://user:password@localhost:5432/contacts_dev alembic upgrade head
 
 # Migrate existing SQLite data — ALWAYS dry-run first; back up valuable data first
 python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL" --dry-run
 python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL"
-
-# Alembic baseline (future migrations)
-DATABASE_URL=... alembic upgrade head
 ```
+
+PostgreSQL schema is created only through Alembic migrations (`alembic upgrade head`). Runtime startup does not call SQLAlchemy `create_all()` for PostgreSQL; if migrations have not been applied, the app fails with a clear error.
 
 **Warning:** Do not run migration against production or valuable `leads.db` data without a dry-run, a backup, and a disposable PostgreSQL target. Review the JSON reconciliation report for skipped and conflicting records before trusting results.
 
 PostgreSQL integration tests (optional; requires disposable `TEST_DATABASE_URL`):
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test python -m pytest tests/test_pg_integration.py -v
+DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test alembic upgrade head
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test python -m pytest tests/test_pg_integration.py tests/test_pg_schema_initialization.py -v
 ```

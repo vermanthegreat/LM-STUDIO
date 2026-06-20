@@ -6,12 +6,11 @@ import os
 from uuid import uuid4
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from persistence.models import Base
-from persistence.session import get_engine, init_schema, reset_cached_engines
+from persistence.session import get_engine, reset_cached_engines
 from repositories.postgres_store import PostgresContactStore
 from sqlalchemy import inspect, text
+from tests.pg_support import reset_public_schema, run_alembic_upgrade
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
@@ -20,25 +19,6 @@ pytestmark = pytest.mark.skipif(
     not TEST_DATABASE_URL,
     reason="TEST_DATABASE_URL is not configured",
 )
-
-
-def _alembic_config(database_url: str) -> Config:
-    cfg = Config("alembic.ini")
-    cfg.set_main_option("script_location", "migrations")
-    os.environ["DATABASE_URL"] = database_url
-    return cfg
-
-
-def _reset_public_schema(database_url: str) -> None:
-    engine = get_engine(database_url)
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE"))
-        conn.execute(text("CREATE SCHEMA public"))
-    reset_cached_engines()
-
-
-def _run_alembic_upgrade(database_url: str, revision: str = "head") -> None:
-    command.upgrade(_alembic_config(database_url), revision)
 
 
 def _tasks_has_unique_command_id(database_url: str) -> bool:
@@ -60,11 +40,11 @@ def _tasks_has_unique_command_id(database_url: str) -> bool:
 
 @pytest.fixture()
 def migrated_pg_store():
-    _reset_public_schema(TEST_DATABASE_URL)
-    init_schema(TEST_DATABASE_URL)
-    _run_alembic_upgrade(TEST_DATABASE_URL, "head")
+    reset_public_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
     assert _tasks_has_unique_command_id(TEST_DATABASE_URL)
     store = PostgresContactStore(TEST_DATABASE_URL)
+    store.init_db()
     yield store
     engine = get_engine(TEST_DATABASE_URL)
     with engine.begin() as conn:
@@ -74,15 +54,14 @@ def migrated_pg_store():
 
 
 def test_alembic_upgrade_head_succeeds_on_disposable_database():
-    _reset_public_schema(TEST_DATABASE_URL)
-    init_schema(TEST_DATABASE_URL)
-    _run_alembic_upgrade(TEST_DATABASE_URL, "head")
+    reset_public_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
     assert _tasks_has_unique_command_id(TEST_DATABASE_URL)
 
 
 def test_migration_adds_created_by_command_id_on_legacy_tasks_table():
-    _reset_public_schema(TEST_DATABASE_URL)
-    init_schema(TEST_DATABASE_URL)
+    reset_public_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
 
     engine = get_engine(TEST_DATABASE_URL)
     with engine.begin() as conn:
@@ -92,7 +71,7 @@ def test_migration_adds_created_by_command_id_on_legacy_tasks_table():
     columns = {column["name"] for column in inspector.get_columns("tasks")}
     assert "created_by_command_id" not in columns
 
-    _run_alembic_upgrade(TEST_DATABASE_URL, "head")
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
     assert _tasks_has_unique_command_id(TEST_DATABASE_URL)
 
 

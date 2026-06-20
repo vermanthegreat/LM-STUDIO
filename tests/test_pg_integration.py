@@ -6,9 +6,10 @@ import os
 
 import pytest
 from persistence.models import Base
-from persistence.session import get_engine, init_schema, reset_cached_engines
+from persistence.session import get_engine, reset_cached_engines
 from repositories.postgres_store import PostgresContactStore
 from sqlalchemy import text
+from tests.pg_support import run_alembic_upgrade
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
@@ -22,8 +23,9 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture()
 def pg_store():
     reset_cached_engines()
-    init_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
     store = PostgresContactStore(TEST_DATABASE_URL)
+    store.init_db()
     yield store
     engine = get_engine(TEST_DATABASE_URL)
     with engine.begin() as conn:
