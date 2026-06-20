@@ -88,6 +88,13 @@ class ContactStore(Protocol):
 
     def update_lead_fit_score(self, lead_id: int, fit_score: int) -> None: ...
 
+    def update_lead_contact_field(
+        self,
+        lead_id: int,
+        field: str,
+        value: str,
+    ) -> Dict[str, Any]: ...
+
     def sanitize_company_name(self, name: Optional[str]) -> Optional[str]: ...
 
     def extract_domain(self, website: Optional[str]) -> Optional[str]: ...

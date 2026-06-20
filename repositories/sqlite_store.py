@@ -136,6 +136,14 @@ class SqliteContactStore:
     def update_lead_fit_score(self, lead_id: int, fit_score: int) -> None:
         db.update_lead_fit_score(lead_id, fit_score, **self._kwargs())
 
+    def update_lead_contact_field(
+        self,
+        lead_id: int,
+        field: str,
+        value: str,
+    ) -> Dict[str, Any]:
+        return db.update_lead_contact_field(lead_id, field, value, **self._kwargs())
+
     def sanitize_company_name(self, name: Optional[str]) -> Optional[str]:
         return db.sanitize_company_name(name)
 

@@ -926,6 +926,46 @@ def update_lead_fit_score(
             _run(c)
 
 
+ALLOWED_LEAD_CONTACT_UPDATE_FIELDS = frozenset({"company_email", "company_phone", "website"})
+
+
+def update_lead_contact_field(
+    lead_id: int,
+    field: str,
+    value: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    if field not in ALLOWED_LEAD_CONTACT_UPDATE_FIELDS:
+        raise ValueError(f"Unsupported contact field: {field}")
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError("Contact field value must not be empty")
+
+    def _run(c: sqlite3.Connection) -> Dict[str, Any]:
+        row = c.execute("SELECT id FROM leads WHERE id = ?", (lead_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Lead not found: {lead_id}")
+        if field == "website":
+            domain = extract_domain(cleaned)
+            c.execute(
+                "UPDATE leads SET website = ?, domain = ?, updated_at = ? WHERE id = ?",
+                (cleaned, domain, _now(), lead_id),
+            )
+        else:
+            c.execute(
+                f"UPDATE leads SET {field} = ?, updated_at = ? WHERE id = ?",
+                (cleaned, _now(), lead_id),
+            )
+        updated = c.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+        return dict(updated)
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
 def _csv_cell(value: Any) -> Any:
     if value is None:
         return ""

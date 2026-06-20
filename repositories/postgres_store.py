@@ -786,6 +786,43 @@ class PostgresContactStore:
             if own_session:
                 session.close()
 
+    def update_lead_contact_field(
+        self,
+        lead_id: int,
+        field: str,
+        value: str,
+    ) -> Dict[str, Any]:
+        if field not in sqlite_db.ALLOWED_LEAD_CONTACT_UPDATE_FIELDS:
+            raise ValueError(f"Unsupported contact field: {field}")
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValueError("Contact field value must not be empty")
+
+        session = self._active_session()
+        own_session = self._session is None
+        try:
+            org = self._org_by_lead_id(session, lead_id)
+            if org is None:
+                raise ValueError(f"Lead not found: {lead_id}")
+            if field == "company_email":
+                self._upsert_org_contact(session, org, "email", cleaned)
+            elif field == "company_phone":
+                self._upsert_org_contact(session, org, "phone", cleaned)
+            elif field == "website":
+                org.website = cleaned
+                org.normalized_domain = sqlite_db.extract_domain(cleaned) or org.normalized_domain
+            if own_session:
+                session.commit()
+                session.refresh(org)
+            return organization_to_lead_row(org)
+        except Exception:
+            if own_session:
+                session.rollback()
+            raise
+        finally:
+            if own_session:
+                session.close()
+
     def sanitize_company_name(self, name: Optional[str]) -> Optional[str]:
         return sqlite_db.sanitize_company_name(name)
 

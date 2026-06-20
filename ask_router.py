@@ -626,7 +626,7 @@ def _proposal_result_to_ask_response(
         "proposal": result.proposal,
         "record_count": 0,
     }
-    if tool_name == "propose_create_followup":
+    if tool_name in {"propose_create_followup", "propose_contact_update"}:
         return {
             "question": question,
             "intent": "write_proposal",
