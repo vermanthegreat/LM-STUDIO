@@ -467,6 +467,12 @@ class PostgresContactStore:
                     meta[key] = data[key]
             org.legacy_metadata = meta
 
+            if org.legacy_lead_id is None:
+                org.legacy_lead_id = (
+                    lead_id if lead_id is not None else self._next_legacy_lead_id(session)
+                )
+            session.flush()
+
             if data.get("company_email"):
                 self._upsert_org_contact(session, org, "email", data["company_email"])
             if data.get("company_phone"):
@@ -579,6 +585,10 @@ class PostgresContactStore:
     ) -> None:
         extraction.status = "approved"
         extraction.approved_at = datetime.now(timezone.utc)
+
+    def _next_legacy_lead_id(self, session: Session) -> int:
+        current = session.scalar(select(func.max(Organization.legacy_lead_id))) or 0
+        return int(current) + 1
 
     def _next_legacy_source_id(self, session: Session) -> int:
         current = session.scalar(select(func.max(Source.legacy_source_id))) or 0

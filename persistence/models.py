@@ -11,7 +11,6 @@ from sqlalchemy import (
     CheckConstraint,
     Float,
     ForeignKey,
-    Identity,
     Index,
     Integer,
     String,
@@ -29,7 +28,7 @@ class Organization(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
     legacy_lead_id: Mapped[Optional[int]] = mapped_column(
-        Integer, Identity(always=False), unique=True, index=True
+        Integer, unique=True, index=True
     )
     name: Mapped[Optional[str]] = mapped_column(String(512))
     normalized_name: Mapped[Optional[str]] = mapped_column(String(512), index=True)
