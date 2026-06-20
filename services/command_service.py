@@ -14,6 +14,7 @@ from services.command_log import (
     CommandStatus,
     transition,
 )
+from services.write_proposal_authority import load_stored_write_proposal
 from services.write_proposals import apply_write_proposal
 from tools.envelope import ToolResult
 from tools.planner import PlannerClarify, PlannerToolCall
@@ -86,17 +87,33 @@ class CommandService:
         return result
 
     def approve_command(self, entry: CommandLogEntry) -> CommandLogEntry:
+        entry = self._reload_command_entry(entry.id)
+        if entry.status == CommandStatus.SUCCEEDED:
+            raise CommandLogError("Write proposal has already been applied")
+        if entry.status == CommandStatus.FAILED:
+            raise CommandLogError("Command is in failed state and cannot be approved")
+        if entry.status == CommandStatus.REJECTED:
+            raise CommandLogError("Command was rejected and cannot be approved")
         if entry.status != CommandStatus.AWAITING_APPROVAL:
             raise CommandLogError("Command is not awaiting approval")
         if not entry.requires_approval:
             raise CommandLogError("Command does not require approval")
+        try:
+            load_stored_write_proposal(entry)
+        except WriteProposalError as exc:
+            raise CommandLogError(str(exc)) from exc
         entry.approved_at = datetime.now(timezone.utc)
         self.command_log.update(entry)
         return entry
 
     def apply_approved_command(self, entry: CommandLogEntry) -> ToolResult:
+        entry = self._reload_command_entry(entry.id)
         if entry.status == CommandStatus.SUCCEEDED:
             raise CommandLogError("Write proposal has already been applied")
+        if entry.status == CommandStatus.FAILED:
+            raise CommandLogError("Command is in failed state and cannot be applied")
+        if entry.status == CommandStatus.REJECTED:
+            raise CommandLogError("Command was rejected and cannot be applied")
         if entry.status != CommandStatus.AWAITING_APPROVAL:
             raise CommandLogError("Command is not awaiting approval")
         if not entry.requires_approval:
@@ -113,7 +130,7 @@ class CommandService:
             entry.error_code = type(exc).__name__
             entry.error_message = str(exc)
             self.command_log.update(entry)
-            raise
+            raise CommandLogError(str(exc)) from exc
 
         transition(entry, CommandStatus.SUCCEEDED)
         summary = dict(entry.result_summary or {})
@@ -122,6 +139,12 @@ class CommandService:
         self.command_log.update(entry)
         result.command_id = entry.id
         return result
+
+    def _reload_command_entry(self, command_id: UUID) -> CommandLogEntry:
+        entry = self.command_log.get(command_id)
+        if entry is None:
+            raise CommandLogError(f"Command {command_id} was not found")
+        return entry
 
     def _store_write_proposal(self, entry: CommandLogEntry, result: ToolResult) -> ToolResult:
         transition(entry, CommandStatus.AWAITING_APPROVAL)
