@@ -91,3 +91,22 @@ def test_postgres_store_init_db_fails_without_migrations():
     store = PostgresContactStore(TEST_DATABASE_URL)
     with pytest.raises(PostgreSQLSchemaError, match="alembic upgrade head"):
         store.init_db()
+
+
+def test_init_schema_fails_when_required_columns_are_missing():
+    reset_public_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
+    reset_cached_engines()
+
+    engine = get_engine(TEST_DATABASE_URL)
+    with engine.begin() as conn:
+        from sqlalchemy import text
+
+        conn.execute(text("ALTER TABLE people DROP COLUMN IF EXISTS legacy_person_id"))
+
+    with pytest.raises(PostgreSQLSchemaError, match="people.legacy_person_id"):
+        init_schema(TEST_DATABASE_URL)
+
+    reset_public_schema(TEST_DATABASE_URL)
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
+    reset_cached_engines()

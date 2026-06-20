@@ -12,6 +12,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from persistence.models import Base
 
 _REQUIRED_POSTGRESQL_TABLES = ("organizations", "command_log")
+_REQUIRED_POSTGRESQL_COLUMNS: dict[str, tuple[str, ...]] = {
+    "people": ("legacy_person_id",),
+}
 _POSTGRESQL_MIGRATION_HINT = (
     "PostgreSQL schema is not initialized. "
     "Run migrations before using this database: "
@@ -56,10 +59,25 @@ def get_session_factory(database_url: str) -> sessionmaker[Session]:
 def ensure_postgresql_schema(engine: Engine) -> None:
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
-    missing = [name for name in _REQUIRED_POSTGRESQL_TABLES if name not in tables]
-    if missing:
+    missing_tables = [name for name in _REQUIRED_POSTGRESQL_TABLES if name not in tables]
+    if missing_tables:
         raise PostgreSQLSchemaError(
-            f"{_POSTGRESQL_MIGRATION_HINT} (missing tables: {', '.join(missing)})"
+            f"{_POSTGRESQL_MIGRATION_HINT} (missing tables: {', '.join(missing_tables)})"
+        )
+
+    missing_columns: list[str] = []
+    for table_name, column_names in _REQUIRED_POSTGRESQL_COLUMNS.items():
+        if table_name not in tables:
+            missing_columns.extend(f"{table_name}.{column}" for column in column_names)
+            continue
+        present = {column["name"] for column in inspector.get_columns(table_name)}
+        for column_name in column_names:
+            if column_name not in present:
+                missing_columns.append(f"{table_name}.{column_name}")
+
+    if missing_columns:
+        raise PostgreSQLSchemaError(
+            f"{_POSTGRESQL_MIGRATION_HINT} (missing columns: {', '.join(missing_columns)})"
         )
 
 
