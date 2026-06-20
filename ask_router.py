@@ -77,6 +77,7 @@ def answer_question(
     db_path=None,
     store=None,
     command_service: Optional[CommandService] = None,
+    planner_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Answer a free-form Ask Database question from SQLite."""
     q = (question or "").strip()
@@ -112,6 +113,14 @@ def answer_question(
                 **tool_response,
                 "answer": answer,
             }
+
+    if planner_payload is not None:
+        return execute_planner_read_tool_route(
+            q,
+            planner_payload,
+            store=store,
+            command_service=command_service,
+        )
 
     result = _execute_intent(intent, store=store)
     answer = result["answer"]
@@ -398,6 +407,37 @@ def execute_tool_route(
         }
 
     return _tool_result_to_ask_response(question, tool_name, result, entry)
+
+
+def execute_planner_read_tool_route(
+    question: str,
+    payload: Dict[str, Any],
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """Execute one validated read-only planner tool call for /ask."""
+    from services.planner_validation import execute_planner_read_tool_call
+
+    service = command_service or CommandService(store)
+    outcome = execute_planner_read_tool_call(
+        service,
+        command_text=question,
+        payload=payload,
+    )
+    if outcome["status"] != "ok":
+        return {
+            "question": question,
+            "intent": outcome["intent"],
+            "answer": outcome["message"],
+            "data": outcome["data"],
+        }
+    return _tool_result_to_ask_response(
+        question,
+        outcome["tool_name"],
+        outcome["result"],
+        outcome["entry"],
+    )
 
 
 def _tool_result_to_ask_response(
