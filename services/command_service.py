@@ -95,6 +95,8 @@ class CommandService:
         return entry
 
     def apply_approved_command(self, entry: CommandLogEntry) -> ToolResult:
+        if entry.status == CommandStatus.SUCCEEDED:
+            raise CommandLogError("Write proposal has already been applied")
         if entry.status != CommandStatus.AWAITING_APPROVAL:
             raise CommandLogError("Command is not awaiting approval")
         if not entry.requires_approval:

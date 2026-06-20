@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from ask_router import answer_question
+from ask_router import answer_question, apply_write_proposal_route, approve_write_proposal_route
 from config import AppConfig
 from errors import AppError, ValidationError
 from extractor import parse_and_save
@@ -154,6 +154,30 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "ask.html",
             {"request": request, "result": result},
         )
+
+    @application.post("/ask/commands/{command_id}/approve")
+    def ask_approve_command(request: Request, command_id: str):
+        assert_safe_mutation_request(request, port=cfg.port)
+        from uuid import UUID
+
+        result = approve_write_proposal_route(
+            UUID(command_id),
+            store=request.app.state.store,
+        )
+        status_code = 200 if result["status"] == "ok" else 409
+        return JSONResponse(status_code=status_code, content=result)
+
+    @application.post("/ask/commands/{command_id}/apply")
+    def ask_apply_command(request: Request, command_id: str):
+        assert_safe_mutation_request(request, port=cfg.port)
+        from uuid import UUID
+
+        result = apply_write_proposal_route(
+            UUID(command_id),
+            store=request.app.state.store,
+        )
+        status_code = 200 if result["status"] == "ok" else 409
+        return JSONResponse(status_code=status_code, content=result)
 
     @application.get("/export/csv")
     def export_csv(request: Request):

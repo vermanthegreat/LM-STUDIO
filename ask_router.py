@@ -13,10 +13,12 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 import db
 from llm import chat_completion, call_lmstudio_for_text
 from repositories.sqlite_store import SqliteContactStore
+from services.command_log import CommandLogError, CommandStatus
 from services.command_service import CommandService
 from tools.planner import PlannerToolCall
 from tools.registry import ToolRegistryError, ToolValidationError, UnknownToolError
@@ -86,6 +88,15 @@ def answer_question(
 
     if store is None:
         store = SqliteContactStore(db_path or db.DB_PATH)
+
+    if planner_payload is not None:
+        return execute_planner_tool_route(
+            q,
+            planner_payload,
+            store=store,
+            command_service=command_service,
+        )
+
     intent = _deterministic_intent(q)
 
     if intent.name == "unknown" and use_llm:
@@ -113,14 +124,6 @@ def answer_question(
                 **tool_response,
                 "answer": answer,
             }
-
-    if planner_payload is not None:
-        return execute_planner_read_tool_route(
-            q,
-            planner_payload,
-            store=store,
-            command_service=command_service,
-        )
 
     result = _execute_intent(intent, store=store)
     answer = result["answer"]
@@ -409,6 +412,36 @@ def execute_tool_route(
     return _tool_result_to_ask_response(question, tool_name, result, entry)
 
 
+def execute_planner_tool_route(
+    question: str,
+    payload: Dict[str, Any],
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """Dispatch one validated planner tool call to read-only or proposal-only paths."""
+    service = command_service or CommandService(store)
+    tool_name = payload.get("tool_name")
+    if isinstance(tool_name, str) and tool_name:
+        try:
+            spec = service.registry.get(tool_name)
+            if spec.risk_class.creates_write_proposal:
+                return execute_planner_propose_tool_route(
+                    question,
+                    payload,
+                    store=store,
+                    command_service=service,
+                )
+        except UnknownToolError:
+            pass
+    return execute_planner_read_tool_route(
+        question,
+        payload,
+        store=store,
+        command_service=service,
+    )
+
+
 def execute_planner_read_tool_route(
     question: str,
     payload: Dict[str, Any],
@@ -438,6 +471,177 @@ def execute_planner_read_tool_route(
         outcome["result"],
         outcome["entry"],
     )
+
+
+def execute_planner_propose_tool_route(
+    question: str,
+    payload: Dict[str, Any],
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """Preview one validated propose-class planner tool call for /ask."""
+    from services.planner_validation import execute_planner_propose_tool_call
+
+    service = command_service or CommandService(store)
+    outcome = execute_planner_propose_tool_call(
+        service,
+        command_text=question,
+        payload=payload,
+    )
+    if outcome["status"] != "ok":
+        return {
+            "question": question,
+            "intent": outcome["intent"],
+            "answer": outcome["message"],
+            "data": outcome["data"],
+        }
+    return _proposal_result_to_ask_response(
+        question,
+        outcome["tool_name"],
+        outcome["result"],
+        outcome["entry"],
+    )
+
+
+def approve_write_proposal_route(
+    command_id: UUID,
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """Record explicit approval for a command awaiting write apply."""
+    service = command_service or CommandService(store)
+    entry = service.get_command(command_id)
+    if entry is None:
+        return _command_route_error(
+            command_id,
+            error_code="command_not_found",
+            message=f"Command {command_id} was not found.",
+        )
+    try:
+        service.approve_command(entry)
+    except CommandLogError as exc:
+        return _command_route_error(
+            command_id,
+            error_code=type(exc).__name__,
+            message=str(exc),
+            command_status=entry.status.value,
+            tool_name=entry.tool_name,
+        )
+    updated = service.get_command(command_id)
+    assert updated is not None
+    return {
+        "status": "ok",
+        "intent": "write_proposal_approved",
+        "answer": "Write proposal approved. Apply to commit the change.",
+        "data": {
+            "command_id": str(command_id),
+            "command_status": updated.status.value,
+            "tool_name": updated.tool_name,
+            "requires_approval": updated.requires_approval,
+            "approved_at": updated.approved_at.isoformat() if updated.approved_at else None,
+        },
+    }
+
+
+def apply_write_proposal_route(
+    command_id: UUID,
+    *,
+    store,
+    command_service: Optional[CommandService] = None,
+) -> Dict[str, Any]:
+    """Apply an approved write proposal from command_log."""
+    service = command_service or CommandService(store)
+    entry = service.get_command(command_id)
+    if entry is None:
+        return _command_route_error(
+            command_id,
+            error_code="command_not_found",
+            message=f"Command {command_id} was not found.",
+        )
+    try:
+        result = service.apply_approved_command(entry)
+    except CommandLogError as exc:
+        updated = service.get_command(command_id)
+        return _command_route_error(
+            command_id,
+            error_code=type(exc).__name__,
+            message=str(exc),
+            command_status=updated.status.value if updated else entry.status.value,
+            tool_name=entry.tool_name,
+        )
+
+    updated = service.get_command(command_id)
+    assert updated is not None
+    return {
+        "status": "ok",
+        "intent": "write_applied",
+        "answer": result.summary,
+        "data": {
+            "command_id": str(command_id),
+            "command_status": updated.status.value,
+            "tool_name": updated.tool_name,
+            "record_count": result.record_count,
+            "records": result.records,
+        },
+    }
+
+
+def _command_route_error(
+    command_id: UUID,
+    *,
+    error_code: str,
+    message: str,
+    command_status: Optional[str] = None,
+    tool_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "command_id": str(command_id),
+        "error_code": error_code,
+    }
+    if command_status is not None:
+        data["command_status"] = command_status
+    if tool_name is not None:
+        data["tool_name"] = tool_name
+    return {
+        "status": "error",
+        "intent": "write_proposal_error",
+        "answer": message,
+        "data": data,
+    }
+
+
+def _proposal_result_to_ask_response(
+    question: str,
+    tool_name: str,
+    result,
+    entry,
+) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "command_id": str(entry.id),
+        "command_status": entry.status.value,
+        "tool_name": tool_name,
+        "requires_approval": entry.requires_approval,
+        "proposal": result.proposal,
+        "record_count": 0,
+    }
+    if tool_name == "propose_create_followup":
+        return {
+            "question": question,
+            "intent": "write_proposal",
+            "answer": (
+                f"{result.summary}\n"
+                "No changes have been made. Approve this proposal before applying."
+            ),
+            "data": data,
+        }
+    return {
+        "question": question,
+        "intent": "write_proposal",
+        "answer": result.summary,
+        "data": data,
+    }
 
 
 def _tool_result_to_ask_response(
