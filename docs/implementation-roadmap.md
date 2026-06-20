@@ -3,7 +3,29 @@
 Each phase is independently releasable. Do not begin a later phase while the
 current phase acceptance criteria remain unmet.
 
+## Current repository state
+
+As of `main` (commit containing Phase 0 hardening plus in-tree Phase 1
+foundation code):
+
+- **Phase 0** (SQLite hardening) is implemented and is the active reviewed
+  foundation for local use on `127.0.0.1:8025` with SQLite as the default
+  runtime.
+- **Phase 1 foundation code may exist in-tree** (`persistence/`, `repositories/`,
+  Alembic baseline, migration CLI, optional `DATABASE_URL` path). That presence
+  does **not** mean Phase 1 is accepted.
+- **Phase 1 is not accepted** until every Phase 1 acceptance criterion below
+  is verified (including repeatable migration with reconciliation report and
+  isolated PostgreSQL integration tests).
+
+Agents must still execute phases separately. Do not combine Phase 0 review work
+with Phase 1 certification, PostgreSQL cutover, or Phase 2+ tool planning in a
+single patch.
+
 ## Phase 0 — immediate SQLite hardening
+
+**Status:** Implemented in-tree; subject to verification and review. Not
+combined with PostgreSQL migration or agent tool planning.
 
 Scope:
 
@@ -36,6 +58,9 @@ Stop conditions:
 - Do not delete user data to make tests pass.
 
 ## Phase 1 — PostgreSQL contact foundation
+
+**Status:** Foundation code may exist in-tree; **not accepted** until explicit
+acceptance criteria below pass and are reported.
 
 Scope:
 

@@ -1,10 +1,10 @@
 # LM Studio Lead Intelligence
 
-Local manual-copy lead intelligence app. You copy text from Shopify Partner Directory, LinkedIn, websites, and emails — then paste into the web UI. All data is stored in a local **SQLite** database (`leads.db`). The LLM (LM Studio) helps extract structure but is **not** treated as memory.
+Local manual-copy lead intelligence app. You copy text from Shopify Partner Directory, LinkedIn, websites, and emails — then paste into the web UI. By default, all data is stored in a local **SQLite** database (`leads.db` or `DATABASE_PATH`). The LLM (LM Studio) helps extract structure but is **not** treated as memory.
 
-**No scraping.** This app does not scrape Shopify, LinkedIn, or any other site. No browser automation, no login automation, no mass email.
+**No scraping.** This app does not scrape Shopify, LinkedIn, or any other site. No browser automation, no login automation, no mass email, no n8n, and no generic SQL-agent behavior.
 
-## Quick start
+## Quick start (SQLite — default)
 
 ```bash
 pip install -r requirements.txt
@@ -12,6 +12,8 @@ python app.py
 ```
 
 Open http://127.0.0.1:8025
+
+Do **not** set `DATABASE_URL` unless you are explicitly testing Phase 1 PostgreSQL foundation code. Without it, the app uses SQLite only.
 
 Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://localhost:1234/v1/chat/completions`. If LM Studio is unavailable, deterministic fallback parsers still save pasted text.
 
@@ -53,9 +55,20 @@ Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://l
 python -m pytest tests/ -v
 ```
 
+SQLite route and unit tests run without PostgreSQL. Optional PostgreSQL integration tests in `tests/test_pg_integration.py` are skipped unless `TEST_DATABASE_URL` points at a disposable database.
+
+## Runtime
+
+| Mode | When | Status |
+|------|------|--------|
+| **SQLite** (default) | `DATABASE_URL` unset; `DATABASE_PATH` optional | Phase 0 foundation — supported local runtime |
+| **PostgreSQL** | `DATABASE_URL` set | Phase 1 foundation code in-tree; **experimental, not accepted** until Phase 1 acceptance criteria pass |
+
+The web app reads and writes through a repository layer. SQLite remains the default and recommended runtime for local use on port **8025**.
+
 ## Legacy CLI (Postgres)
 
-Older CLI tools (`agent.py`, `ingest_raw.py`) used PostgreSQL via `db_postgres.py`. The web app uses SQLite via `db.py`. To use the legacy CLI, restore Postgres imports or point those scripts at `db_postgres.py`.
+Older CLI tools (`agent.py`, `ingest_raw.py`) used PostgreSQL via `db_postgres.py`. That legacy stack is separate from the current web app repository layer. Do not confuse it with Phase 1 `persistence/` / `repositories/` code.
 
 ## Environment (optional)
 
@@ -72,15 +85,20 @@ LOG_LEVEL=INFO
 
 Copy `.env.example` to `.env` and adjust paths for your machine. Never commit real credentials.
 
-### PostgreSQL (Phase 1)
+### PostgreSQL (Phase 1 — experimental, not production)
 
-When `DATABASE_URL` is set, the app uses PostgreSQL via the repository layer instead of SQLite.
+Phase 1 foundation code exists in this repository (SQLAlchemy models, repositories, Alembic baseline, migration CLI). **Phase 1 is not complete or certified** until its acceptance criteria in `docs/implementation-roadmap.md` are verified (repeatable migration, reconciliation report, isolated PG integration tests, and related checks).
+
+Only enable PostgreSQL for disposable development or test databases:
 
 ```bash
-# Create schema (first run)
+# Optional: switch runtime (experimental)
+export DATABASE_URL=postgresql://user:password@localhost:5432/contacts_dev
+
+# Create schema (first run on a disposable DB)
 python -c "from persistence.session import init_schema; import os; init_schema(os.environ['DATABASE_URL'])"
 
-# Migrate existing SQLite data (dry run first)
+# Migrate existing SQLite data — ALWAYS dry-run first; back up valuable data first
 python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL" --dry-run
 python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL"
 
@@ -88,7 +106,9 @@ python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-u
 DATABASE_URL=... alembic upgrade head
 ```
 
-PostgreSQL integration tests (optional, requires disposable `TEST_DATABASE_URL`):
+**Warning:** Do not run migration against production or valuable `leads.db` data without a dry-run, a backup, and a disposable PostgreSQL target. Review the JSON reconciliation report for skipped and conflicting records before trusting results.
+
+PostgreSQL integration tests (optional; requires disposable `TEST_DATABASE_URL`):
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test python -m pytest tests/test_pg_integration.py -v
