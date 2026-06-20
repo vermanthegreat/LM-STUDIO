@@ -117,6 +117,27 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_lead_id ON tasks(lead_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
+
+CREATE TABLE IF NOT EXISTS command_log (
+    id TEXT PRIMARY KEY,
+    command_text TEXT NOT NULL,
+    intent TEXT,
+    tool_name TEXT,
+    tool_arguments_json TEXT,
+    risk_class TEXT,
+    status TEXT NOT NULL DEFAULT 'received',
+    requires_approval INTEGER DEFAULT 0,
+    approved_at TEXT,
+    result_summary_json TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    correlation_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_command_log_status ON command_log(status);
+CREATE INDEX IF NOT EXISTS idx_command_log_correlation_id ON command_log(correlation_id);
 """
 
 

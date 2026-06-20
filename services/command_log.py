@@ -88,7 +88,7 @@ def transition(entry: CommandLogEntry, new_status: CommandStatus) -> None:
 
 
 class InMemoryCommandLog:
-    """Test-friendly command log until PostgreSQL persistence is wired."""
+    """In-memory command log for tests or stores without DB configuration."""
 
     def __init__(self) -> None:
         self._entries: dict[UUID, CommandLogEntry] = {}

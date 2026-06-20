@@ -6,11 +6,11 @@ from typing import Any, Optional
 from uuid import UUID
 
 from repositories import ContactStore
+from repositories.command_log_store import CommandLogStore, get_command_log_store
 from services.command_log import (
     CommandLogEntry,
     CommandLogError,
     CommandStatus,
-    InMemoryCommandLog,
     transition,
 )
 from tools.envelope import ToolResult
@@ -24,11 +24,11 @@ class CommandService:
         self,
         store: ContactStore,
         registry: Optional[ToolRegistry] = None,
-        command_log: Optional[InMemoryCommandLog] = None,
+        command_log: Optional[CommandLogStore] = None,
     ) -> None:
         self.store = store
         self.registry = registry or build_default_registry()
-        self.command_log = command_log or InMemoryCommandLog()
+        self.command_log = command_log if command_log is not None else get_command_log_store(store)
 
     def receive(self, command_text: str, *, correlation_id: Optional[str] = None) -> CommandLogEntry:
         return self.command_log.create(command_text, correlation_id=correlation_id)
