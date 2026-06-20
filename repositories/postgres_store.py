@@ -22,6 +22,7 @@ from persistence.models import (
 from persistence.session import get_session_factory, init_schema
 from persistence.unit_of_work import UnitOfWork
 from repositories.mapping import (
+    _org_has_verified_email,
     organization_to_lead_detail,
     organization_to_lead_row,
     person_to_dict,
@@ -222,6 +223,7 @@ class PostgresContactStore:
             ) or 0
             with_person_email = 0
             with_any_email = 0
+            with_verified_email = 0
             orgs = session.scalars(
                 select(Organization)
                 .where(active)
@@ -240,6 +242,8 @@ class PostgresContactStore:
                     with_person_email += 1
                 if has_company or has_person:
                     with_any_email += 1
+                if _org_has_verified_email(org):
+                    with_verified_email += 1
             email_interactions = session.scalar(
                 select(func.count())
                 .select_from(Interaction)
@@ -251,6 +255,7 @@ class PostgresContactStore:
                 "with_people": with_people,
                 "with_person_email": with_person_email,
                 "with_any_email": with_any_email,
+                "with_verified_email": with_verified_email,
                 "without_email": companies - with_any_email,
                 "email_interactions": email_interactions,
             }

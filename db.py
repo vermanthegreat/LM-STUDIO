@@ -824,6 +824,7 @@ def get_contact_summary(db_path: Path = DB_PATH) -> Dict[str, int]:
         "with_people": with_people,
         "with_person_email": with_person_email,
         "with_any_email": with_any_email,
+        "with_verified_email": 0,
         "without_email": companies - with_any_email,
         "email_interactions": email_interactions,
     }

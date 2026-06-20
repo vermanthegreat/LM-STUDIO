@@ -60,6 +60,36 @@ def _primary_contact_value(
     return None
 
 
+def _org_has_verified_email(org: Organization) -> bool:
+    for method in org.contact_methods:
+        if method.kind == "email" and method.verification_status == "verified":
+            return True
+    for person in org.people:
+        for method in person.contact_methods:
+            if method.kind == "email" and method.verification_status == "verified":
+                return True
+    return False
+
+
+def _org_has_non_rejected_email(org: Organization) -> bool:
+    for method in org.contact_methods:
+        if (
+            method.kind == "email"
+            and method.verification_status != "rejected"
+            and (method.value or "").strip()
+        ):
+            return True
+    for person in org.people:
+        for method in person.contact_methods:
+            if (
+                method.kind == "email"
+                and method.verification_status != "rejected"
+                and (method.value or "").strip()
+            ):
+                return True
+    return False
+
+
 def person_to_dict(person: Person) -> Dict[str, Any]:
     meta = dict(person.legacy_metadata or {})
     email = _person_contact(person, "email")
@@ -159,6 +189,8 @@ def organization_to_lead_detail(org: Organization) -> Dict[str, Any]:
     )
     lead["people_count"] = len(people)
     lead["has_decision_maker"] = any(p.get("is_decision_maker") for p in people)
+    lead["has_verified_email"] = _org_has_verified_email(org)
+    lead["has_non_rejected_email"] = _org_has_non_rejected_email(org)
     return lead
 
 

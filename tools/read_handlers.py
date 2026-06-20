@@ -18,18 +18,40 @@ from tools.read_inputs import (
 )
 
 
-def _lead_has_email(lead: dict[str, Any], definition: MissingEmailDefinition) -> bool:
+_SQLITE_VERIFICATION_WARNING = "sqlite_backend_verification_not_tracked"
+
+
+def _sqlite_verification_warnings(store: ContactStore, *, uses_verified_semantics: bool) -> list[str]:
+    if getattr(store, "backend", None) == "sqlite" and uses_verified_semantics:
+        return [_SQLITE_VERIFICATION_WARNING]
+    return []
+
+
+def _lead_has_any_email(lead: dict[str, Any]) -> bool:
     email = (lead.get("company_email") or "").strip()
-    if definition == MissingEmailDefinition.ANY:
-        if email:
+    if email:
+        return True
+    for person in lead.get("people") or []:
+        if (person.get("email") or "").strip():
             return True
-        for person in lead.get("people") or []:
-            if (person.get("email") or "").strip():
-                return True
-        return False
+    return False
+
+
+def _lead_has_email(
+    lead: dict[str, Any],
+    definition: MissingEmailDefinition,
+    *,
+    store: ContactStore,
+) -> bool:
     if definition == MissingEmailDefinition.VERIFIED:
-        return bool(email)
-    return bool(email)
+        if getattr(store, "backend", None) == "sqlite":
+            return False
+        return bool(lead.get("has_verified_email"))
+    if definition == MissingEmailDefinition.NON_REJECTED:
+        if getattr(store, "backend", None) == "sqlite":
+            return _lead_has_any_email(lead)
+        return bool(lead.get("has_non_rejected_email"))
+    return _lead_has_any_email(lead)
 
 
 def handle_search_contacts(store: ContactStore, args: BaseModel) -> ToolResult:
@@ -77,9 +99,16 @@ def handle_find_companies_missing_email(store: ContactStore, args: BaseModel) ->
         if params.minimum_relevance is not None and int(lead.get("fit_score") or 0) < params.minimum_relevance:
             continue
         detail = store.get_lead(lead["id"]) or lead
-        if not _lead_has_email(detail, params.missing_definition):
+        if not _lead_has_email(detail, params.missing_definition, store=store):
             missing.append(lead)
     page = missing[: params.limit]
+    warnings = [f"missing_definition={params.missing_definition.value}"]
+    warnings.extend(
+        _sqlite_verification_warnings(
+            store,
+            uses_verified_semantics=params.missing_definition == MissingEmailDefinition.VERIFIED,
+        )
+    )
     return ToolResult(
         tool_name="find_companies_missing_email",
         status="ok",
@@ -90,7 +119,7 @@ def handle_find_companies_missing_email(store: ContactStore, args: BaseModel) ->
         records=page,
         record_count=len(missing),
         provenance=["repository:list_leads", "repository:get_lead"],
-        warnings=[f"missing_definition={params.missing_definition.value}"],
+        warnings=warnings,
     )
 
 
@@ -119,6 +148,7 @@ def handle_calculate_pipeline_analytics(store: ContactStore, args: BaseModel) ->
     params = CalculatePipelineAnalyticsInput.model_validate(args)
     summary = store.get_contact_summary()
     metric = params.metric
+    warnings: list[str] = []
     if metric == PipelineMetric.ORGANIZATION_COUNT:
         value = int(summary.get("companies", 0))
         label = "organization_count"
@@ -129,8 +159,10 @@ def handle_calculate_pipeline_analytics(store: ContactStore, args: BaseModel) ->
         label = "contact_coverage_percent"
     elif metric == PipelineMetric.VERIFIED_EMAIL_COVERAGE:
         companies = int(summary.get("companies", 0))
-        value = 0 if companies else 0.0
+        with_verified = int(summary.get("with_verified_email", 0))
+        value = round((with_verified / companies) * 100, 2) if companies else 0.0
         label = "verified_email_coverage_percent"
+        warnings.extend(_sqlite_verification_warnings(store, uses_verified_semantics=True))
     else:
         followups = store.get_followups_due()
         value = len(followups)
@@ -142,4 +174,5 @@ def handle_calculate_pipeline_analytics(store: ContactStore, args: BaseModel) ->
         records=[{"metric": label, "value": value}],
         record_count=1,
         provenance=["repository:get_contact_summary", "repository:get_followups_due"],
+        warnings=warnings,
     )
