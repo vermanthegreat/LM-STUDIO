@@ -920,8 +920,12 @@ def get_leads_without_contacts(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def get_followups_due(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
-    now = _now()[:10]
+def get_followups_due(
+    db_path: Path = DB_PATH,
+    due_on_or_before: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[Dict[str, Any]]:
+    cutoff = str(due_on_or_before or _now()[:10])[:10]
     sql = """
     SELECT l.company_name, l.id AS lead_id, t.title, t.due_date, t.priority, 'task' AS item_type
     FROM tasks t JOIN leads l ON l.id = t.lead_id
@@ -932,8 +936,11 @@ def get_followups_due(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
     WHERE i.status = 'open' AND i.deadline IS NOT NULL AND i.deadline <= ?
     ORDER BY due_date ASC
     """
+    if conn is not None:
+        rows = conn.execute(sql, (cutoff, cutoff)).fetchall()
+        return [dict(r) for r in rows]
     with get_conn(db_path) as conn:
-        rows = conn.execute(sql, (now, now)).fetchall()
+        rows = conn.execute(sql, (cutoff, cutoff)).fetchall()
     return [dict(r) for r in rows]
 
 

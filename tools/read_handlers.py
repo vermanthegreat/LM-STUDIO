@@ -132,7 +132,7 @@ def handle_find_companies_missing_email(store: ContactStore, args: BaseModel) ->
 def handle_list_due_followups(store: ContactStore, args: BaseModel) -> ToolResult:
     params = ListDueFollowupsInput.model_validate(args)
     cutoff = params.due_on_or_before or date.today()
-    records = store.get_followups_due()
+    records = store.get_followups_due(due_on_or_before=cutoff.isoformat())
     filtered: list[dict[str, Any]] = []
     for item in records:
         if params.item_type and item.get("item_type") != params.item_type:

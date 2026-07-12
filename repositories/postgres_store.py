@@ -400,10 +400,14 @@ class PostgresContactStore:
             if self._session is None:
                 session.close()
 
-    def get_followups_due(self) -> List[Dict[str, Any]]:
+    def get_followups_due(self, due_on_or_before: Optional[str] = None) -> List[Dict[str, Any]]:
         session = self._active_session()
         try:
-            today = datetime.now(timezone.utc).date()
+            cutoff = (
+                datetime.fromisoformat(str(due_on_or_before)[:10]).date()
+                if due_on_or_before
+                else datetime.now(timezone.utc).date()
+            )
             items: List[Dict[str, Any]] = []
             tasks = session.scalars(
                 select(Task)
@@ -411,7 +415,7 @@ class PostgresContactStore:
                 .where(Task.status == "open", Task.due_at.is_not(None))
             ).all()
             for task in tasks:
-                if task.due_at and task.due_at.date() <= today and task.organization:
+                if task.due_at and task.due_at.date() <= cutoff and task.organization:
                     items.append({
                         "company_name": task.organization.name,
                         "lead_id": task.organization.legacy_lead_id,
@@ -428,7 +432,7 @@ class PostgresContactStore:
             for item in interactions:
                 meta = item.legacy_metadata or {}
                 deadline = meta.get("deadline")
-                if deadline and deadline <= today.isoformat() and item.organization:
+                if deadline and deadline <= cutoff.isoformat() and item.organization:
                     items.append({
                         "company_name": item.organization.name,
                         "lead_id": item.organization.legacy_lead_id,

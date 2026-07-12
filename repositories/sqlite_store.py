@@ -97,8 +97,8 @@ class SqliteContactStore:
             )
         return records
 
-    def get_followups_due(self) -> List[Dict[str, Any]]:
-        return db.get_followups_due(**self._kwargs())
+    def get_followups_due(self, due_on_or_before: Optional[str] = None) -> List[Dict[str, Any]]:
+        return db.get_followups_due(due_on_or_before=due_on_or_before, **self._kwargs())
 
     def search_lead_by_name(self, name: str) -> List[Dict[str, Any]]:
         return db.search_lead_by_name(name, **self._kwargs())
