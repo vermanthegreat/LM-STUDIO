@@ -70,6 +70,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     def index(request: Request):
         leads = request.app.state.store.get_all_leads_simple()
         return templates.TemplateResponse(
+            request,
             "index.html",
             {"request": request, "leads": leads, "message": None},
         )
@@ -119,6 +120,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 status_code=303,
             )
         return templates.TemplateResponse(
+            request,
             "index.html",
             {"request": request, "leads": leads, "message": msg},
         )
@@ -127,6 +129,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     def leads_list(request: Request):
         leads = request.app.state.store.list_leads()
         return templates.TemplateResponse(
+            request,
             "leads.html",
             {"request": request, "leads": leads},
         )
@@ -141,6 +144,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 status_code=404,
             )
         return templates.TemplateResponse(
+            request,
             "lead_detail.html",
             {"request": request, "lead": lead, "message": msg},
         )
@@ -148,6 +152,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.get("/ask", response_class=HTMLResponse)
     def ask_page(request: Request):
         return templates.TemplateResponse(
+            request,
             "ask.html",
             {"request": request, "result": None},
         )
@@ -171,6 +176,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         assert_safe_mutation_request(request, port=cfg.port)
         result = answer_question(question, use_llm=use_llm, store=request.app.state.store)
         return templates.TemplateResponse(
+            request,
             "ask.html",
             {"request": request, "result": result},
         )
