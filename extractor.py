@@ -938,7 +938,7 @@ def parse_and_save(
         confidence = float(parsed.get("confidence") or 0.4)
         if llm_attempted:
             extraction_status = "needs_review"
-    if pg_proposal_mode:
+    if pg_proposal_mode and validated is not None:
         for key, value in contact_proposal_fields.items():
             if value:
                 parsed[key] = value

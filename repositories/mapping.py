@@ -171,12 +171,34 @@ def source_to_dict(source: Source) -> Dict[str, Any]:
     }
 
 
+def _parsed_contact_from_sources(
+    raw_sources: List[Dict[str, Any]],
+    field: str,
+) -> Optional[str]:
+    for source in raw_sources:
+        parsed = source.get("parsed_json")
+        if not isinstance(parsed, dict):
+            continue
+        value = (parsed.get(field) or "").strip()
+        if value:
+            return value
+    return None
+
+
 def organization_to_lead_detail(org: Organization) -> Dict[str, Any]:
     lead = organization_to_lead_row(org)
     people = [person_to_dict(p) for p in org.people]
     interactions = [interaction_to_dict(i, org) for i in org.interactions]
     tasks = [task_to_dict(t, org) for t in org.tasks]
     raw_sources = [source_to_dict(s) for s in _org_sources(org)]
+    if not (lead.get("company_email") or "").strip():
+        projected_email = _parsed_contact_from_sources(raw_sources, "company_email")
+        if projected_email:
+            lead["company_email"] = projected_email
+    if not (lead.get("company_phone") or "").strip():
+        projected_phone = _parsed_contact_from_sources(raw_sources, "company_phone")
+        if projected_phone:
+            lead["company_phone"] = projected_phone
     lead["people"] = people
     lead["interactions"] = interactions
     lead["tasks"] = tasks
