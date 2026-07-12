@@ -1,5 +1,8 @@
 .env
 *.db
+gmail_token.json
+credentials.json
+client_secret*.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

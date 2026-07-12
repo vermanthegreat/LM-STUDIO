@@ -71,6 +71,22 @@ merge from name similarity alone.
 
 Read-only. Filters by kind, source, age, relevance, and verification state.
 
+### `list_email_messages`
+
+Read-only. Filters imported Gmail messages by intent, marker, direction,
+link status, organization/person identifier, since, limit, and offset.
+Reads the local database only; does not call Gmail during `/ask`.
+On PostgreSQL runtime (G0), returns `status=error` with
+`gmail_postgresql_runtime_unsupported` rather than an empty success.
+
+### `get_email_thread`
+
+Read-only. Returns ordered imported messages and thread-level attention summary
+for an `external_thread_id` (optional `external_account` for disambiguation).
+Reads the local database only.
+On PostgreSQL runtime (G0), returns `status=error` with
+`gmail_postgresql_runtime_unsupported` rather than a false not-found.
+
 ## Planner output
 
 The planner produces one of:

@@ -114,6 +114,9 @@ class SqliteContactStore:
     def find_leads_by_email(self, email: str) -> List[Dict[str, Any]]:
         return db.find_leads_by_email(email, **self._kwargs())
 
+    def find_exact_email_matches(self, email: str) -> List[Dict[str, Any]]:
+        return db.find_exact_email_matches(email, **self._kwargs())
+
     def upsert_lead(
         self,
         data: Dict[str, Any],
@@ -182,3 +185,55 @@ class SqliteContactStore:
 
     def extract_domain(self, website: Optional[str]) -> Optional[str]:
         return db.extract_domain(website)
+
+    def list_imported_email_messages(
+        self,
+        *,
+        intent: Optional[str] = None,
+        marker: Optional[str] = None,
+        direction: Optional[str] = None,
+        link_status: Optional[str] = None,
+        lead_id: Optional[int] = None,
+        person_id: Optional[int] = None,
+        since: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        app_timezone: str = "UTC",
+    ) -> tuple[List[Dict[str, Any]], int]:
+        import gmail_db
+
+        gmail_db.init_gmail_db(self.database_path)
+        with db.get_conn(self.database_path) as conn:
+            gmail_db.ensure_gmail_tables(conn)
+            rows, total = gmail_db.list_gmail_messages(
+                conn,
+                intent=intent,
+                marker=marker,
+                direction=direction,
+                link_status=link_status,
+                lead_id=lead_id,
+                person_id=person_id,
+                since=since,
+                limit=limit,
+                offset=offset,
+            )
+        return [gmail_db.row_to_public_dict(row, app_timezone=app_timezone) for row in rows], total
+
+    def get_imported_email_thread(
+        self,
+        external_thread_id: str,
+        *,
+        external_account: Optional[str] = None,
+        app_timezone: str = "UTC",
+    ) -> List[Dict[str, Any]]:
+        import gmail_db
+
+        gmail_db.init_gmail_db(self.database_path)
+        with db.get_conn(self.database_path) as conn:
+            gmail_db.ensure_gmail_tables(conn)
+            rows = gmail_db.get_thread_messages(
+                conn,
+                external_thread_id=external_thread_id,
+                external_account=external_account,
+            )
+        return [gmail_db.row_to_public_dict(row, app_timezone=app_timezone) for row in rows]

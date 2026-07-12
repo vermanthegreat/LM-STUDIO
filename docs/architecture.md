@@ -97,8 +97,50 @@ Configuration must be environment-driven and validated at startup:
 - `LMSTUDIO_TIMEOUT`
 - `MAX_PASTE_CHARS`
 - `LOG_LEVEL`
+- `GMAIL_ENABLED` — enable Phase G0 Gmail read-only intake (default `false`)
+- `GMAIL_CLIENT_SECRET_PATH` — path to Google OAuth desktop client JSON
+- `GMAIL_TOKEN_PATH` — path to authorized-user token file (gitignored)
+- `GMAIL_SYNC_LABEL` — operator-created Gmail label to sync (default `LMStudio`)
+- `GMAIL_SYNC_LIMIT` — maximum messages per manual sync (default `100`)
+- `APP_TIMEZONE` — IANA timezone for follow-up dates and email display
 
 Secrets never belong in `.env.example`, logs, prompts, or committed fixtures.
+
+## Gmail provider boundary (Phase G0)
+
+Gmail G0 is a bounded read-only intake path:
+
+```text
+Operator UI  POST /integrations/gmail/sync
+       |
+       v
+GmailProviderAdapter  (gmail.readonly OAuth only)
+       |
+       v
+normalize + classify + link  (application services)
+       |
+       v
+SQLite gmail_* tables  (supported runtime)
+```
+
+- **OAuth:** `scripts/gmail_authorize.py` bootstraps desktop OAuth with exactly
+  `https://www.googleapis.com/auth/gmail.readonly`. Token files are gitignored
+  and never passed to the LLM.
+- **Manual sync:** Operator triggers bounded label sync from
+  `/integrations/gmail`. Each sync writes a `gmail_sync` command-log entry with
+  counts only (no tokens or full message bodies).
+- **Fake provider:** Automated tests use `FakeGmailProvider` only; it is not
+  reachable from production routes.
+- **Classifier trust boundary:** Email bodies are untrusted. The local LLM
+  classifier returns schema-validated intent/markers only; it cannot invoke
+  tools, Gmail, or database writes. `requires_followup` is derived from
+  validated markers.
+- **PostgreSQL capability:** Alembic migration `004_gmail_g0` defines PostgreSQL
+  schema, but Gmail sync and query operations are **SQLite-only** in G0.
+  PostgreSQL runtime requests fail closed with
+  `gmail_postgresql_runtime_unsupported` rather than returning empty results.
+- **`/ask` reads:** `list_email_messages` and `get_email_thread` read the local
+  database only; they do not call Gmail during ordinary `/ask` queries.
 
 ## Trust boundaries
 

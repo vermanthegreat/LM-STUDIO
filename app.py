@@ -22,10 +22,12 @@ from ask_router import (
 )
 from config import AppConfig
 from errors import AppError, ValidationError, parse_command_id
+from gmail_runtime import GmailRuntimeUnsupportedError
 from extractor import parse_and_save
 from intake import validate_parse_intake
 from repositories.factory import get_contact_store
 from security import assert_safe_mutation_request
+from services.gmail_sync_service import gmail_integration_status, sync_gmail_label
 
 load_dotenv()
 
@@ -222,6 +224,103 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             csv_data,
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=leads_export.csv"},
+        )
+
+    @application.get("/integrations/gmail", response_class=HTMLResponse)
+    def gmail_integration_page(request: Request):
+        status = gmail_integration_status(request.app.state.store, cfg)
+        return templates.TemplateResponse(
+            request,
+            "gmail_integration.html",
+            {"request": request, "status": status, "message": None},
+        )
+
+    @application.post("/integrations/gmail/sync", response_class=HTMLResponse)
+    def gmail_sync(request: Request):
+        assert_safe_mutation_request(request, port=cfg.port)
+        result, entry = sync_gmail_label(request.app.state.store, cfg)
+        status = gmail_integration_status(request.app.state.store, cfg)
+        if result.status == "ok":
+            counts = result.counts
+            msg = (
+                f"Gmail sync complete: imported={counts.imported}, updated={counts.updated}, "
+                f"already_present={counts.already_present}, failed={counts.failed}. "
+                f"Command: {entry.id if entry else 'n/a'}"
+            )
+        else:
+            msg = result.message or result.error_code or "Gmail sync failed."
+        return templates.TemplateResponse(
+            request,
+            "gmail_integration.html",
+            {"request": request, "status": status, "message": msg},
+        )
+
+    @application.get("/emails", response_class=HTMLResponse)
+    def emails_list(
+        request: Request,
+        intent: str = "",
+        marker: str = "",
+        direction: str = "",
+        link_status: str = "",
+        since: str = "",
+        limit: int = 50,
+    ):
+        store = request.app.state.store
+        runtime_error: str | None = None
+        records: list = []
+        total = 0
+        try:
+            records, total = store.list_imported_email_messages(
+                intent=intent or None,
+                marker=marker or None,
+                direction=direction or None,
+                link_status=link_status or None,
+                since=since or None,
+                limit=min(max(limit, 1), 100),
+                app_timezone=cfg.app_timezone,
+            )
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
+        return templates.TemplateResponse(
+            request,
+            "emails.html",
+            {
+                "request": request,
+                "emails": records,
+                "total": total,
+                "runtime_error": runtime_error,
+                "filters": {
+                    "intent": intent,
+                    "marker": marker,
+                    "direction": direction,
+                    "link_status": link_status,
+                    "since": since,
+                    "limit": limit,
+                },
+            },
+        )
+
+    @application.get("/emails/thread/{thread_id}", response_class=HTMLResponse)
+    def email_thread_detail(request: Request, thread_id: str, account: str = ""):
+        runtime_error: str | None = None
+        messages: list = []
+        try:
+            messages = request.app.state.store.get_imported_email_thread(
+                thread_id,
+                external_account=account or None,
+                app_timezone=cfg.app_timezone,
+            )
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
+        return templates.TemplateResponse(
+            request,
+            "email_thread.html",
+            {
+                "request": request,
+                "thread_id": thread_id,
+                "messages": messages,
+                "runtime_error": runtime_error,
+            },
         )
 
     return application

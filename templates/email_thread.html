@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Email Thread</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Thread {{ thread_id[:12] }}…</h1>
+    <nav>
+      <a href="/emails">Back to Imported Emails</a>
+    </nav>
+  </header>
+  <main>
+    {% if runtime_error %}<div class="msg">{{ runtime_error }}</div>{% endif %}
+    <div class="card">
+      {% for row in messages %}
+      <article style="margin-bottom: 1.5rem; border-bottom: 1px solid #ccc; padding-bottom: 1rem;">
+        <p><strong>{{ row.occurred_at_local }}</strong> — {{ row.direction }} — {{ row.from_address }}</p>
+        <p><strong>Subject:</strong> {{ row.subject or "(no subject)" }}</p>
+        <p><strong>Intent:</strong> {{ row.primary_intent }} ({{ row.intent_confidence }})</p>
+        <p><strong>Markers:</strong> {{ row.markers|join(", ") }}</p>
+        <p><strong>Link status:</strong> {{ row.link_status }}</p>
+        {% if row.classification_warning %}<p><strong>Warning:</strong> {{ row.classification_warning }}</p>{% endif %}
+      </article>
+      {% else %}
+      {% if not runtime_error %}<p>No messages found for this thread.</p>{% endif %}
+      {% endfor %}
+    </div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Imported Emails</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Imported Gmail Messages</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/emails">Imported Emails</a>
+      <a href="/integrations/gmail">Gmail</a>
+      <a href="/ask">Ask Database</a>
+    </nav>
+  </header>
+  <main>
+    {% if runtime_error %}<div class="msg">{{ runtime_error }}</div>{% endif %}
+    <div class="card">
+      <form method="get" action="/emails">
+        <label>Intent <input name="intent" value="{{ filters.intent }}"></label>
+        <label>Marker <input name="marker" value="{{ filters.marker }}"></label>
+        <label>Direction <input name="direction" value="{{ filters.direction }}"></label>
+        <label>Link status <input name="link_status" value="{{ filters.link_status }}"></label>
+        <label>Since (ISO) <input name="since" value="{{ filters.since }}"></label>
+        <label>Limit <input name="limit" type="number" value="{{ filters.limit }}"></label>
+        <button type="submit">Filter</button>
+      </form>
+      <p>Showing {{ emails|length }} of {{ total }} imported message(s).</p>
+      <table>
+        <thead>
+          <tr>
+            <th>When (local)</th>
+            <th>Direction</th>
+            <th>From</th>
+            <th>Subject</th>
+            <th>Linked</th>
+            <th>Intent</th>
+            <th>Markers</th>
+            <th>Link</th>
+            <th>Thread</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in emails %}
+          <tr>
+            <td>{{ row.occurred_at_local }}</td>
+            <td>{{ row.direction }}</td>
+            <td>{{ row.from_address }}</td>
+            <td>{{ row.subject or "(no subject)" }}</td>
+            <td>
+              {% if row.company_name %}{{ row.company_name }}{% if row.person_name %} / {{ row.person_name }}{% endif %}{% else %}—{% endif %}
+            </td>
+            <td>{{ row.primary_intent }} ({{ row.intent_confidence }})</td>
+            <td>{{ row.markers|join(", ") }}</td>
+            <td>{{ row.link_status }}</td>
+            <td><a href="/emails/thread/{{ row.external_thread_id }}">{{ row.thread_short }}</a></td>
+          </tr>
+          {% if row.classification_warning %}
+          <tr><td colspan="9">Warning: {{ row.classification_warning }}</td></tr>
+          {% endif %}
+          {% else %}
+          <tr><td colspan="9">No imported Gmail messages yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>

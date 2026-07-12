@@ -282,6 +282,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "ON tasks(created_by_command_id) WHERE created_by_command_id IS NOT NULL"
     )
 
+    from gmail_db import ensure_gmail_tables
+
+    ensure_gmail_tables(conn)
+
 
 def _json_dumps(obj: Any) -> Optional[str]:
     if obj is None:
@@ -362,6 +366,49 @@ def find_leads_by_email(
             (domain, norm),
         ).fetchall()
         return [_hydrate_lead_row(dict(r)) for r in rows]
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def find_exact_email_matches(
+    email: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[Dict[str, Any]]:
+    norm = normalize_email(email)
+    if not norm:
+        return []
+
+    def _run(c: sqlite3.Connection) -> List[Dict[str, Any]]:
+        matches: List[Dict[str, Any]] = []
+        people_rows = c.execute(
+            "SELECT id, lead_id, email FROM people WHERE lower(email) = ?",
+            (norm,),
+        ).fetchall()
+        for row in people_rows:
+            matches.append(
+                {
+                    "lead_id": row["lead_id"],
+                    "person_id": row["id"],
+                    "kind": "person",
+                }
+            )
+        lead_rows = c.execute(
+            "SELECT id FROM leads WHERE lower(company_email) = ?",
+            (norm,),
+        ).fetchall()
+        for row in lead_rows:
+            matches.append(
+                {
+                    "lead_id": row["id"],
+                    "person_id": None,
+                    "kind": "organization",
+                }
+            )
+        return matches
 
     if conn is not None:
         return _run(conn)

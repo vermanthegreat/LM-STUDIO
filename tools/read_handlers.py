@@ -8,11 +8,14 @@ from typing import Any
 from pydantic import BaseModel
 
 from repositories import ContactStore
+from gmail_runtime import GmailRuntimeUnsupportedError
 from tools.envelope import ToolResult
 from tools.read_inputs import (
     CalculatePipelineAnalyticsInput,
     FindCompaniesMissingEmailInput,
+    GetEmailThreadInput,
     ListDueFollowupsInput,
+    ListEmailMessagesInput,
     ListUnverifiedContactMethodsInput,
     MissingEmailDefinition,
     PipelineMetric,
@@ -241,4 +244,80 @@ def handle_calculate_pipeline_analytics(store: ContactStore, args: BaseModel) ->
         record_count=1,
         provenance=["repository:get_contact_summary", "repository:get_followups_due"],
         warnings=warnings,
+    )
+
+
+def _safe_summary(row: dict[str, Any]) -> str:
+    subject = (row.get("subject") or "(no subject)").strip()
+    intent = row.get("primary_intent") or "unknown"
+    return f"{subject} [{intent}]"
+
+
+def _gmail_runtime_error_result(tool_name: str, exc: GmailRuntimeUnsupportedError) -> ToolResult:
+    return ToolResult(
+        tool_name=tool_name,
+        status="error",
+        summary=exc.message,
+        records=[],
+        record_count=0,
+        warnings=[exc.error_code],
+        provenance=["gmail_runtime:unsupported"],
+    )
+
+
+def handle_list_email_messages(store: ContactStore, args: BaseModel) -> ToolResult:
+    params = ListEmailMessagesInput.model_validate(args)
+    try:
+        records, total = store.list_imported_email_messages(
+            intent=params.intent,
+            marker=params.marker,
+            direction=params.direction,
+            link_status=params.link_status,
+            lead_id=params.lead_id,
+            person_id=params.person_id,
+            since=params.since,
+            limit=params.limit,
+            offset=params.offset,
+        )
+    except GmailRuntimeUnsupportedError as exc:
+        return _gmail_runtime_error_result("list_email_messages", exc)
+    for row in records:
+        row["summary"] = _safe_summary(row)
+    summary = f"Found {total} imported Gmail message(s); showing {len(records)}."
+    return ToolResult(
+        tool_name="list_email_messages",
+        status="ok",
+        summary=summary,
+        records=records,
+        record_count=total,
+        provenance=["repository:list_imported_email_messages"],
+    )
+
+
+def handle_get_email_thread(store: ContactStore, args: BaseModel) -> ToolResult:
+    params = GetEmailThreadInput.model_validate(args)
+    try:
+        records = store.get_imported_email_thread(
+            params.external_thread_id,
+            external_account=params.external_account,
+        )
+    except GmailRuntimeUnsupportedError as exc:
+        return _gmail_runtime_error_result("get_email_thread", exc)
+    markers: set[str] = set()
+    for row in records:
+        row["summary"] = _safe_summary(row)
+        for marker in row.get("markers") or []:
+            markers.add(str(marker))
+    attention = sorted(markers)
+    summary = f"Thread {params.external_thread_id[:12]} has {len(records)} imported message(s)."
+    if attention:
+        summary += f" Attention markers: {', '.join(attention)}."
+    return ToolResult(
+        tool_name="get_email_thread",
+        status="ok",
+        summary=summary,
+        records=records,
+        record_count=len(records),
+        provenance=["repository:get_imported_email_thread"],
+        warnings=[],
     )

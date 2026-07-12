@@ -100,3 +100,26 @@ class ContactStore(Protocol):
     def sanitize_company_name(self, name: Optional[str]) -> Optional[str]: ...
 
     def extract_domain(self, website: Optional[str]) -> Optional[str]: ...
+
+    def list_imported_email_messages(
+        self,
+        *,
+        intent: Optional[str] = None,
+        marker: Optional[str] = None,
+        direction: Optional[str] = None,
+        link_status: Optional[str] = None,
+        lead_id: Optional[int] = None,
+        person_id: Optional[int] = None,
+        since: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        app_timezone: str = "UTC",
+    ) -> tuple[List[Dict[str, Any]], int]: ...
+
+    def get_imported_email_thread(
+        self,
+        external_thread_id: str,
+        *,
+        external_account: Optional[str] = None,
+        app_timezone: str = "UTC",
+    ) -> List[Dict[str, Any]]: ...

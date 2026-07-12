@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gmail Integration</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Gmail Integration (G0)</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/emails">Imported Emails</a>
+      <a href="/integrations/gmail">Gmail</a>
+      <a href="/ask">Ask Database</a>
+    </nav>
+  </header>
+  <main>
+    {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+    <div class="card">
+      <h2>Status</h2>
+      <ul>
+        <li>Enabled: {{ status.enabled }}</li>
+        <li>Runtime capability: {{ status.runtime_capability }}</li>
+        <li>Database backend: {{ status.runtime_backend }}</li>
+        <li>Token available: {{ status.token_available }}</li>
+        <li>Credentials available: {{ status.credentials_available }}</li>
+        <li>Connected account: {{ status.account_email or "n/a" }}</li>
+        <li>Configured label: {{ status.configured_label }}</li>
+        <li>Sync limit: {{ status.sync_limit }}</li>
+        <li>Last sync: {{ status.last_sync_at or "never" }}</li>
+        <li>Last status: {{ status.last_status or "n/a" }}</li>
+        <li>Last error: {{ status.last_error_code or "none" }}</li>
+      </ul>
+      {% if status.last_result_summary %}
+      <p>Last counts: {{ status.last_result_summary }}</p>
+      {% endif %}
+      <form method="post" action="/integrations/gmail/sync">
+        <button type="submit" {% if not status.enabled %}disabled{% endif %}>Sync Gmail</button>
+      </form>
+      <p>Read-only scope: gmail.readonly. Create the <code>{{ status.configured_label }}</code> label manually in Gmail before syncing.</p>
+    </div>
+  </main>
+</body>
+</html>

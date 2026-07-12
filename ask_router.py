@@ -62,6 +62,29 @@ _TOOL_ROUTED_INTENTS: dict[str, tuple[str, Any]] = {
         "list_due_followups",
         lambda intent: {"limit": 50},
     ),
+    "imported_emails_reply_needed": (
+        "list_email_messages",
+        lambda intent: {"marker": "reply_needed", "limit": intent.limit},
+    ),
+    "imported_emails_positive": (
+        "list_email_messages",
+        lambda intent: {"intent": "positive_interest", "limit": intent.limit},
+    ),
+    "imported_emails_meeting": (
+        "list_email_messages",
+        lambda intent: {"marker": "meeting_requested", "limit": intent.limit},
+    ),
+    "imported_emails_unlinked": (
+        "list_email_messages",
+        lambda intent: {"link_status": "unlinked", "limit": intent.limit},
+    ),
+    "imported_email_thread": (
+        "get_email_thread",
+        lambda intent: {
+            "external_thread_id": intent.query,
+            "external_account": (intent.filters or {}).get("external_account"),
+        },
+    ),
 }
 
 _STOPWORDS = {
@@ -160,6 +183,26 @@ def answer_question(
 
 def _deterministic_intent(question: str) -> AskIntent:
     q = _norm(question)
+
+    if any(term in q for term in ("need a reply", "need reply", "reply needed", "trebaju odgovor")):
+        return AskIntent("imported_emails_reply_needed", limit=50, confidence=1.0)
+
+    if "positive" in q and any(term in q for term in ("reply", "replies", "email", "agency")):
+        return AskIntent("imported_emails_positive", limit=50, confidence=1.0)
+
+    if any(term in q for term in ("meeting request", "meeting requests", "call request", "zahtev za sastanak")):
+        return AskIntent("imported_emails_meeting", limit=50, confidence=1.0)
+
+    if any(term in q for term in ("unlinked email", "unlinked emails", "nepovezane poruke")):
+        return AskIntent("imported_emails_unlinked", limit=50, confidence=1.0)
+
+    thread_match = re.search(r"(?:gmail thread|thread)\s+([a-zA-Z0-9_-]+)", q)
+    if thread_match:
+        return AskIntent(
+            "imported_email_thread",
+            query=thread_match.group(1),
+            confidence=1.0,
+        )
 
     if any(term in q for term in ("how many", "koliko", "count", "broj")):
         if any(term in q for term in ("email", "contact", "kontakt")):
@@ -756,6 +799,30 @@ def _tool_result_to_ask_response(
             "question": question,
             "intent": "followups_due",
             "answer": "\n".join(lines),
+            "data": data,
+        }
+    if tool_name == "list_email_messages":
+        data["emails"] = result.records
+        lines = [result.summary]
+        for row in result.records[:15]:
+            lines.append(
+                f"- {row.get('occurred_at_local')}: {row.get('subject') or '(no subject)'} "
+                f"[{row.get('primary_intent')}] ({row.get('link_status')})"
+            )
+        if len(result.records) > 15:
+            lines.append(f"... and {len(result.records) - 15} more in this page.")
+        return {
+            "question": question,
+            "intent": "imported_emails",
+            "answer": "\n".join(lines),
+            "data": data,
+        }
+    if tool_name == "get_email_thread":
+        data["thread"] = result.records
+        return {
+            "question": question,
+            "intent": "imported_email_thread",
+            "answer": result.summary,
             "data": data,
         }
     data["records"] = result.records

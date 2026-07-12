@@ -22,6 +22,7 @@ from persistence.models import (
 )
 from persistence.session import get_session_factory, init_schema
 from persistence.unit_of_work import UnitOfWork
+from gmail_runtime import GmailRuntimeUnsupportedError, require_gmail_sqlite_runtime
 from repositories.mapping import (
     _org_has_verified_email,
     organization_to_lead_detail,
@@ -951,3 +952,30 @@ class PostgresContactStore:
 
     def extract_domain(self, website: Optional[str]) -> Optional[str]:
         return sqlite_db.extract_domain(website)
+
+    def list_imported_email_messages(
+        self,
+        *,
+        intent: Optional[str] = None,
+        marker: Optional[str] = None,
+        direction: Optional[str] = None,
+        link_status: Optional[str] = None,
+        lead_id: Optional[int] = None,
+        person_id: Optional[int] = None,
+        since: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        app_timezone: str = "UTC",
+    ) -> tuple[List[Dict[str, Any]], int]:
+        require_gmail_sqlite_runtime(self)
+        return [], 0  # pragma: no cover
+
+    def get_imported_email_thread(
+        self,
+        external_thread_id: str,
+        *,
+        external_account: Optional[str] = None,
+        app_timezone: str = "UTC",
+    ) -> List[Dict[str, Any]]:
+        require_gmail_sqlite_runtime(self)
+        return []  # pragma: no cover

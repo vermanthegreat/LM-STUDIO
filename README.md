@@ -37,6 +37,18 @@ Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://l
 | `/leads/{id}` | Lead detail |
 | `/ask` | Natural-language DB queries |
 | `/export/csv` | CSV download |
+| `/integrations/gmail` | Gmail G0 status and manual sync |
+| `/emails` | Imported Gmail messages (filtered) |
+
+Gmail G0 is disabled unless `GMAIL_ENABLED=true`. Gmail sync and email queries
+require the **SQLite** runtime; PostgreSQL returns a controlled unsupported-runtime
+error for Gmail operations. Authorization:
+
+```bash
+python scripts/gmail_authorize.py
+```
+
+Create the configured Gmail label (default `LMStudio`) manually before the first sync.
 
 ## Ask database examples
 
@@ -81,6 +93,14 @@ LMSTUDIO_BASE_URL=http://localhost:1234/v1
 LMSTUDIO_MODEL=local-model
 LMSTUDIO_TIMEOUT=60
 LOG_LEVEL=INFO
+
+# Gmail G0 (optional; disabled by default)
+GMAIL_ENABLED=false
+GMAIL_CLIENT_SECRET_PATH=
+GMAIL_TOKEN_PATH=
+GMAIL_SYNC_LABEL=LMStudio
+GMAIL_SYNC_LIMIT=100
+APP_TIMEZONE=Asia/Jerusalem
 ```
 
 Copy `.env.example` to `.env` and adjust paths for your machine. Never commit real credentials.
