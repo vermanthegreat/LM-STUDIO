@@ -12,7 +12,7 @@ import db
 import pytest
 from config import AppConfig
 from fastapi.testclient import TestClient
-from gmail_schemas import GMAIL_READONLY_SCOPE, AttentionMarker, PrimaryIntent
+from gmail_schemas import GMAIL_READONLY_SCOPE, AttentionMarker, MessageRole, PrimaryIntent
 from providers.fake_gmail import FakeGmailProvider
 from providers.gmail_normalize import normalize_gmail_api_message
 from repositories.sqlite_store import SqliteContactStore
@@ -21,6 +21,7 @@ from services.email_classification_service import classify_email_message, determ
 from services.gmail_linking import resolve_contact_link
 from services.gmail_sync_service import gmail_integration_status, sync_gmail_label
 from tools.registry import build_default_registry
+from ask_router import answer_question
 
 from app import create_app
 
@@ -59,6 +60,33 @@ def _seed_provider() -> FakeGmailProvider:
         body="We are interested in moving forward. Can we schedule a call next week?",
     )
     return provider
+
+
+def _records_by_message_id(sqlite_store) -> dict[str, dict]:
+    records, _ = sqlite_store.list_imported_email_messages(limit=100)
+    return {str(row["external_message_id"]): row for row in records}
+
+
+def _seed_shopify_confirmation(
+    provider: FakeGmailProvider,
+    *,
+    message_id: str = "shopify-relay-1",
+    thread_id: str = "t-shopify-relay",
+    target_company: str = "Human Element",
+    initiator: str = "Operator",
+) -> None:
+    provider.seed_message(
+        message_id=message_id,
+        thread_id=thread_id,
+        subject=f"Shopify Partner Directory: New Service Inquiry from {initiator} to {target_company}",
+        from_email="Shopify Partner Directory <partners@shopify.com>",
+        to_email="operator@example.com, archive@example.com",
+        body=(
+            "Shopify Partner Directory\n\n"
+            "Your message has been sent. "
+            "You asked whether they can schedule a call next week."
+        ),
+    )
 
 
 def test_gmail_disabled_by_default():
@@ -200,6 +228,159 @@ def test_classification_automated_header():
     assert AttentionMarker.AUTOMATED_MESSAGE in result.markers
 
 
+def test_shopify_partner_directory_confirmation_has_typed_role_outreach_and_target(sqlite_store, gmail_cfg):
+    lead, _ = sqlite_store.upsert_lead({"company_name": "Human Element"})
+    provider = FakeGmailProvider()
+    _seed_shopify_confirmation(provider, target_company="Human Element to Consumer")
+    sqlite_store.upsert_lead({"company_name": "Human Element to Consumer"})
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+
+    records, total = sqlite_store.list_imported_email_messages()
+    assert total == 1
+    row = records[0]
+    assert row["direction"] == "inbound"
+    assert row["message_role"] == MessageRole.SHOPIFY_PARTNER_INQUIRY_CONFIRMATION.value
+    assert row["target_company_name"] == "Human Element to Consumer"
+    assert row["primary_intent"] == "outreach"
+    assert row["requires_followup"] is False
+    assert row["link_status"] == "linked"
+    assert row["lead_id"] != lead["id"]
+    assert row["classification_warning"] == "shopify_partner_directory_relay"
+    assert "automated_message" in row["markers"]
+    assert "reply_needed" not in row["markers"]
+    assert "meeting_requested" not in row["markers"]
+    assert row["external_account"] == "operator@example.com"
+    assert row["to_address_text"] == "operator@example.com, archive@example.com"
+
+
+def test_shopify_confirmation_ambiguous_on_multiple_exact_company_matches(sqlite_store, gmail_cfg):
+    with db.get_conn(sqlite_store.database_path) as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        normalized = db.normalize_name("Human Element")
+        conn.execute(
+            "INSERT INTO leads (company_name, normalized_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("Human Element", normalized, now, now),
+        )
+        conn.execute(
+            "INSERT INTO leads (company_name, normalized_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("Human Element", normalized, now, now),
+        )
+    provider = FakeGmailProvider()
+    _seed_shopify_confirmation(provider, target_company="Human Element")
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+    row = _records_by_message_id(sqlite_store)["shopify-relay-1"]
+    assert row["link_status"] == "ambiguous"
+    assert row["lead_id"] is None
+
+
+def test_shopify_confirmation_never_links_shopify_sender_as_agency(sqlite_store, gmail_cfg):
+    sqlite_store.upsert_lead({"company_name": "Shopify Transport", "company_email": "partners@shopify.com"})
+    provider = FakeGmailProvider()
+    _seed_shopify_confirmation(provider, target_company="Missing Agency")
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+    row = _records_by_message_id(sqlite_store)["shopify-relay-1"]
+    assert row["link_status"] == "unlinked"
+    assert row["lead_id"] is None
+
+
+def test_direct_agency_reply_inherits_thread_link_without_confirmation_role(sqlite_store, gmail_cfg):
+    lead, _ = sqlite_store.upsert_lead({"company_name": "Human Element"})
+    provider = FakeGmailProvider()
+    _seed_shopify_confirmation(provider, message_id="shopify-confirm", thread_id="thread-human", target_company="Human Element")
+    provider.seed_message(
+        message_id="agency-reply",
+        thread_id="thread-human",
+        subject="Re: Shopify Partner Directory: New Service Inquiry from Operator to Human Element",
+        from_email="hello@humanelement.com",
+        to_email="operator@example.com",
+        body="Sounds good, we are interested in talking further.",
+        internal_date=datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc),
+    )
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+    rows = _records_by_message_id(sqlite_store)
+    assert rows["shopify-confirm"]["lead_id"] == lead["id"]
+    assert rows["agency-reply"]["lead_id"] == lead["id"]
+    assert rows["agency-reply"]["message_role"] == "conversation_message"
+    assert rows["agency-reply"]["primary_intent"] == "positive_interest"
+
+
+def test_existing_misclassified_shopify_confirmation_is_reclassified_idempotently(sqlite_store, gmail_cfg):
+    sqlite_store.upsert_lead({"company_name": "Human Element"})
+    provider = FakeGmailProvider()
+    _seed_shopify_confirmation(provider, target_company="Human Element")
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+    before = _records_by_message_id(sqlite_store)["shopify-relay-1"]
+    with db.get_conn(sqlite_store.database_path) as conn:
+        conn.execute(
+            """
+            UPDATE gmail_messages
+            SET message_role = 'conversation_message',
+                target_company_name = NULL,
+                primary_intent = 'meeting_or_call_request',
+                markers_json = ?,
+                requires_followup = 1,
+                link_status = 'unlinked',
+                lead_id = NULL,
+                classification_warning = NULL
+            WHERE id = ?
+            """,
+            (json.dumps(["meeting_requested", "reply_needed"]), before["id"]),
+        )
+
+    correction, _ = sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+    corrected = _records_by_message_id(sqlite_store)["shopify-relay-1"]
+    records_after_correction, total_after_correction = sqlite_store.list_imported_email_messages()
+    repeated, _ = sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+    repeated_row = _records_by_message_id(sqlite_store)["shopify-relay-1"]
+    records_after_repeat, total_after_repeat = sqlite_store.list_imported_email_messages()
+
+    assert correction.counts.updated == 1
+    assert corrected["external_message_id"] == before["external_message_id"]
+    assert corrected["external_thread_id"] == before["external_thread_id"]
+    assert total_after_correction == 1
+    assert corrected["message_role"] == MessageRole.SHOPIFY_PARTNER_INQUIRY_CONFIRMATION.value
+    assert corrected["primary_intent"] == "outreach"
+    assert corrected["requires_followup"] is False
+    assert "meeting_requested" not in corrected["markers"]
+    assert "reply_needed" not in corrected["markers"]
+    assert records_after_correction[0]["id"] == before["id"]
+    assert repeated.counts.updated == 0
+    assert total_after_repeat == 1
+    assert repeated_row == corrected
+
+
+def test_label_boundary_passes_resolved_label_id_and_no_sender_exclusion(sqlite_store, gmail_cfg):
+    provider = FakeGmailProvider()
+    provider._labels = [{"id": "Label_Custom", "name": "LMStudio", "type": "user"}]
+    provider.seed_message(
+        message_id="google-alert-labeled",
+        thread_id="thread-alert",
+        subject="Security alert",
+        from_email="Google <no-reply@accounts.google.com>",
+        to_email="operator@example.com",
+        body="A security alert carried the configured label.",
+        label_ids=["Label_Custom"],
+    )
+    provider.seed_message(
+        message_id="google-alert-unlabeled",
+        thread_id="thread-alert-2",
+        subject="Security alert",
+        from_email="Google <no-reply@accounts.google.com>",
+        to_email="operator@example.com",
+        body="This alert does not carry the configured label.",
+        label_ids=["INBOX"],
+    )
+    result, entry = sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+    rows = _records_by_message_id(sqlite_store)
+    assert result.counts.discovered == 1
+    assert result.counts.imported == 1
+    assert provider.list_message_calls == [{"label_id": "Label_Custom", "limit": 100, "page_token": None}]
+    assert entry is not None
+    assert entry.tool_arguments["label_id"] == "Label_Custom"
+    assert "google-alert-labeled" in rows
+    assert "google-alert-unlabeled" not in rows
+
+
 def test_malformed_llm_fallback():
     provider = _seed_provider()
     message = provider.get_message("msg-1")
@@ -248,6 +429,60 @@ def test_gmail_status_and_sync_routes(tmp_path, gmail_cfg):
         assert response.status_code == 200
 
 
+def test_gmail_page_displays_recent_imported_email_data(sqlite_store, gmail_cfg):
+    provider = _seed_provider()
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+
+    client = TestClient(create_app(gmail_cfg), base_url="http://127.0.0.1:8025")
+    with client:
+        response = client.get("/integrations/gmail")
+
+    assert response.status_code == 200
+    assert "Recent Imported Email Data" in response.text
+    assert "operator@example.com" in response.text
+    assert "client@agency.com" in response.text
+    assert "Interested in partnership" in response.text
+    assert "Body preview" in response.text
+    assert "positive_interest" in response.text
+
+
+def test_imported_emails_page_displays_email_relevant_fields(sqlite_store, gmail_cfg):
+    provider = _seed_provider()
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+
+    client = TestClient(create_app(gmail_cfg), base_url="http://127.0.0.1:8025")
+    with client:
+        response = client.get("/emails")
+
+    assert response.status_code == 200
+    assert "Account" in response.text
+    assert "From:" in response.text
+    assert "To:" in response.text
+    assert "Body preview" in response.text
+    assert "follow-up" in response.text
+
+
+def test_imported_emails_page_displays_shopify_confirmation_semantics(sqlite_store, gmail_cfg):
+    sqlite_store.upsert_lead({"company_name": "Human Element"})
+    provider = FakeGmailProvider()
+    _seed_shopify_confirmation(provider, target_company="Human Element")
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+
+    client = TestClient(create_app(gmail_cfg), base_url="http://127.0.0.1:8025")
+    with client:
+        response = client.get("/emails")
+
+    assert response.status_code == 200
+    assert "inbound" in response.text
+    assert "Shopify inquiry confirmation" in response.text
+    assert "Target:" in response.text
+    assert "Human Element" in response.text
+    assert "outreach" in response.text
+    assert "operator@example.com" in response.text
+    assert "partners@shopify.com" in response.text
+    assert "Link status" in response.text
+
+
 def test_list_email_messages_tool(sqlite_store, gmail_cfg):
     provider = _seed_provider()
     sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
@@ -255,6 +490,61 @@ def test_list_email_messages_tool(sqlite_store, gmail_cfg):
     result = registry.execute(sqlite_store, "list_email_messages", {"marker": "positive_signal", "limit": 10})
     assert result.status == "ok"
     assert result.record_count >= 1
+
+
+def test_typed_queries_exclude_shopify_confirmation_but_keep_direct_agency_replies(sqlite_store, gmail_cfg):
+    sqlite_store.upsert_lead({"company_name": "Pictonix"})
+    sqlite_store.upsert_lead({"company_name": "Blackbelt Commerce"})
+    provider = FakeGmailProvider()
+    _seed_shopify_confirmation(
+        provider,
+        message_id="confirm-pictonix",
+        thread_id="thread-pictonix",
+        target_company="Pictonix",
+        initiator="Operator",
+    )
+    provider.seed_message(
+        message_id="pictonix-reply",
+        thread_id="thread-pictonix",
+        subject="Re: Shopify Partner Directory: New Service Inquiry from Operator to Pictonix",
+        from_email="team@pictonix.com",
+        to_email="operator@example.com",
+        body="Sounds good, we are interested.",
+        internal_date=datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc),
+    )
+    provider.seed_message(
+        message_id="blackbelt-meeting",
+        thread_id="thread-blackbelt",
+        subject="Re: Project",
+        from_email="hello@blackbeltcommerce.com",
+        to_email="operator@example.com",
+        body="Can we schedule a call next week?",
+        internal_date=datetime(2026, 7, 10, 11, 0, tzinfo=timezone.utc),
+    )
+    provider.seed_message(
+        message_id="operator-outbound",
+        thread_id="thread-outbound",
+        subject="Following up",
+        from_email="operator@example.com",
+        to_email="agency@example.com",
+        body="Sounds good, looking forward to it.",
+        internal_date=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=provider, use_llm=False)
+
+    positive = answer_question("show positive agency replies", store=sqlite_store, use_llm=False)
+    reply_needed = answer_question("show emails that need reply", store=sqlite_store, use_llm=False)
+    meetings = answer_question("show meeting requests", store=sqlite_store, use_llm=False)
+
+    positive_ids = {row["external_message_id"] for row in positive["data"]["emails"]}
+    reply_ids = {row["external_message_id"] for row in reply_needed["data"]["emails"]}
+    meeting_ids = {row["external_message_id"] for row in meetings["data"]["emails"]}
+    assert "pictonix-reply" in positive_ids
+    assert "operator-outbound" not in positive_ids
+    assert "confirm-pictonix" not in positive_ids
+    assert "confirm-pictonix" not in reply_ids
+    assert "blackbelt-meeting" in meeting_ids
+    assert "confirm-pictonix" not in meeting_ids
 
 
 def test_get_email_thread_tool(sqlite_store, gmail_cfg):

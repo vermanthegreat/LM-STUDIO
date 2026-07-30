@@ -48,6 +48,17 @@ def test_parse_success_redirects(tmp_path):
         _close_client(client)
 
 
+def test_root_header_links_to_gmail(tmp_path):
+    client, _, _ = _client(tmp_path)
+    try:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert 'href="/integrations/gmail"' in response.text
+        assert "Gmail" in response.text
+    finally:
+        _close_client(client)
+
+
 def test_parse_rejects_empty_text(tmp_path):
     client, _, _ = _client(tmp_path)
     try:

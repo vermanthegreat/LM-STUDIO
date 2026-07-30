@@ -59,6 +59,32 @@ construct a database session, or bypass application validation.
 - `TaskService`: manages local follow-up plans.
 - `AnalyticsService`: deterministic, read-only metrics.
 
+### Source-specific pasted-text parsing
+
+- LinkedIn input is structurally classified before generic fallback as a
+  company Home, About, or People page, a personal profile, or unsupported
+  LinkedIn content.
+- LinkedIn company People pages use deterministic header and named-card
+  boundaries. Page chrome, anonymous members, similar-company sections, and
+  workforce filters are not promoted to canonical contact facts.
+- Each paste appends a raw source, while a People-page person is upserted within
+  its lead by normalized name (case-folded with whitespace normalized). The
+  identity does not depend on the raw-source row or mutable headline.
+- A LinkedIn company URL remains source metadata and never becomes the
+  organization's canonical website. Existing explicit Shopify Partner
+  Directory fields retain precedence during a LinkedIn merge.
+- Cross-source company identity resolution evaluates exact official domain,
+  business-email domain, LinkedIn company URL, canonical name, known alias,
+  and unique source-display alias in that order. Multiple matches at the first
+  matching tier fail closed for review; substring and general fuzzy matching
+  are not used.
+- Structurally valid Shopify Partner Directory profiles may retain a
+  conservative promotional-suffix alias in parsed source metadata while the
+  original display name remains unchanged. Phase 0 does not add an alias
+  table or schema migration.
+- Raw-source type follows the resolved parser classification independently of
+  the route default and of the canonical lead's original source.
+
 ### Typed tool registry
 
 Each tool has a unique name, Pydantic input/output schema, risk class,
@@ -135,6 +161,11 @@ SQLite gmail_* tables  (supported runtime)
   classifier returns schema-validated intent/markers only; it cannot invoke
   tools, Gmail, or database writes. `requires_followup` is derived from
   validated markers.
+- **Shopify Partner Directory confirmations:** Anchored provider confirmation
+  subjects are classified deterministically as
+  `message_role=shopify_partner_inquiry_confirmation` with business intent
+  `outreach`; target-company linkage uses exact existing company-name matches
+  or existing deterministic thread linkage only.
 - **PostgreSQL capability:** Alembic migration `004_gmail_g0` defines PostgreSQL
   schema, but Gmail sync and query operations are **SQLite-only** in G0.
   PostgreSQL runtime requests fail closed with

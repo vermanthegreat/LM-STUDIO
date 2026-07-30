@@ -79,5 +79,14 @@ pre.answer {
   padding: 1rem;
   border-radius: 4px;
 }
+pre.email-preview {
+  max-width: 42rem;
+  max-height: 12rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: #f8f9fa;
+  padding: 0.75rem;
+  border-radius: 4px;
+}
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 @media (max-width: 700px) { .grid-2 { grid-template-columns: 1fr; } }

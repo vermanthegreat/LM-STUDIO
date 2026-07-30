@@ -12,13 +12,15 @@
     <nav>
       <a href="/">Paste</a>
       <a href="/leads">Leads</a>
-      <a href="/emails">Imported Emails</a>
       <a href="/integrations/gmail">Gmail</a>
+      <a href="/emails">Imported Emails</a>
       <a href="/ask">Ask Database</a>
     </nav>
   </header>
   <main>
     {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+    {% if runtime_error %}<div class="msg">{{ runtime_error }}</div>{% endif %}
+
     <div class="card">
       <h2>Status</h2>
       <ul>
@@ -41,6 +43,75 @@
         <button type="submit" {% if not status.enabled %}disabled{% endif %}>Sync Gmail</button>
       </form>
       <p>Read-only scope: gmail.readonly. Create the <code>{{ status.configured_label }}</code> label manually in Gmail before syncing.</p>
+    </div>
+
+    <div class="card">
+      <h2>Recent Imported Email Data</h2>
+      <p>Showing {{ recent_emails|length }} of {{ email_total }} locally imported Gmail message(s).</p>
+      <table>
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Account</th>
+            <th>Transport direction</th>
+            <th>From / To</th>
+            <th>Subject</th>
+            <th>Role / Target</th>
+            <th>Intent</th>
+            <th>Attention</th>
+            <th>Linked record</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in recent_emails %}
+          <tr>
+            <td>{{ row.occurred_at_local }}</td>
+            <td>{{ row.external_account or "n/a" }}</td>
+            <td>{{ row.direction }}</td>
+            <td>
+              <strong>From:</strong> {{ row.from_address or "n/a" }}<br>
+              <strong>To:</strong> {{ row.to_address_text or "n/a" }}
+              {% if row.cc_address_text %}<br><strong>Cc:</strong> {{ row.cc_address_text }}{% endif %}
+            </td>
+            <td>
+              {{ row.subject or "(no subject)" }}
+              {% if row.body_preview %}
+              <details>
+                <summary>Body preview</summary>
+                <pre class="email-preview">{{ row.body_preview }}{% if row.body_length > 500 %}...{% endif %}</pre>
+              </details>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.message_role == "shopify_partner_inquiry_confirmation" %}
+                Shopify inquiry confirmation<br>
+                <strong>Target:</strong> {{ row.target_company_name or "n/a" }}
+              {% else %}
+                {{ row.message_role or "conversation_message" }}
+              {% endif %}
+            </td>
+            <td>{{ row.primary_intent }} ({{ row.intent_confidence }})<br><small>{{ row.classification_source }}</small></td>
+            <td>
+              {% if row.requires_followup %}<span class="badge warn">follow-up</span>{% endif %}
+              {{ row.markers|join(", ") or "none" }}
+            </td>
+            <td>
+              {{ row.link_status }}
+              {% if row.company_name %}<br>{{ row.company_name }}{% endif %}
+              {% if row.person_name %}<br>{{ row.person_name }}{% endif %}
+            </td>
+            <td>
+              <a href="/emails/thread/{{ row.external_thread_id }}">{{ row.thread_short }}</a><br>
+              <small>ID: {{ row.message_short }}</small>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="10">No imported Gmail messages yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p><a href="/emails">Open full imported email list</a></p>
     </div>
   </main>
 </body>

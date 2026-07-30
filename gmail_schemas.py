@@ -37,6 +37,11 @@ class PrimaryIntent(str, Enum):
     UNKNOWN = "unknown"
 
 
+class MessageRole(str, Enum):
+    CONVERSATION_MESSAGE = "conversation_message"
+    SHOPIFY_PARTNER_INQUIRY_CONFIRMATION = "shopify_partner_inquiry_confirmation"
+
+
 class AttentionMarker(str, Enum):
     REPLY_NEEDED = "reply_needed"
     FOLLOW_UP_NEEDED = "follow_up_needed"
@@ -118,6 +123,8 @@ class NormalizedGmailMessage(BaseModel):
 class EmailClassificationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    message_role: MessageRole = MessageRole.CONVERSATION_MESSAGE
+    target_company_name: Optional[str] = None
     primary_intent: PrimaryIntent
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str = Field(max_length=500)

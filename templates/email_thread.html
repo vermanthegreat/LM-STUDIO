@@ -8,9 +8,13 @@
 </head>
 <body>
   <header>
-    <h1>Thread {{ thread_id[:12] }}…</h1>
+    <h1>Thread {{ thread_id[:12] }}...</h1>
     <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/integrations/gmail">Gmail</a>
       <a href="/emails">Back to Imported Emails</a>
+      <a href="/ask">Ask Database</a>
     </nav>
   </header>
   <main>
@@ -18,11 +22,35 @@
     <div class="card">
       {% for row in messages %}
       <article style="margin-bottom: 1.5rem; border-bottom: 1px solid #ccc; padding-bottom: 1rem;">
-        <p><strong>{{ row.occurred_at_local }}</strong> — {{ row.direction }} — {{ row.from_address }}</p>
+        <p><strong>{{ row.occurred_at_local }}</strong> - {{ row.external_account }}</p>
+        <p><strong>Transport direction:</strong> {{ row.direction }}</p>
+        <p><strong>From:</strong> {{ row.from_address or "n/a" }}</p>
+        <p><strong>To:</strong> {{ row.to_address_text or "n/a" }}</p>
+        {% if row.cc_address_text %}<p><strong>Cc:</strong> {{ row.cc_address_text }}</p>{% endif %}
         <p><strong>Subject:</strong> {{ row.subject or "(no subject)" }}</p>
+        <p><strong>Message role:</strong>
+          {% if row.message_role == "shopify_partner_inquiry_confirmation" %}
+            Shopify inquiry confirmation
+          {% else %}
+            {{ row.message_role or "conversation_message" }}
+          {% endif %}
+        </p>
+        {% if row.target_company_name %}<p><strong>Target:</strong> {{ row.target_company_name }}</p>{% endif %}
         <p><strong>Intent:</strong> {{ row.primary_intent }} ({{ row.intent_confidence }})</p>
+        <p><strong>Classification:</strong> {{ row.classification_source }}{% if row.classification_model %} / {{ row.classification_model }}{% endif %}</p>
         <p><strong>Markers:</strong> {{ row.markers|join(", ") }}</p>
+        <p><strong>Requires follow-up:</strong> {{ "yes" if row.requires_followup else "no" }}</p>
         <p><strong>Link status:</strong> {{ row.link_status }}</p>
+        {% if row.company_name %}<p><strong>Linked company:</strong> {{ row.company_name }}</p>{% endif %}
+        {% if row.person_name %}<p><strong>Linked person:</strong> {{ row.person_name }}</p>{% endif %}
+        <p><strong>Provider message ID:</strong> {{ row.external_message_id }}</p>
+        {% if row.external_rfc_message_id %}<p><strong>RFC Message-ID:</strong> {{ row.external_rfc_message_id }}</p>{% endif %}
+        {% if row.body_preview %}
+        <details open>
+          <summary>Body preview</summary>
+          <pre class="email-preview">{{ row.body_preview }}{% if row.body_length > 500 %}...{% endif %}</pre>
+        </details>
+        {% endif %}
         {% if row.classification_warning %}<p><strong>Warning:</strong> {{ row.classification_warning }}</p>{% endif %}
       </article>
       {% else %}

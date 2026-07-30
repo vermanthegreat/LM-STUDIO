@@ -14,6 +14,7 @@ from gmail_schemas import (
     AttentionMarker,
     EmailDirection,
     LinkStatus,
+    MessageRole,
     PrimaryIntent,
     SyncResultCounts,
     TemporalSignal,
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS gmail_messages (
     from_address TEXT,
     to_addresses_json TEXT,
     cc_addresses_json TEXT,
+    message_role TEXT NOT NULL DEFAULT 'conversation_message',
+    target_company_name TEXT,
     primary_intent TEXT NOT NULL,
     intent_confidence REAL NOT NULL DEFAULT 0.0,
     markers_json TEXT NOT NULL,
@@ -87,6 +90,14 @@ def _now() -> str:
 
 def ensure_gmail_tables(conn: sqlite3.Connection) -> None:
     conn.executescript(GMAIL_SCHEMA)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(gmail_messages)").fetchall()}
+    if "message_role" not in columns:
+        conn.execute(
+            "ALTER TABLE gmail_messages ADD COLUMN message_role TEXT NOT NULL DEFAULT 'conversation_message'"
+        )
+    if "target_company_name" not in columns:
+        conn.execute("ALTER TABLE gmail_messages ADD COLUMN target_company_name TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gmail_messages_role ON gmail_messages(message_role)")
 
 
 def _json_dumps(value: Any) -> Optional[str]:
@@ -227,6 +238,8 @@ def insert_gmail_message(
     from_address: str,
     to_addresses: list[dict[str, Any]],
     cc_addresses: list[dict[str, Any]],
+    message_role: MessageRole,
+    target_company_name: Optional[str],
     primary_intent: PrimaryIntent,
     intent_confidence: float,
     markers: list[AttentionMarker],
@@ -244,11 +257,11 @@ def insert_gmail_message(
         """
         INSERT INTO gmail_messages (
             gmail_source_id, subject, direction, occurred_at, from_address,
-            to_addresses_json, cc_addresses_json, primary_intent, intent_confidence,
-            markers_json, temporal_signals_json, link_status, classification_source,
+            to_addresses_json, cc_addresses_json, message_role, target_company_name,
+            primary_intent, intent_confidence, markers_json, temporal_signals_json, link_status, classification_source,
             classification_model, classification_warning, requires_followup,
             lead_id, person_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             gmail_source_id,
@@ -258,6 +271,8 @@ def insert_gmail_message(
             from_address,
             _json_dumps(to_addresses),
             _json_dumps(cc_addresses),
+            message_role.value,
+            target_company_name,
             primary_intent.value,
             intent_confidence,
             _json_dumps([m.value for m in markers]),
@@ -291,6 +306,8 @@ def update_gmail_message(
     from_address: str,
     to_addresses: list[dict[str, Any]],
     cc_addresses: list[dict[str, Any]],
+    message_role: MessageRole,
+    target_company_name: Optional[str],
     primary_intent: PrimaryIntent,
     intent_confidence: float,
     markers: list[AttentionMarker],
@@ -312,8 +329,8 @@ def update_gmail_message(
         """
         UPDATE gmail_messages SET
             subject = ?, direction = ?, occurred_at = ?, from_address = ?,
-            to_addresses_json = ?, cc_addresses_json = ?, primary_intent = ?,
-            intent_confidence = ?, markers_json = ?, temporal_signals_json = ?,
+            to_addresses_json = ?, cc_addresses_json = ?, message_role = ?,
+            target_company_name = ?, primary_intent = ?, intent_confidence = ?, markers_json = ?, temporal_signals_json = ?,
             link_status = ?, classification_source = ?, classification_model = ?,
             classification_warning = ?, requires_followup = ?, lead_id = ?,
             person_id = ?, updated_at = ?
@@ -326,6 +343,8 @@ def update_gmail_message(
             from_address,
             _json_dumps(to_addresses),
             _json_dumps(cc_addresses),
+            message_role.value,
+            target_company_name,
             primary_intent.value,
             intent_confidence,
             _json_dumps([m.value for m in markers]),
@@ -414,7 +433,9 @@ def list_gmail_messages(
     rows = conn.execute(
         f"""
         SELECT gm.*, gs.external_message_id, gs.external_thread_id, gs.external_account,
-               gs.external_rfc_message_id, l.company_name, p.name AS person_name
+               gs.external_rfc_message_id, gs.provider_occurred_at,
+               gs.provider_metadata_json, gs.raw_text,
+               l.company_name, p.name AS person_name
         FROM gmail_messages gm
         JOIN gmail_sources gs ON gs.id = gm.gmail_source_id
         LEFT JOIN leads l ON l.id = gm.lead_id
@@ -443,7 +464,9 @@ def get_thread_messages(
     rows = conn.execute(
         f"""
         SELECT gm.*, gs.external_message_id, gs.external_thread_id, gs.external_account,
-               gs.external_rfc_message_id, l.company_name, p.name AS person_name
+               gs.external_rfc_message_id, gs.provider_occurred_at,
+               gs.provider_metadata_json, gs.raw_text,
+               l.company_name, p.name AS person_name
         FROM gmail_messages gm
         JOIN gmail_sources gs ON gs.id = gm.gmail_source_id
         LEFT JOIN leads l ON l.id = gm.lead_id
@@ -468,18 +491,34 @@ def format_local_time(iso_value: str, tz_name: str) -> str:
 
 def row_to_public_dict(row: dict[str, Any], *, app_timezone: str) -> dict[str, Any]:
     markers = _json_loads(row.get("markers_json"), [])
+    to_addresses = _json_loads(row.get("to_addresses_json"), [])
+    cc_addresses = _json_loads(row.get("cc_addresses_json"), [])
+    raw_text = str(row.get("raw_text") or "")
     return {
         "id": row.get("id"),
         "gmail_source_id": row.get("gmail_source_id"),
+        "external_account": row.get("external_account"),
         "external_message_id": row.get("external_message_id"),
         "external_thread_id": row.get("external_thread_id"),
+        "external_rfc_message_id": row.get("external_rfc_message_id"),
         "thread_short": (row.get("external_thread_id") or "")[:12],
+        "message_short": (row.get("external_message_id") or "")[:12],
         "occurred_at": row.get("occurred_at"),
         "occurred_at_local": format_local_time(str(row.get("occurred_at") or ""), app_timezone),
+        "provider_occurred_at": row.get("provider_occurred_at"),
         "direction": row.get("direction"),
         "from_address": row.get("from_address"),
-        "to_addresses": _json_loads(row.get("to_addresses_json"), []),
+        "to_addresses": to_addresses,
+        "cc_addresses": cc_addresses,
+        "to_address_text": ", ".join(
+            str(item.get("email") or item.get("display_name") or "") for item in to_addresses if isinstance(item, dict)
+        ),
+        "cc_address_text": ", ".join(
+            str(item.get("email") or item.get("display_name") or "") for item in cc_addresses if isinstance(item, dict)
+        ),
         "subject": row.get("subject"),
+        "message_role": row.get("message_role") or MessageRole.CONVERSATION_MESSAGE.value,
+        "target_company_name": row.get("target_company_name"),
         "lead_id": row.get("lead_id"),
         "person_id": row.get("person_id"),
         "company_name": row.get("company_name"),
@@ -490,6 +529,11 @@ def row_to_public_dict(row: dict[str, Any], *, app_timezone: str) -> dict[str, A
         "link_status": row.get("link_status"),
         "requires_followup": bool(row.get("requires_followup")),
         "classification_warning": row.get("classification_warning"),
+        "classification_source": row.get("classification_source"),
+        "classification_model": row.get("classification_model"),
+        "body_preview": raw_text[:500],
+        "body_length": len(raw_text),
+        "provider_metadata": _json_loads(row.get("provider_metadata_json"), {}),
     }
 
 

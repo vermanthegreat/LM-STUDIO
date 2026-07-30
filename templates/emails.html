@@ -12,8 +12,8 @@
     <nav>
       <a href="/">Paste</a>
       <a href="/leads">Leads</a>
-      <a href="/emails">Imported Emails</a>
       <a href="/integrations/gmail">Gmail</a>
+      <a href="/emails">Imported Emails</a>
       <a href="/ask">Ask Database</a>
     </nav>
   </header>
@@ -34,13 +34,15 @@
         <thead>
           <tr>
             <th>When (local)</th>
-            <th>Direction</th>
-            <th>From</th>
+            <th>Account</th>
+            <th>Transport direction</th>
+            <th>From / To</th>
             <th>Subject</th>
+            <th>Role / Target</th>
             <th>Linked</th>
             <th>Intent</th>
             <th>Markers</th>
-            <th>Link</th>
+            <th>Link status</th>
             <th>Thread</th>
           </tr>
         </thead>
@@ -48,22 +50,43 @@
           {% for row in emails %}
           <tr>
             <td>{{ row.occurred_at_local }}</td>
+            <td>{{ row.external_account or "n/a" }}</td>
             <td>{{ row.direction }}</td>
-            <td>{{ row.from_address }}</td>
-            <td>{{ row.subject or "(no subject)" }}</td>
             <td>
-              {% if row.company_name %}{{ row.company_name }}{% if row.person_name %} / {{ row.person_name }}{% endif %}{% else %}—{% endif %}
+              <strong>From:</strong> {{ row.from_address or "n/a" }}<br>
+              <strong>To:</strong> {{ row.to_address_text or "n/a" }}
+              {% if row.cc_address_text %}<br><strong>Cc:</strong> {{ row.cc_address_text }}{% endif %}
             </td>
-            <td>{{ row.primary_intent }} ({{ row.intent_confidence }})</td>
-            <td>{{ row.markers|join(", ") }}</td>
+            <td>
+              {{ row.subject or "(no subject)" }}
+              {% if row.body_preview %}
+              <details>
+                <summary>Body preview</summary>
+                <pre class="email-preview">{{ row.body_preview }}{% if row.body_length > 500 %}...{% endif %}</pre>
+              </details>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.message_role == "shopify_partner_inquiry_confirmation" %}
+                Shopify inquiry confirmation<br>
+                <strong>Target:</strong> {{ row.target_company_name or "n/a" }}
+              {% else %}
+                {{ row.message_role or "conversation_message" }}
+              {% endif %}
+            </td>
+            <td>
+              {% if row.company_name %}{{ row.company_name }}{% if row.person_name %} / {{ row.person_name }}{% endif %}{% else %}n/a{% endif %}
+            </td>
+            <td>{{ row.primary_intent }} ({{ row.intent_confidence }})<br><small>{{ row.classification_source }}</small></td>
+            <td>{% if row.requires_followup %}<span class="badge warn">follow-up</span>{% endif %} {{ row.markers|join(", ") }}</td>
             <td>{{ row.link_status }}</td>
-            <td><a href="/emails/thread/{{ row.external_thread_id }}">{{ row.thread_short }}</a></td>
+            <td><a href="/emails/thread/{{ row.external_thread_id }}">{{ row.thread_short }}</a><br><small>ID: {{ row.message_short }}</small></td>
           </tr>
           {% if row.classification_warning %}
-          <tr><td colspan="9">Warning: {{ row.classification_warning }}</td></tr>
+          <tr><td colspan="11">Warning: {{ row.classification_warning }}</td></tr>
           {% endif %}
           {% else %}
-          <tr><td colspan="9">No imported Gmail messages yet.</td></tr>
+          <tr><td colspan="11">No imported Gmail messages yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

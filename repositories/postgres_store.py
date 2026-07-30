@@ -508,6 +508,69 @@ class PostgresContactStore:
             if self._session is None:
                 session.close()
 
+    def find_company_identity_candidates(
+        self,
+        evidence_kind: str,
+        value: str,
+    ) -> List[Dict[str, Any]]:
+        """PostgreSQL equivalent of the exact Phase 0 identity lookup."""
+        allowed = {
+            "domain", "email_domain", "linkedin_company_url", "normalized_name", "source_alias",
+        }
+        if evidence_kind not in allowed or not value:
+            return []
+        session = self._active_session()
+        try:
+            if evidence_kind == "domain":
+                orgs = session.scalars(
+                    select(Organization).where(Organization.normalized_domain == value)
+                ).all()
+            elif evidence_kind == "normalized_name":
+                orgs = session.scalars(
+                    select(Organization).where(Organization.normalized_name == value)
+                ).all()
+            elif evidence_kind == "email_domain":
+                orgs = session.scalars(
+                    select(Organization).options(selectinload(Organization.contact_methods))
+                ).all()
+                orgs = [
+                    org for org in orgs
+                    if org.normalized_domain == value or any(
+                        method.kind == "email"
+                        and sqlite_db.email_domain(method.normalized_value) == value
+                        for method in org.contact_methods
+                    )
+                ]
+            else:
+                sources = session.scalars(
+                    select(Source).where(Source.organization_id.is_not(None))
+                ).all()
+                organization_ids = set()
+                for source in sources:
+                    parsed = (source.legacy_metadata or {}).get("parsed_json") or {}
+                    if evidence_kind == "linkedin_company_url":
+                        matched = (
+                            sqlite_db.normalize_linkedin_url(parsed.get("linkedin_company_url"))
+                            == value
+                        )
+                    else:
+                        matched = any(
+                            sqlite_db.normalize_name(alias) == value
+                            for alias in (parsed.get("company_aliases") or [])
+                            if isinstance(alias, str)
+                        )
+                    if matched:
+                        organization_ids.add(source.organization_id)
+                orgs = session.scalars(
+                    select(Organization).where(Organization.id.in_(organization_ids))
+                ).all() if organization_ids else []
+            return sorted(
+                (organization_to_lead_row(org) for org in orgs), key=lambda row: row["id"]
+            )
+        finally:
+            if self._session is None:
+                session.close()
+
     def find_leads_by_email(self, email: str) -> List[Dict[str, Any]]:
         norm = sqlite_db.normalize_email(email)
         if not norm:

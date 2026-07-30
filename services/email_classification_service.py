@@ -11,6 +11,7 @@ from gmail_schemas import (
     ClassificationSource,
     EmailClassificationResult,
     EmailDirection,
+    MessageRole,
     PrimaryIntent,
     TemporalKind,
     TemporalResolutionStatus,
@@ -40,6 +41,11 @@ _CLASSIFICATION_SYSTEM = (
 
 _AUTOMATED_HEADERS = ("auto-submitted", "x-autoreply", "x-autorespond", "precedence")
 _NO_REPLY_RE = re.compile(r"(no[-_.]?reply|donotreply|do-not-reply)", re.I)
+_SHOPIFY_SENDER_RE = re.compile(r"(^|@|[.\s])shopify\.com\b", re.I)
+_SHOPIFY_PARTNER_INQUIRY_SUBJECT_RE = re.compile(
+    r"^\s*Shopify Partner Directory:\s*New Service Inquiry from\s+(.+?)\s+to\s+(.+?)\s*$",
+    re.I,
+)
 _QUESTION_RE = re.compile(r"\?|could you|can you|would you|please let me know", re.I)
 _POSITIVE_RE = re.compile(
     r"\b(interested|sounds good|let's proceed|happy to|looking forward|great fit)\b",
@@ -86,6 +92,8 @@ def _header_blob(message: NormalizedGmailMessage) -> str:
 
 def _is_automated(message: NormalizedGmailMessage) -> bool:
     from_email = message.from_address.email or ""
+    if _shopify_partner_directory_classification_warning(message):
+        return True
     if _NO_REPLY_RE.search(from_email):
         return True
     blob = _header_blob(message)
@@ -97,6 +105,27 @@ def _is_automated(message: NormalizedGmailMessage) -> bool:
     if "mailing list" in body or "notification" in (message.subject or "").lower():
         return True
     return False
+
+
+def extract_shopify_partner_inquiry_target(message: NormalizedGmailMessage) -> Optional[str]:
+    match = _SHOPIFY_PARTNER_INQUIRY_SUBJECT_RE.match(message.subject or "")
+    if not match:
+        return None
+    target = " ".join(match.group(2).split()).strip(" \t\r\n-:;,.")
+    return target or None
+
+
+def is_shopify_partner_inquiry_confirmation(message: NormalizedGmailMessage) -> bool:
+    from_email = message.from_address.email or ""
+    reply_to = message.reply_to.email if message.reply_to else ""
+    is_shopify_sender = bool(_SHOPIFY_SENDER_RE.search(from_email) or _SHOPIFY_SENDER_RE.search(reply_to))
+    return bool(is_shopify_sender and extract_shopify_partner_inquiry_target(message))
+
+
+def _shopify_partner_directory_classification_warning(message: NormalizedGmailMessage) -> Optional[str]:
+    if is_shopify_partner_inquiry_confirmation(message):
+        return "shopify_partner_directory_relay"
+    return None
 
 
 def _detect_temporal_signals(body: str) -> list[TemporalSignal]:
@@ -145,6 +174,21 @@ def classify_deterministic(
     combined = f"{subject}\n{body}"
     markers: list[AttentionMarker] = []
     temporal_signals = _detect_temporal_signals(combined)
+    target_company_name = extract_shopify_partner_inquiry_target(message)
+
+    if is_shopify_partner_inquiry_confirmation(message):
+        markers.append(AttentionMarker.AUTOMATED_MESSAGE)
+        return EmailClassificationResult(
+            message_role=MessageRole.SHOPIFY_PARTNER_INQUIRY_CONFIRMATION,
+            target_company_name=target_company_name,
+            primary_intent=PrimaryIntent.OUTREACH,
+            confidence=0.95,
+            reason="Shopify Partner Directory inquiry confirmation detected.",
+            markers=markers,
+            temporal_signals=[],
+            classification_source=ClassificationSource.DETERMINISTIC,
+            classification_warning=_shopify_partner_directory_classification_warning(message),
+        )
 
     if _is_automated(message):
         markers.append(AttentionMarker.AUTOMATED_MESSAGE)
@@ -155,6 +199,7 @@ def classify_deterministic(
             markers=markers,
             temporal_signals=temporal_signals,
             classification_source=ClassificationSource.DETERMINISTIC,
+            classification_warning=_shopify_partner_directory_classification_warning(message),
         )
 
     primary_intent = PrimaryIntent.INFORMATIONAL

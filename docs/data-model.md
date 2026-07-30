@@ -126,6 +126,20 @@ Avoid storing complete prompts or private raw source text in ordinary logs.
   application command.
 - Merge operations preserve redirects/history and never silently delete source
   evidence.
+- In the Phase 0 SQLite runtime, source-specific LinkedIn company metadata
+  (company URL, industry, location, follower/employee counts, associated-member
+  count, and workforce distributions) is retained in `raw_sources.parsed_json`.
+  It does not overwrite canonical Shopify website, service, description, or
+  partner-profile fields.
+- Phase 0 company aliases are source-level evidence in
+  `raw_sources.parsed_json`, including the original source display name and
+  the deterministic alias derivation reason. Alias matching is exact,
+  source-specific, and unique-only; ambiguity is preserved for review and is
+  not treated as broad fuzzy matching.
+- LinkedIn workforce function counts are source observations, not canonical
+  services. Repeated People-page ingestion appends source evidence but reuses a
+  person with the same normalized name within the same lead; non-empty contact
+  values and positive decision-maker/relevance flags are preserved.
 
 ## Gmail G0 tables (Phase G0 — SQLite runtime; PostgreSQL schema only)
 
@@ -163,6 +177,10 @@ Application-owned interpretation and linkage for one imported message:
 - `subject`, `direction` (`inbound` / `outbound` / `internal` / `unknown`)
 - `occurred_at` — canonical message time in UTC
 - `from_address`, `to_addresses`, `cc_addresses` — JSON address lists
+- `message_role` — durable typed semantic role, default `conversation_message`;
+  Shopify relay confirmations use `shopify_partner_inquiry_confirmation`
+- `target_company_name` — target company extracted from anchored provider
+  confirmation subjects when present
 - `primary_intent` — validated enum (`positive_interest`, `automated`, etc.)
 - `intent_confidence` — `[0, 1]`
 - `classification_source` — `deterministic`, `local_llm`, or `fallback`

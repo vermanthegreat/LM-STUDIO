@@ -37,7 +37,7 @@ def test_shopvert_fallback_extracts_contact_and_profile_fields():
     assert parsed["website"] == "shopvert.com"
     assert parsed["company_email"] == "[info@shopvert.com](mailto:info@shopvert.com)"
     assert parsed["company_phone"] == "+971 52 700 94 95"
-    assert parsed["partner_tier"] == "Service partner"
+    assert parsed["partner_tier"] == "Plus Partner"
     assert parsed["plus_partner_signal"] is True
     assert parsed["rating"] == 5.0
     assert parsed["review_count"] == 58

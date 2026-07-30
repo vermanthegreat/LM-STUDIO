@@ -229,10 +229,27 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.get("/integrations/gmail", response_class=HTMLResponse)
     def gmail_integration_page(request: Request):
         status = gmail_integration_status(request.app.state.store, cfg)
+        runtime_error: str | None = None
+        recent_emails: list = []
+        email_total = 0
+        try:
+            recent_emails, email_total = request.app.state.store.list_imported_email_messages(
+                limit=10,
+                app_timezone=cfg.app_timezone,
+            )
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
         return templates.TemplateResponse(
             request,
             "gmail_integration.html",
-            {"request": request, "status": status, "message": None},
+            {
+                "request": request,
+                "status": status,
+                "message": None,
+                "recent_emails": recent_emails,
+                "email_total": email_total,
+                "runtime_error": runtime_error,
+            },
         )
 
     @application.post("/integrations/gmail/sync", response_class=HTMLResponse)
@@ -240,6 +257,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         assert_safe_mutation_request(request, port=cfg.port)
         result, entry = sync_gmail_label(request.app.state.store, cfg)
         status = gmail_integration_status(request.app.state.store, cfg)
+        runtime_error: str | None = None
+        recent_emails: list = []
+        email_total = 0
+        try:
+            recent_emails, email_total = request.app.state.store.list_imported_email_messages(
+                limit=10,
+                app_timezone=cfg.app_timezone,
+            )
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
         if result.status == "ok":
             counts = result.counts
             msg = (
@@ -252,7 +279,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request,
             "gmail_integration.html",
-            {"request": request, "status": status, "message": msg},
+            {
+                "request": request,
+                "status": status,
+                "message": msg,
+                "recent_emails": recent_emails,
+                "email_total": email_total,
+                "runtime_error": runtime_error,
+            },
         )
 
     @application.get("/emails", response_class=HTMLResponse)

@@ -64,15 +64,15 @@ _TOOL_ROUTED_INTENTS: dict[str, tuple[str, Any]] = {
     ),
     "imported_emails_reply_needed": (
         "list_email_messages",
-        lambda intent: {"marker": "reply_needed", "limit": intent.limit},
+        lambda intent: {"marker": "reply_needed", "direction": "inbound", "limit": intent.limit},
     ),
     "imported_emails_positive": (
         "list_email_messages",
-        lambda intent: {"intent": "positive_interest", "limit": intent.limit},
+        lambda intent: {"intent": "positive_interest", "direction": "inbound", "limit": intent.limit},
     ),
     "imported_emails_meeting": (
         "list_email_messages",
-        lambda intent: {"marker": "meeting_requested", "limit": intent.limit},
+        lambda intent: {"marker": "meeting_requested", "direction": "inbound", "limit": intent.limit},
     ),
     "imported_emails_unlinked": (
         "list_email_messages",
@@ -807,7 +807,8 @@ def _tool_result_to_ask_response(
         for row in result.records[:15]:
             lines.append(
                 f"- {row.get('occurred_at_local')}: {row.get('subject') or '(no subject)'} "
-                f"[{row.get('primary_intent')}] ({row.get('link_status')})"
+                f"[{row.get('message_role') or 'conversation_message'} / {row.get('primary_intent')}] "
+                f"({row.get('link_status')})"
             )
         if len(result.records) > 15:
             lines.append(f"... and {len(result.records) - 15} more in this page.")

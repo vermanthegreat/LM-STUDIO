@@ -111,6 +111,13 @@ class SqliteContactStore:
     ) -> List[Dict[str, Any]]:
         return db.find_matching_leads(company_name, website, linkedin_url, **self._kwargs())
 
+    def find_company_identity_candidates(
+        self,
+        evidence_kind: str,
+        value: str,
+    ) -> List[Dict[str, Any]]:
+        return db.find_company_identity_candidates(evidence_kind, value, **self._kwargs())
+
     def find_leads_by_email(self, email: str) -> List[Dict[str, Any]]:
         return db.find_leads_by_email(email, **self._kwargs())
 

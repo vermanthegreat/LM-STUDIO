@@ -1,6 +1,7 @@
 .env
 *.db
 gmail_token.json
+gmail_client_secret.json
 credentials.json
 client_secret*.json
 __pycache__/

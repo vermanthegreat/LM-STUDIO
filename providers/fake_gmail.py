@@ -18,6 +18,7 @@ class FakeGmailProvider:
         ]
         self._messages: dict[str, dict[str, Any]] = {}
         self._threads: dict[str, list[str]] = {}
+        self.list_message_calls: list[dict[str, Any]] = []
 
     def seed_message(
         self,
@@ -78,6 +79,7 @@ class FakeGmailProvider:
         limit: int,
         page_token: Optional[str] = None,
     ) -> dict[str, Any]:
+        self.list_message_calls.append({"label_id": label_id, "limit": limit, "page_token": page_token})
         del page_token
         ids = [
             mid

@@ -347,6 +347,63 @@ def find_matching_leads(
         return _run(c)
 
 
+def find_company_identity_candidates(
+    evidence_kind: str,
+    value: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[Dict[str, Any]]:
+    """Return leads matching one exact, normalized company-identity fact."""
+    allowed = {
+        "domain", "email_domain", "linkedin_company_url", "normalized_name", "source_alias",
+    }
+    if evidence_kind not in allowed or not value:
+        return []
+
+    def _run(c: sqlite3.Connection) -> List[Dict[str, Any]]:
+        lead_ids: set[int] = set()
+        if evidence_kind == "domain":
+            rows = c.execute("SELECT id FROM leads WHERE lower(domain) = ?", (value,)).fetchall()
+            lead_ids.update(int(row["id"]) for row in rows)
+        elif evidence_kind == "email_domain":
+            rows = c.execute(
+                """SELECT id FROM leads
+                   WHERE lower(domain) = ?
+                      OR lower(substr(company_email, instr(company_email, '@') + 1)) = ?""",
+                (value, value),
+            ).fetchall()
+            lead_ids.update(int(row["id"]) for row in rows)
+        elif evidence_kind == "normalized_name":
+            rows = c.execute("SELECT id FROM leads WHERE normalized_name = ?", (value,)).fetchall()
+            lead_ids.update(int(row["id"]) for row in rows)
+        else:
+            rows = c.execute(
+                "SELECT lead_id, parsed_json FROM raw_sources WHERE lead_id IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                parsed = _json_loads(row["parsed_json"], {}) or {}
+                if evidence_kind == "linkedin_company_url":
+                    stored = normalize_linkedin_url(parsed.get("linkedin_company_url"))
+                    if stored == value:
+                        lead_ids.add(int(row["lead_id"]))
+                else:
+                    aliases = parsed.get("company_aliases") or []
+                    if any(normalize_name(alias) == value for alias in aliases if isinstance(alias, str)):
+                        lead_ids.add(int(row["lead_id"]))
+        if not lead_ids:
+            return []
+        placeholders = ",".join("?" for _ in lead_ids)
+        rows = c.execute(
+            f"SELECT * FROM leads WHERE id IN ({placeholders}) ORDER BY id", sorted(lead_ids)
+        ).fetchall()
+        return [_hydrate_lead_row(dict(row)) for row in rows]
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
 def find_leads_by_email(
     email: str,
     db_path: Path = DB_PATH,
@@ -558,6 +615,8 @@ def add_person(
     now = _now()
     li = normalize_linkedin_url(data.get("linkedin_url"))
     em = normalize_email(data.get("email"))
+    normalized_person_name = normalize_name(data.get("name"))
+    title = (data.get("title") or "").strip() or None
 
     def _run(c: sqlite3.Connection) -> Dict[str, Any]:
         existing = None
@@ -571,22 +630,35 @@ def add_person(
                 "SELECT * FROM people WHERE lead_id = ? AND lower(email) = ?",
                 (lead_id, em),
             ).fetchone()
+        if not existing and normalized_person_name:
+            existing = next(
+                (
+                    row
+                    for row in c.execute(
+                        "SELECT * FROM people WHERE lead_id = ? AND name IS NOT NULL",
+                        (lead_id,),
+                    ).fetchall()
+                    if normalize_name(row["name"]) == normalized_person_name
+                ),
+                None,
+            )
         if existing:
             c.execute(
-                """UPDATE people SET name=COALESCE(?,name), title=COALESCE(?,title),
+                """UPDATE people SET title=COALESCE(?,title),
                    department=COALESCE(?,department), seniority=COALESCE(?,seniority),
-                   email=COALESCE(?,email), is_decision_maker=?, is_relevant_contact=?,
+                   email=COALESCE(email,?), linkedin_url=COALESCE(linkedin_url,?),
+                   is_decision_maker=?, is_relevant_contact=?,
                    relevance_reason=COALESCE(?,relevance_reason),
                    confidence=?, raw_source_id=COALESCE(?,raw_source_id)
                    WHERE id=?""",
                 (
-                    data.get("name"),
-                    data.get("title"),
+                    title,
                     data.get("department"),
                     data.get("seniority"),
                     em,
-                    int(data.get("is_decision_maker", 0)),
-                    int(data.get("is_relevant_contact", 0)),
+                    li,
+                    int(bool(existing["is_decision_maker"]) or bool(data.get("is_decision_maker", 0))),
+                    int(bool(existing["is_relevant_contact"]) or bool(data.get("is_relevant_contact", 0))),
                     data.get("relevance_reason"),
                     data.get("confidence", 0.0),
                     raw_source_id,
@@ -604,7 +676,7 @@ def add_person(
             (
                 lead_id,
                 data.get("name"),
-                data.get("title"),
+                title,
                 data.get("department"),
                 data.get("seniority"),
                 em,

@@ -35,10 +35,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _SqliteGmailLinkAdapter:
     store: Any
+    conn: Any | None = None
 
     def find_exact_email_matches(self, email: str) -> list[dict[str, Any]]:
         import db
 
+        if self.conn is not None:
+            return db.find_exact_email_matches(email, db_path=self.store.database_path, conn=self.conn)
         return db.find_exact_email_matches(email, db_path=self.store.database_path)
 
     def find_thread_links(
@@ -51,6 +54,14 @@ class _SqliteGmailLinkAdapter:
         import db
         import gmail_db
 
+        if self.conn is not None:
+            gmail_db.ensure_gmail_tables(self.conn)
+            return gmail_db.find_thread_links(
+                self.conn,
+                external_account=external_account,
+                external_thread_id=external_thread_id,
+                exclude_message_id=exclude_message_id,
+            )
         with db.get_conn(self.store.database_path) as conn:
             gmail_db.ensure_gmail_tables(conn)
             return gmail_db.find_thread_links(
@@ -59,6 +70,33 @@ class _SqliteGmailLinkAdapter:
                 external_thread_id=external_thread_id,
                 exclude_message_id=exclude_message_id,
             )
+
+    def find_exact_company_name_matches(self, company_name: str) -> list[dict[str, Any]]:
+        import db
+
+        normalized = db.normalize_name(company_name)
+        if not normalized:
+            return []
+        if self.conn is not None:
+            rows = self.conn.execute(
+                """
+                SELECT id AS lead_id, NULL AS person_id, company_name
+                FROM leads
+                WHERE normalized_name = ?
+                """,
+                (normalized,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        with db.get_conn(self.store.database_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT id AS lead_id, NULL AS person_id, company_name
+                FROM leads
+                WHERE normalized_name = ?
+                """,
+                (normalized,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def _provider_from_config(cfg: AppConfig, provider: Any | None) -> Any:
@@ -98,7 +136,7 @@ def _persist_message(
         external_account=normalized.account_email,
         external_message_id=normalized.message_id,
     )
-    link_adapter = _SqliteGmailLinkAdapter(store)
+    link_adapter = _SqliteGmailLinkAdapter(store, conn)
     link: LinkDecision = resolve_contact_link(link_adapter, normalized)
     if link.link_status.value == "linked":
         counts.linked += 1
@@ -158,6 +196,8 @@ def _persist_message(
             from_address=normalized.from_address.email,
             to_addresses=_serialize_addresses(normalized.to_addresses),
             cc_addresses=_serialize_addresses(normalized.cc_addresses),
+            message_role=classification.message_role,
+            target_company_name=classification.target_company_name,
             primary_intent=classification.primary_intent,
             intent_confidence=classification.confidence,
             markers=classification.markers,
@@ -174,8 +214,6 @@ def _persist_message(
 
     counts.already_present += 1
     message_row = get_message_by_source_id(conn, int(existing["id"]))
-    if message_row and existing.get("content_hash") == content_hash:
-        return
 
     if message_row is None:
         insert_gmail_message(
@@ -187,6 +225,8 @@ def _persist_message(
             from_address=normalized.from_address.email,
             to_addresses=_serialize_addresses(normalized.to_addresses),
             cc_addresses=_serialize_addresses(normalized.cc_addresses),
+            message_role=classification.message_role,
+            target_company_name=classification.target_company_name,
             primary_intent=classification.primary_intent,
             intent_confidence=classification.confidence,
             markers=classification.markers,
@@ -201,6 +241,27 @@ def _persist_message(
         counts.updated += 1
         return
 
+    stored_markers = gmail_db._json_loads(message_row.get("markers_json"), [])
+    semantic_changed = (
+        message_row.get("subject") != normalized.subject
+        or message_row.get("direction") != direction.value
+        or message_row.get("from_address") != normalized.from_address.email
+        or gmail_db._json_loads(message_row.get("to_addresses_json"), []) != _serialize_addresses(normalized.to_addresses)
+        or gmail_db._json_loads(message_row.get("cc_addresses_json"), []) != _serialize_addresses(normalized.cc_addresses)
+        or (message_row.get("message_role") or "conversation_message") != classification.message_role.value
+        or message_row.get("target_company_name") != classification.target_company_name
+        or message_row.get("primary_intent") != classification.primary_intent.value
+        or list(stored_markers or []) != [m.value for m in classification.markers]
+        or message_row.get("link_status") != link.link_status.value
+        or message_row.get("classification_source") != classification.classification_source.value
+        or message_row.get("classification_model") != classification.classification_model
+        or message_row.get("classification_warning") != classification.classification_warning
+        or message_row.get("lead_id") != link.lead_id
+        or message_row.get("person_id") != link.person_id
+    )
+    if not semantic_changed and existing.get("content_hash") == content_hash:
+        return
+
     update_gmail_message(
         conn,
         int(message_row["id"]),
@@ -211,6 +272,8 @@ def _persist_message(
         from_address=normalized.from_address.email,
         to_addresses=_serialize_addresses(normalized.to_addresses),
         cc_addresses=_serialize_addresses(normalized.cc_addresses),
+        message_role=classification.message_role,
+        target_company_name=classification.target_company_name,
         primary_intent=classification.primary_intent,
         intent_confidence=classification.confidence,
         markers=classification.markers,
@@ -223,7 +286,8 @@ def _persist_message(
         person_id=link.person_id,
         gmail_source_id=int(existing["id"]),
     )
-    counts.updated += 1
+    if semantic_changed or existing.get("content_hash") != content_hash:
+        counts.updated += 1
 
 
 def sync_gmail_label(
@@ -307,6 +371,11 @@ def sync_gmail_label(
                 "gmail_label_missing",
                 f"Gmail label '{cfg.gmail_sync_label}' was not found. Create it manually in Gmail.",
             )
+        entry.tool_arguments = {
+            **(entry.tool_arguments or {}),
+            "label_id": label_id,
+        }
+        command_log.update(entry)
 
         listing = gmail_provider.list_messages(label_id, cfg.gmail_sync_limit)
         refs = listing.get("messages") or []
@@ -343,6 +412,7 @@ def sync_gmail_label(
             "warnings": warnings,
             "account": account_email,
             "label": cfg.gmail_sync_label,
+            "label_id": label_id,
             "limit": cfg.gmail_sync_limit,
             "correlation_id": str(uuid4()),
         }

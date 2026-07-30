@@ -50,6 +50,12 @@ class ContactStore(Protocol):
         linkedin_url: Optional[str] = None,
     ) -> List[Dict[str, Any]]: ...
 
+    def find_company_identity_candidates(
+        self,
+        evidence_kind: str,
+        value: str,
+    ) -> List[Dict[str, Any]]: ...
+
     def find_leads_by_email(self, email: str) -> List[Dict[str, Any]]: ...
 
     def upsert_lead(
