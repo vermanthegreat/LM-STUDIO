@@ -145,6 +145,77 @@ def test_homepage_and_http_website_are_accepted_with_normalized_urls():
     assert fetcher.calls[0][0] == "http://example.com/"
 
 
+def transport_response(final_url: str, body: str, *, status: int = 200, content_type: str = "text/html"):
+    """Mirror hardened transport identity: requested_url equals final_url after redirects."""
+    return CompanyWebsiteFetchResponse(
+        requested_url=final_url,
+        final_url=final_url,
+        http_status=status,
+        content_type=content_type,
+        body=body.encode("utf-8"),
+        retry_after=None,
+    )
+
+
+@pytest.mark.parametrize("company_website,final_url", [
+    ("https://example.com", "https://www.example.com/"),
+    ("https://www.example.com", "https://example.com/"),
+    ("https://example.com/about", "https://www.example.com/about"),
+])
+def test_canonical_apex_www_redirect_responses_are_accepted(company_website, final_url):
+    from services.company_website_discovery_provider import _normalize_website_url
+
+    plan_url = _normalize_website_url(company_website, allow_query=False)
+    assert plan_url is not None
+    site, fetcher = provider({plan_url: transport_response(final_url, HOME)})
+    result = site.execute(request(company_website=company_website, max_requests=1, max_pages=1))
+    assert result.status is DiscoveryOutcomeStatus.NO_RESULT
+    assert result.safe_error_code is None
+    assert fetcher.calls
+    assert result.sources[0].source_url == _normalize_expected(final_url)
+
+
+def _normalize_expected(url: str) -> str:
+    from services.company_website_discovery_provider import _normalize_website_url
+    normalized = _normalize_website_url(url, allow_query=False) or url
+    return normalized.rstrip("/")
+
+
+@pytest.mark.parametrize("final_url", [
+    "https://team.example.com/",
+    "https://shop.example.com/",
+    "https://example.net/",
+    "https://www.example.net/",
+])
+def test_non_canonical_redirect_destinations_remain_blocked(final_url):
+    site, fetcher = provider({"https://example.com/": transport_response(final_url, HOME)})
+    result = site.execute(request(max_requests=1, max_pages=1))
+    assert result.status is DiscoveryOutcomeStatus.PERMANENT_ERROR
+    assert result.safe_error_code == "company_website_redirect_blocked"
+    assert fetcher.calls == [("https://example.com/", 10, 1024 * 1024)]
+
+
+def test_www_team_subdomain_is_not_treated_as_apex_www_equivalent():
+    site, _ = provider({"https://example.com/": transport_response("https://www.team.example.com/", HOME)})
+    result = site.execute(request(max_requests=1, max_pages=1))
+    assert result.status is DiscoveryOutcomeStatus.PERMANENT_ERROR
+    assert result.safe_error_code == "company_website_redirect_blocked"
+
+
+def test_apex_www_redirect_preserves_actual_final_url_in_source_evidence():
+    final_url = "https://www.digismoothie.com/"
+    site, _ = provider({"https://digismoothie.com/": transport_response(final_url, TEAM)})
+    result = site.execute(request(company_website="https://digismoothie.com", max_requests=1, max_pages=1))
+    assert result.status is DiscoveryOutcomeStatus.SUCCEEDED
+    assert result.sources[0].source_url == "https://www.digismoothie.com"
+    assert result.candidates[0].name == "Jane Doe"
+    first, second = (
+        site.execute(request(company_website="https://digismoothie.com", max_requests=1, max_pages=1)).sources[0].content_hash,
+        site.execute(request(company_website="https://digismoothie.com", max_requests=1, max_pages=1)).sources[0].content_hash,
+    )
+    assert first == second
+
+
 def test_allowed_host_is_exact_or_www_but_not_arbitrary_subdomain():
     pages = {
         "https://example.com": response("https://example.com", HOME.replace('href="/team"', 'href="https://www.example.com/team"')),

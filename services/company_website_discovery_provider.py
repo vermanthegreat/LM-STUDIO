@@ -271,7 +271,18 @@ def _is_blocked_host(host: str) -> bool:
 
 
 def _same_allowed_host(host: str, start_host: str) -> bool:
-    return host == start_host or {host, start_host} == {start_host.removeprefix("www."), f"www.{start_host.removeprefix('www.')}"}
+    root = start_host.removeprefix("www.")
+    return host in {root, f"www.{root}"}
+
+
+def _same_redirect_target(expected: str, actual: str) -> bool:
+    expected_parts = urlsplit(expected)
+    actual_parts = urlsplit(actual)
+    if expected_parts.scheme != actual_parts.scheme:
+        return False
+    if expected_parts.path != actual_parts.path:
+        return False
+    return _same_allowed_host(actual_parts.hostname or "", expected_parts.hostname or "")
 
 
 def _page_type(url: str, title: str = "") -> Optional[str]:
@@ -591,9 +602,19 @@ class CompanyWebsiteDiscoveryProvider(DiscoveryProvider):
 
 
 def _response_matches_request(response: CompanyWebsiteFetchResponse, requested_url: str, start_host: str) -> bool:
+    planned = _normalize_website_url(requested_url, allow_query=False)
     requested = _normalize_website_url(response.requested_url, allow_query=False)
     final = _normalize_website_url(response.final_url, allow_query=False)
-    return requested == requested_url and final is not None and _same_allowed_host(urlsplit(final).hostname or "", start_host)
+    if planned is None or requested is None or final is None:
+        return False
+    planned_host = urlsplit(planned).hostname or ""
+    if not _same_allowed_host(planned_host, start_host):
+        return False
+    return (
+        _same_redirect_target(planned, requested)
+        and _same_redirect_target(planned, final)
+        and _same_redirect_target(requested, final)
+    )
 
 
 def _is_person_type(value: str) -> bool:
