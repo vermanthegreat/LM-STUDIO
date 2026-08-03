@@ -42,6 +42,13 @@ schema phase.
 
 ## contact_methods
 
+SQLite E1.1 also persists noncanonical `person_candidates` and
+`contact_method_candidates`. These versioned review-evidence rows are linked to
+one lead and raw source, start in `needs_review`, preserve provenance, and do
+not create or update canonical people or contact fields. Candidate lifecycle,
+verification, evidence-basis, discovery-method, ownership, and expected-version
+rules are enforced by the SQLite repository boundary.
+
 - `id` UUID primary key
 - `organization_id` nullable foreign key
 - `person_id` nullable foreign key

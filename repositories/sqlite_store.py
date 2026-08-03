@@ -157,6 +157,30 @@ class SqliteContactStore:
     def link_raw_source_to_lead(self, raw_source_id: int, lead_id: int) -> None:
         db.link_raw_source_to_lead(raw_source_id, lead_id, **self._kwargs())
 
+    def create_or_reuse_person_candidate(self, lead_id: int, raw_source_id: int, **fields: Any) -> Dict[str, Any]:
+        return db.create_or_reuse_person_candidate(lead_id, raw_source_id, **fields, **self._kwargs())
+
+    def get_person_candidate(self, candidate_id: int) -> Optional[Dict[str, Any]]:
+        return db.get_person_candidate(candidate_id, **self._kwargs())
+
+    def list_person_candidates_for_lead(self, lead_id: int) -> List[Dict[str, Any]]:
+        return db.list_person_candidates_for_lead(lead_id, **self._kwargs())
+
+    def update_person_candidate_status(self, candidate_id: int, expected_version: int, target_status: str, applied_person_id: Optional[int] = None) -> Dict[str, Any]:
+        return db.update_person_candidate_status(candidate_id, expected_version, target_status, applied_person_id, **self._kwargs())
+
+    def create_or_reuse_contact_candidate(self, lead_id: int, raw_source_id: int, **fields: Any) -> Dict[str, Any]:
+        return db.create_or_reuse_contact_candidate(lead_id, raw_source_id, **fields, **self._kwargs())
+
+    def get_contact_candidate(self, candidate_id: int) -> Optional[Dict[str, Any]]:
+        return db.get_contact_candidate(candidate_id, **self._kwargs())
+
+    def list_contact_candidates_for_lead(self, lead_id: int) -> List[Dict[str, Any]]:
+        return db.list_contact_candidates_for_lead(lead_id, **self._kwargs())
+
+    def update_contact_candidate_status(self, candidate_id: int, expected_version: int, target_status: str, applied_contact_method_id: Optional[int] = None) -> Dict[str, Any]:
+        return db.update_contact_candidate_status(candidate_id, expected_version, target_status, applied_contact_method_id, **self._kwargs())
+
     def add_person(
         self,
         lead_id: int,

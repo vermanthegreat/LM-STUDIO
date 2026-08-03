@@ -144,6 +144,67 @@ CREATE TABLE IF NOT EXISTS command_log (
 
 CREATE INDEX IF NOT EXISTS idx_command_log_status ON command_log(status);
 CREATE INDEX IF NOT EXISTS idx_command_log_correlation_id ON command_log(correlation_id);
+
+CREATE TABLE IF NOT EXISTS person_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    raw_source_id INTEGER NOT NULL REFERENCES raw_sources(id) ON DELETE CASCADE,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    normalized_name TEXT NOT NULL CHECK (length(trim(normalized_name)) > 0),
+    title TEXT,
+    role_type TEXT NOT NULL,
+    is_decision_maker INTEGER NOT NULL CHECK (is_decision_maker IN (0, 1)),
+    profile_url TEXT,
+    source_type TEXT NOT NULL,
+    source_url TEXT,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    relevance_reason TEXT,
+    discovery_method TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needs_review',
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    applied_person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((status = 'applied' AND applied_person_id IS NOT NULL) OR
+           (status <> 'applied' AND applied_person_id IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_candidates_lead ON person_candidates(lead_id);
+CREATE INDEX IF NOT EXISTS idx_person_candidates_reuse_profile ON person_candidates(lead_id, raw_source_id, profile_url);
+CREATE INDEX IF NOT EXISTS idx_person_candidates_reuse_name ON person_candidates(lead_id, raw_source_id, normalized_name, role_type);
+CREATE INDEX IF NOT EXISTS idx_person_candidates_status ON person_candidates(status);
+
+CREATE TABLE IF NOT EXISTS contact_method_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    raw_source_id INTEGER NOT NULL REFERENCES raw_sources(id) ON DELETE CASCADE,
+    person_candidate_id INTEGER REFERENCES person_candidates(id) ON DELETE CASCADE,
+    person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL CHECK (length(trim(value)) > 0),
+    normalized_value TEXT NOT NULL CHECK (length(trim(normalized_value)) > 0),
+    source_url TEXT,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    verification_status TEXT NOT NULL DEFAULT 'unverified',
+    evidence_basis TEXT NOT NULL,
+    discovery_method TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needs_review',
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    applied_contact_method_id INTEGER,
+    discovered_at TEXT NOT NULL,
+    verified_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((person_candidate_id IS NOT NULL AND person_id IS NULL) OR
+           (person_candidate_id IS NULL AND person_id IS NOT NULL)),
+    CHECK ((status = 'applied' AND applied_contact_method_id IS NOT NULL) OR
+           (status <> 'applied' AND applied_contact_method_id IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_lead ON contact_method_candidates(lead_id);
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_reuse_candidate ON contact_method_candidates(person_candidate_id, raw_source_id, kind, normalized_value);
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_reuse_person ON contact_method_candidates(person_id, raw_source_id, kind, normalized_value);
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_status ON contact_method_candidates(status);
 """
 
 
@@ -572,6 +633,228 @@ def create_raw_source(
     if conn is not None:
         return _run(conn)
     with get_conn(db_path) as c:
+        return _run(c)
+
+
+def _candidate_connection(db_path: Path, conn: Optional[sqlite3.Connection]):
+    if conn is not None:
+        @contextmanager
+        def _existing_connection():
+            yield conn
+        return _existing_connection()
+    return get_conn(db_path)
+
+
+def _begin_candidate_write(c: sqlite3.Connection) -> None:
+    """Serialize the candidate read-then-insert section at SQLite's write boundary."""
+    if not c.in_transaction:
+        c.execute("BEGIN IMMEDIATE")
+
+
+def _candidate_refs(c: sqlite3.Connection, lead_id: int, raw_source_id: int) -> sqlite3.Row:
+    lead = c.execute("SELECT id FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    if lead is None:
+        from candidate_models import CandidateError
+        raise CandidateError("lead_not_found", "lead not found")
+    source = c.execute("SELECT lead_id FROM raw_sources WHERE id = ?", (raw_source_id,)).fetchone()
+    if source is None:
+        from candidate_models import CandidateError
+        raise CandidateError("raw_source_not_found", "raw source not found")
+    if source["lead_id"] != lead_id:
+        from candidate_models import CandidateError
+        raise CandidateError("raw_source_ownership_mismatch", "raw source belongs to another lead")
+    return source
+
+
+def _candidate_status(status: str, applied_id: Optional[int]) -> None:
+    from candidate_models import CANDIDATE_STATUSES, CandidateError, require_enum
+
+    require_enum(status, CANDIDATE_STATUSES, "invalid_candidate_status", "candidate status")
+    if status == "applied" and applied_id is None:
+        raise CandidateError("invalid_applied_binding", "applied status requires an applied identifier")
+    if status != "applied" and applied_id is not None:
+        raise CandidateError("invalid_applied_binding", "only applied status may have an applied identifier")
+
+
+def create_or_reuse_person_candidate(
+    lead_id: int,
+    raw_source_id: int,
+    *,
+    name: str,
+    title: Optional[str] = None,
+    role_type: str = "other",
+    is_decision_maker: bool = False,
+    profile_url: Optional[str] = None,
+    source_type: str,
+    source_url: Optional[str] = None,
+    confidence: float = 0.0,
+    relevance_reason: Optional[str] = None,
+    discovery_method: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    from candidate_models import DISCOVERY_METHODS, CandidateError, normalize_profile_url, require_confidence, require_enum, normalize_candidate_name
+    normalized_name = normalize_candidate_name(name)
+    profile_url = normalize_profile_url(profile_url)
+    require_enum(role_type, __import__("models").ROLE_TYPES, "invalid_role_type", "role_type")
+    require_enum(discovery_method, DISCOVERY_METHODS, "invalid_discovery_method", "discovery_method")
+    numeric_confidence = require_confidence(confidence)
+
+    def _run(c: sqlite3.Connection) -> Dict[str, Any]:
+        _begin_candidate_write(c)
+        _candidate_refs(c, lead_id, raw_source_id)
+        query = """SELECT * FROM person_candidates
+                   WHERE lead_id = ? AND raw_source_id = ? AND
+                   ((? IS NOT NULL AND profile_url = ?) OR
+                    (? IS NULL AND normalized_name = ? AND role_type = ?))
+                   ORDER BY id LIMIT 1"""
+        existing = c.execute(query, (lead_id, raw_source_id, profile_url, profile_url, profile_url, normalized_name, role_type)).fetchone()
+        if existing is not None:
+            return dict(existing)
+        now = _now()
+        cur = c.execute(
+            """INSERT INTO person_candidates
+               (lead_id, raw_source_id, name, normalized_name, title, role_type,
+                is_decision_maker, profile_url, source_type, source_url, confidence,
+                relevance_reason, discovery_method, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lead_id, raw_source_id, name.strip(), normalized_name, title, role_type,
+             int(is_decision_maker), profile_url, source_type, source_url, numeric_confidence,
+             relevance_reason, discovery_method, now, now),
+        )
+        return dict(c.execute("SELECT * FROM person_candidates WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def get_person_candidate(candidate_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Optional[Dict[str, Any]]:
+    def _run(c: sqlite3.Connection):
+        row = c.execute("SELECT * FROM person_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def list_person_candidates_for_lead(lead_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
+    def _run(c: sqlite3.Connection):
+        return [dict(row) for row in c.execute("SELECT * FROM person_candidates WHERE lead_id = ? ORDER BY id", (lead_id,)).fetchall()]
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def update_person_candidate_status(candidate_id: int, expected_version: int, target_status: str, applied_person_id: Optional[int] = None, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    from candidate_models import CandidateError
+    _candidate_status(target_status, applied_person_id)
+    def _run(c: sqlite3.Connection):
+        row = c.execute("SELECT * FROM person_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        if row is None:
+            raise CandidateError("candidate_not_found", "person candidate not found")
+        if row["version"] != expected_version:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        if applied_person_id is not None:
+            person = c.execute("SELECT lead_id FROM people WHERE id = ?", (applied_person_id,)).fetchone()
+            if person is None or person["lead_id"] != row["lead_id"]:
+                raise CandidateError("person_ownership_mismatch", "applied person belongs to another lead")
+        now = _now()
+        result = c.execute("UPDATE person_candidates SET status = ?, applied_person_id = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?", (target_status, applied_person_id, now, candidate_id, expected_version))
+        if result.rowcount != 1:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        return dict(c.execute("SELECT * FROM person_candidates WHERE id = ?", (candidate_id,)).fetchone())
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def create_or_reuse_contact_candidate(
+    lead_id: int,
+    raw_source_id: int,
+    *,
+    person_candidate_id: Optional[int] = None,
+    person_id: Optional[int] = None,
+    kind: str,
+    value: str,
+    normalized_value: Optional[str] = None,
+    source_url: Optional[str] = None,
+    confidence: float = 0.0,
+    verification_status: str = "unverified",
+    evidence_basis: str = "source_confirmed",
+    discovery_method: str,
+    discovered_at: Optional[str] = None,
+    verified_at: Optional[str] = None,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    from candidate_models import CONTACT_KINDS, DISCOVERY_METHODS, CandidateError, normalize_contact_value, require_confidence, require_enum, validate_verification
+    if (person_candidate_id is None) == (person_id is None):
+        raise CandidateError("invalid_owner_binding", "exactly one candidate owner is required")
+    require_enum(kind, CONTACT_KINDS, "invalid_contact_kind", "contact kind")
+    require_enum(discovery_method, DISCOVERY_METHODS, "invalid_discovery_method", "discovery_method")
+    normalized = normalized_value.strip() if normalized_value else normalize_contact_value(kind, value)
+    if not normalized:
+        raise CandidateError("invalid_contact_value", "normalized contact value cannot be blank")
+    numeric_confidence = require_confidence(confidence)
+    validate_verification(evidence_basis, verification_status, verified_at)
+
+    def _run(c: sqlite3.Connection):
+        _begin_candidate_write(c)
+        _candidate_refs(c, lead_id, raw_source_id)
+        if person_candidate_id is not None:
+            owner = c.execute("SELECT lead_id FROM person_candidates WHERE id = ?", (person_candidate_id,)).fetchone()
+            if owner is None or owner["lead_id"] != lead_id:
+                raise CandidateError("person_candidate_ownership_mismatch", "person candidate belongs to another lead")
+            owner_clause, owner_value = "person_candidate_id = ?", person_candidate_id
+        else:
+            owner = c.execute("SELECT lead_id FROM people WHERE id = ?", (person_id,)).fetchone()
+            if owner is None or owner["lead_id"] != lead_id:
+                raise CandidateError("person_ownership_mismatch", "person belongs to another lead")
+            owner_clause, owner_value = "person_id = ?", person_id
+        existing = c.execute(f"SELECT * FROM contact_method_candidates WHERE {owner_clause} AND raw_source_id = ? AND kind = ? AND normalized_value = ? LIMIT 1", (owner_value, raw_source_id, kind, normalized)).fetchone()
+        if existing is not None:
+            return dict(existing)
+        now = _now()
+        cur = c.execute("""INSERT INTO contact_method_candidates
+            (lead_id, raw_source_id, person_candidate_id, person_id, kind, value,
+             normalized_value, source_url, confidence, verification_status, evidence_basis,
+             discovery_method, discovered_at, created_at, updated_at, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lead_id, raw_source_id, person_candidate_id, person_id, kind, value.strip(), normalized,
+             source_url, numeric_confidence, verification_status, evidence_basis, discovery_method,
+             discovered_at or now, now, now, verified_at))
+        return dict(c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (cur.lastrowid,)).fetchone())
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def get_contact_candidate(candidate_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Optional[Dict[str, Any]]:
+    def _run(c):
+        row = c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def list_contact_candidates_for_lead(lead_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
+    def _run(c):
+        return [dict(row) for row in c.execute("SELECT * FROM contact_method_candidates WHERE lead_id = ? ORDER BY id", (lead_id,)).fetchall()]
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def update_contact_candidate_status(candidate_id: int, expected_version: int, target_status: str, applied_contact_method_id: Optional[int] = None, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    from candidate_models import CandidateError
+    _candidate_status(target_status, applied_contact_method_id)
+    def _run(c):
+        row = c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        if row is None:
+            raise CandidateError("candidate_not_found", "contact candidate not found")
+        if row["version"] != expected_version:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        now = _now()
+        result = c.execute("UPDATE contact_method_candidates SET status = ?, applied_contact_method_id = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?", (target_status, applied_contact_method_id, now, candidate_id, expected_version))
+        if result.rowcount != 1:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        return dict(c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (candidate_id,)).fetchone())
+    with _candidate_connection(db_path, conn) as c:
         return _run(c)
 
 
