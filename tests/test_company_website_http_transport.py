@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import ssl
 
+import http.client
+
 import pytest
 
 from services.company_website_discovery_provider import CompanyWebsiteDiscoveryProvider
@@ -436,3 +438,150 @@ def test_stage_deadline_exhaustion_is_stable_and_stops_later_stages(stage: str):
         assert all(connection.closed for connection in getattr(factory, "connections"))
     if stage == "redirect":
         assert len(resolver.calls) == 1
+
+
+def test_system_http_response_set_timeout_uses_transport_socket_when_fp_raw_cleared():
+    class FakeSock:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+    sock = FakeSock()
+    http_response = http.client.HTTPResponse.__new__(http.client.HTTPResponse)
+    http_response.status = 200
+    http_response.fp = type("FP", (), {"raw": None})()
+    wrapped = transport_module._SystemHttpResponse(http_response, sock)
+
+    wrapped.set_timeout(7.5)
+
+    assert sock.timeouts == [7.5]
+
+
+def test_system_http_connection_updates_status_after_begin(monkeypatch):
+    class FakeSock:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+        def sendall(self, payload: bytes) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+    class FakeHttpResponse:
+        status = 200
+
+        def __init__(self, sock: FakeSock) -> None:
+            self.fp = type("FP", (), {"raw": None})()
+
+        def begin(self) -> None:
+            return
+
+        def getheader(self, name: str) -> str | None:
+            return "text/html" if name.casefold() == "content-type" else None
+
+        def read(self, size: int) -> bytes:
+            return b""
+
+    monkeypatch.setattr(transport_module.http.client, "HTTPResponse", FakeHttpResponse)
+    connection = transport_module._SystemHttpConnection(FakeSock())
+    response = connection.get(hostname="example.com", path="/", timeout_seconds=10)
+
+    assert response.status == 200
+
+
+@pytest.mark.parametrize(
+    ("address", "expected_target"),
+    [
+        ("93.184.216.34", ("93.184.216.34", 443)),
+        ("2606:2800:220:1:248:1893:25c8:1946", ("2606:2800:220:1:248:1893:25c8:1946", 443, 0, 0)),
+    ],
+)
+def test_system_connection_uses_correct_sockaddr_tuple_shape(address: str, expected_target: tuple[object, ...], monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeSocket:
+        def __init__(self, family: int, type: int) -> None:
+            captured["family"] = family
+            captured["timeouts"] = []
+
+        def settimeout(self, value: float) -> None:
+            captured.setdefault("timeouts", []).append(value)
+
+        def connect(self, target: object) -> None:
+            captured["target"] = target
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(transport_module.socket, "socket", FakeSocket)
+    factory = SystemCompanyWebsiteConnectionFactory()
+
+    with pytest.raises(Exception):
+        factory.connect(
+            hostname="example.com",
+            address=address,
+            port=443,
+            tls=True,
+            timeout_seconds=12.5,
+        )
+
+    assert captured["target"] == expected_target
+    assert captured["timeouts"] == [12.5]
+    assert captured["closed"] is True
+
+
+def test_system_https_body_read_survives_repeated_timeout_updates(monkeypatch):
+    class FakeSock:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+            self.offset = 0
+            self.payload = b"a" * 20
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+        def sendall(self, payload: bytes) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+    class FakeHttpResponse:
+        status = 200
+
+        def __init__(self, sock: FakeSock) -> None:
+            self._sock = sock
+            self.fp = type("FP", (), {"raw": None})()
+            self.offset = 0
+
+        def begin(self) -> None:
+            return
+
+        def getheader(self, name: str) -> str | None:
+            return None
+
+        def read(self, size: int) -> bytes:
+            chunk = self._sock.payload[self.offset:self.offset + min(size, 5)]
+            self.offset += len(chunk)
+            self.fp.raw = None
+            return chunk
+
+    monkeypatch.setattr(transport_module.http.client, "HTTPResponse", FakeHttpResponse)
+    connection = transport_module._SystemHttpConnection(FakeSock())
+    response = connection.get(hostname="example.com", path="/", timeout_seconds=10)
+    body = bytearray()
+    while True:
+        response.set_timeout(4.0)
+        chunk = response.read(5)
+        if not chunk:
+            break
+        body.extend(chunk)
+
+    assert body == b"a" * 20
+    assert response._sock.timeouts.count(4.0) == 5

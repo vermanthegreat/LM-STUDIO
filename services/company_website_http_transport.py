@@ -132,8 +132,9 @@ class CompanyWebsiteConnectionFactory(ABC):
 
 
 class _SystemHttpResponse(CompanyWebsiteHttpResponse):
-    def __init__(self, response: http.client.HTTPResponse) -> None:
+    def __init__(self, response: http.client.HTTPResponse, sock: socket.socket) -> None:
         self._response = response
+        self._sock = sock
         self.status = response.status
 
     def header(self, name: str) -> Optional[str]:
@@ -143,7 +144,7 @@ class _SystemHttpResponse(CompanyWebsiteHttpResponse):
         return self._response.read(size)
 
     def set_timeout(self, timeout_seconds: float) -> None:
-        self._response.fp.raw._sock.settimeout(timeout_seconds)
+        self._sock.settimeout(timeout_seconds)
 
     def close(self) -> None:
         self._response.close()
@@ -167,8 +168,9 @@ class _SystemHttpConnection(CompanyWebsiteHttpConnection):
             "Connection: close\r\n\r\n"
         ).encode("ascii")
         self._sock.sendall(request)
-        response = _SystemHttpResponse(http.client.HTTPResponse(self._sock))
+        response = _SystemHttpResponse(http.client.HTTPResponse(self._sock), self._sock)
         response._response.begin()
+        response.status = response._response.status
         self._response = response
         return response
 
