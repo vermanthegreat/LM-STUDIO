@@ -90,7 +90,8 @@ def _seed_shopify_confirmation(
     )
 
 
-def test_gmail_disabled_by_default():
+def test_gmail_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("GMAIL_ENABLED", raising=False)
     cfg = AppConfig.from_env()
     assert cfg.gmail_enabled is False
 

@@ -17,66 +17,85 @@
       <a href="/ask">Ask Database</a>
     </nav>
   </header>
-  <main>
+  <main class="gmail-page">
     {% if message %}<div class="msg">{{ message }}</div>{% endif %}
     {% if runtime_error %}<div class="msg">{{ runtime_error }}</div>{% endif %}
 
-    <div class="card">
-      <h2>Status</h2>
+    <div class="card gmail-status-card">
+      <div class="gmail-status-heading">
+        <div>
+          <p class="eyebrow">Gmail import</p>
+          <h2>Operational status</h2>
+        </div>
+        {% if status.last_status == "ok" %}
+          <span class="status-pill good">Ready</span>
+        {% elif status.reauthorization_required %}
+          <span class="status-pill alert">Action required</span>
+        {% elif status.enabled %}
+          <span class="status-pill">Configured</span>
+        {% else %}
+          <span class="status-pill muted">Disabled</span>
+        {% endif %}
+      </div>
       {% if status.status_message %}<p class="msg">{{ status.status_message }}</p>{% endif %}
-      <ul>
-        <li>Enabled: {{ status.enabled }}</li>
-        <li>Runtime capability: {{ status.runtime_capability }}</li>
-        <li>Database backend: {{ status.runtime_backend }}</li>
-        <li>Token available: {{ status.token_available }}</li>
-        <li>Credentials available: {{ status.credentials_available }}</li>
-        <li>Connected account: {{ status.account_email or "n/a" }}</li>
-        <li>Configured label: {{ status.configured_label }}</li>
-        <li>Sync limit: {{ status.sync_limit }}</li>
-        <li>Last sync: {{ status.last_sync_at or "never" }}</li>
-        <li>Last status: {{ status.last_status or "n/a" }}</li>
-        <li>Last error: {{ status.last_error_code or "none" }}</li>
-      </ul>
+      <div class="gmail-summary-grid">
+        <div><span class="summary-label">Connected account</span><strong>{{ status.account_email or "Not connected" }}</strong></div>
+        <div><span class="summary-label">Import label</span><strong>{{ status.configured_label }}</strong></div>
+        <div><span class="summary-label">Last sync</span><strong>{{ status.last_sync_at or "Never" }}</strong></div>
+      </div>
       {% if status.last_result_summary %}
-      <p>Last counts: {{ status.last_result_summary }}</p>
+      <div class="gmail-count-grid" aria-label="Last sync counts">
+        <div><strong>{{ status.last_result_summary.get("imported", 0) }}</strong><span>Imported</span></div>
+        <div><strong>{{ status.last_result_summary.get("updated", 0) }}</strong><span>Updated</span></div>
+        <div><strong>{{ status.last_result_summary.get("already_present", 0) }}</strong><span>Already present</span></div>
+        <div class="{% if status.last_result_summary.get("failed", 0) %}count-alert{% endif %}"><strong>{{ status.last_result_summary.get("failed", 0) }}</strong><span>Failed</span></div>
+      </div>
       {% endif %}
       <form method="post" action="/integrations/gmail/sync">
         <button type="submit" {% if not status.enabled %}disabled{% endif %}>Sync Gmail</button>
       </form>
-      <p>Read-only scope: gmail.readonly. Create the <code>{{ status.configured_label }}</code> label manually in Gmail before syncing.</p>
+      <p class="muted-copy">Read-only import from the <code>{{ status.configured_label }}</code> label. Gmail is never modified.</p>
+      <details class="gmail-diagnostics">
+        <summary>Technical details</summary>
+        <dl>
+          <div><dt>Runtime</dt><dd>{{ status.runtime_backend }} ({{ status.runtime_capability }})</dd></div>
+          <div><dt>Credentials</dt><dd>{{ "available" if status.credentials_available else "missing" }}</dd></div>
+          <div><dt>Token</dt><dd>{{ "available" if status.token_available else "missing" }}</dd></div>
+          <div><dt>Sync limit</dt><dd>{{ status.sync_limit }}</dd></div>
+          <div><dt>Last error</dt><dd>{{ status.last_error_code or "none" }}</dd></div>
+        </dl>
+      </details>
     </div>
 
     <div class="card">
-      <h2>Recent Imported Email Data</h2>
-      <p>Showing {{ recent_emails|length }} of {{ email_total }} locally imported Gmail message(s).</p>
-      <table>
+      <div class="section-heading">
+        <div>
+          <h2>Recent Imported Email Data</h2>
+          <p class="muted-copy">Showing {{ recent_emails|length }} of {{ email_total }} locally imported message(s).</p>
+        </div>
+        <a href="/emails">View all imported email</a>
+      </div>
+      <div class="gmail-table-wrap">
+      <table class="gmail-table">
         <thead>
           <tr>
             <th>When</th>
-            <th>Account</th>
-            <th>Transport direction</th>
-            <th>From / To</th>
+            <th>Conversation</th>
             <th>Subject</th>
-            <th>Role / Target</th>
-            <th>Intent</th>
-            <th>Attention</th>
-            <th>Linked record</th>
-            <th>Message</th>
+            <th>Classification</th>
+            <th>Attention / link</th>
           </tr>
         </thead>
         <tbody>
           {% for row in recent_emails %}
-          <tr>
-            <td>{{ row.occurred_at_local }}</td>
-            <td>{{ row.external_account or "n/a" }}</td>
-            <td>{{ row.direction }}</td>
+          <tr class="{% if row.requires_followup or row.link_status != "linked" %}attention-row{% endif %}">
+            <td class="gmail-when">{{ row.occurred_at_local }}</td>
             <td>
-              <strong>From:</strong> {{ row.from_address or "n/a" }}<br>
-              <strong>To:</strong> {{ row.to_address_text or "n/a" }}
-              {% if row.cc_address_text %}<br><strong>Cc:</strong> {{ row.cc_address_text }}{% endif %}
+              <strong class="gmail-sender">{{ row.from_address or "Unknown sender" }}</strong>
+              {% if row.to_address_text %}<small class="gmail-recipient">To {{ row.to_address_text }}</small>{% endif %}
             </td>
-            <td>
-              {{ row.subject or "(no subject)" }}
+            <td class="gmail-subject-cell">
+              <span class="gmail-subject" title="{{ row.subject or '(no subject)' }}">{{ row.subject or "(no subject)" }}</span>
               {% if row.body_preview %}
               <details>
                 <summary>Body preview</summary>
@@ -86,33 +105,27 @@
             </td>
             <td>
               {% if row.message_role == "shopify_partner_inquiry_confirmation" %}
-                Shopify inquiry confirmation<br>
-                <strong>Target:</strong> {{ row.target_company_name or "n/a" }}
+                <span class="gmail-classification">Shopify inquiry confirmation</span>
+                {% if row.target_company_name %}<small class="gmail-subdetail">Target: {{ row.target_company_name }}</small>{% endif %}
               {% else %}
-                {{ row.message_role or "conversation_message" }}
+                <span class="gmail-classification">{{ row.message_role or "conversation_message" }}</span>
               {% endif %}
-            </td>
-            <td>{{ row.primary_intent }} ({{ row.intent_confidence }})<br><small>{{ row.classification_source }}</small></td>
-            <td>
-              {% if row.requires_followup %}<span class="badge warn">follow-up</span>{% endif %}
-              {{ row.markers|join(", ") or "none" }}
+              <small class="gmail-subdetail">{{ row.primary_intent }} · {{ row.intent_confidence }}</small>
             </td>
             <td>
-              {{ row.link_status }}
-              {% if row.company_name %}<br>{{ row.company_name }}{% endif %}
-              {% if row.person_name %}<br>{{ row.person_name }}{% endif %}
-            </td>
-            <td>
-              <a href="/emails/thread/{{ row.external_thread_id }}">{{ row.thread_short }}</a><br>
-              <small>ID: {{ row.message_short }}</small>
+              {% if row.requires_followup %}<span class="badge warn">Follow-up</span>{% endif %}
+              {% if row.link_status != "linked" %}<span class="badge alert-badge">{{ row.link_status }}</span>{% endif %}
+              {% if row.markers %}<small class="gmail-subdetail">{{ row.markers|join(", ") }}</small>{% endif %}
+              {% if row.company_name or row.person_name %}<small class="gmail-subdetail">{{ row.company_name or row.person_name }}</small>{% endif %}
+              <a class="gmail-thread" href="/emails/thread/{{ row.external_thread_id }}">Open thread</a>
             </td>
           </tr>
           {% else %}
-          <tr><td colspan="10">No imported Gmail messages yet.</td></tr>
+          <tr><td colspan="5">No imported Gmail messages yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
-      <p><a href="/emails">Open full imported email list</a></p>
+      </div>
     </div>
   </main>
 </body>
