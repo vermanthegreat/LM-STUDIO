@@ -39,6 +39,7 @@
         <p><strong>Source filter tier:</strong> {{ lead.source_filter_tier or 'n/a' }}</p>
         <p><strong>Fit score:</strong> {{ lead.fit_score }}</p>
         <p><strong>Status:</strong> {{ lead.status }}</p>
+        <p><strong>Enrichment status:</strong> {{ lead.enrichment_status }}</p>
         <p><strong>Services:</strong> {{ (lead.services or [])|join(', ') or 'n/a' }}</p>
         <p><strong>Industries:</strong> {{ (lead.industries or [])|join(', ') or 'n/a' }}</p>
         {% if lead.description %}<p><strong>Description:</strong> {{ lead.description }}</p>{% endif %}
@@ -55,19 +56,22 @@
     <div class="card">
       <h2>People</h2>
       <table>
-        <thead><tr><th>Name</th><th>Title</th><th>Email</th><th>LinkedIn</th><th>DM</th><th>Relevant</th></tr></thead>
+        <thead><tr><th>Name</th><th>Title</th><th>Role</th><th>DM</th><th>Email</th><th>Email status</th><th>Confidence</th><th>LinkedIn</th><th>Source</th></tr></thead>
         <tbody>
           {% for p in lead.people %}
           <tr>
             <td>{{ p.name }}</td>
             <td>{{ p.title or '—' }}</td>
-            <td>{{ p.email or '—' }}</td>
-            <td>{% if p.linkedin_url %}<a href="{{ p.linkedin_url }}" target="_blank">link</a>{% else %}—{% endif %}</td>
+            <td>{{ p.role_type or 'other' }}</td>
             <td>{{ 'yes' if p.is_decision_maker else 'no' }}</td>
-            <td>{{ 'yes' if p.is_relevant_contact else 'no' }}</td>
+            <td>{{ p.email or '—' }}</td>
+            <td>{{ p.email_status or 'unknown' }}</td>
+            <td>{{ '%.2f'|format(p.email_confidence or 0.0) }}</td>
+            <td>{% if p.linkedin_url %}<a href="{{ p.linkedin_url }}" target="_blank">link</a>{% else %}—{% endif %}</td>
+            <td>{% if p.source_url %}<a href="{{ p.source_url }}" target="_blank">{{ p.source_type or 'source' }}</a>{% elif p.raw_source_id %}{{ p.source_type or 'source' }} #{{ p.raw_source_id }}{% else %}—{% endif %}</td>
           </tr>
           {% else %}
-          <tr><td colspan="6">No contacts yet.</td></tr>
+          <tr><td colspan="9">No contacts yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>

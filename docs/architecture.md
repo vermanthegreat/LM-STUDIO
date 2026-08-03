@@ -71,8 +71,11 @@ construct a database session, or bypass application validation.
   its lead by normalized name (case-folded with whitespace normalized). The
   identity does not depend on the raw-source row or mutable headline.
 - A LinkedIn company URL remains source metadata and never becomes the
-  organization's canonical website. Existing explicit Shopify Partner
-  Directory fields retain precedence during a LinkedIn merge.
+  organization's canonical website. Supplied LinkedIn URL shape is validated
+  against the structural classification; personal-profile URLs are rejected
+  from company source and identity fields with a structured warning. Existing
+  explicit Shopify Partner Directory fields retain precedence during a
+  LinkedIn merge.
 - Cross-source company identity resolution evaluates exact official domain,
   business-email domain, LinkedIn company URL, canonical name, known alias,
   and unique source-display alias in that order. Multiple matches at the first
@@ -84,6 +87,10 @@ construct a database session, or bypass application validation.
   table or schema migration.
 - Raw-source type follows the resolved parser classification independently of
   the route default and of the canonical lead's original source.
+- Extracted person titles are deterministically classified into controlled
+  role types. Decision-maker status is derived only for economic buyers and
+  senior operational owners; technical and workflow contacts remain relevant
+  without being promoted to decision makers.
 
 ### Typed tool registry
 

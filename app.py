@@ -128,12 +128,16 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         )
 
     @application.get("/leads", response_class=HTMLResponse)
-    def leads_list(request: Request):
-        leads = request.app.state.store.list_leads()
+    def leads_list(request: Request, research: bool = False):
+        leads = (
+            request.app.state.store.list_leads(research_only=True)
+            if research
+            else request.app.state.store.list_leads()
+        )
         return templates.TemplateResponse(
             request,
             "leads.html",
-            {"request": request, "leads": leads},
+            {"request": request, "leads": leads, "research": research},
         )
 
     @application.get("/leads/{lead_id}", response_class=HTMLResponse)

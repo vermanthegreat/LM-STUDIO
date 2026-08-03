@@ -14,6 +14,9 @@ class ExtractedPerson(BaseModel):
     title: Optional[str] = None
     linkedin_url: Optional[str] = None
     department: Optional[str] = None
+    email: Optional[str] = None
+    email_status: Optional[str] = None
+    email_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class ExtractedInteraction(BaseModel):

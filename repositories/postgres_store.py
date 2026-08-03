@@ -85,7 +85,7 @@ class PostgresContactStore:
             if self._session is None:
                 session.close()
 
-    def list_leads(self) -> List[Dict[str, Any]]:
+    def list_leads(self, research_only: bool = False) -> List[Dict[str, Any]]:
         session = self._active_session()
         try:
             orgs = session.scalars(
@@ -110,6 +110,18 @@ class PostgresContactStore:
                 deadlines = [t.due_at for t in org.tasks if t.status == "open" and t.due_at]
                 row["next_deadline"] = min(deadlines).isoformat()[:10] if deadlines else None
                 result.append(row)
+            if research_only:
+                result = [
+                    row for row in result
+                    if row.get("enrichment_status") in {"pending", "in_progress", "needs_review"}
+                    and (row["people_count"] < 2 or not row["has_decision_maker"])
+                ]
+                result.sort(key=lambda row: row.get("updated_at") or "", reverse=True)
+                result.sort(key=lambda row: (
+                    -int(row.get("fit_score") or 0),
+                    bool(row.get("has_decision_maker")),
+                    int(row.get("people_count") or 0),
+                ))
             return result
         finally:
             if self._session is None:
@@ -634,7 +646,7 @@ class PostgresContactStore:
                 "partner_tier", "plus_partner_signal", "rating", "review_count", "partner_since",
                 "primary_location", "supported_locations", "languages", "featured_work",
                 "services", "locations", "industries", "confidence", "extraction_status",
-                "possible_duplicate",
+                "possible_duplicate", "enrichment_status",
             ):
                 if key in data and data[key] is not None:
                     meta[key] = data[key]
@@ -806,6 +818,19 @@ class PostgresContactStore:
         session = self._active_session()
         own_session = self._session is None
         try:
+            from models import normalize_email_enrichment
+            from scoring import derive_person_role_fields
+
+            role_fields = derive_person_role_fields(
+                data.get("title"), data.get("role_type")
+            )
+            normalized_email = sqlite_db.normalize_email(data.get("email"))
+            email_metadata = normalize_email_enrichment(
+                has_email=bool(normalized_email),
+                email_status=data.get("email_status"),
+                email_confidence=data.get("email_confidence"),
+                last_verified_at=data.get("last_verified_at"),
+            )
             org = self._org_by_lead_id(session, lead_id)
             if not org:
                 raise ValueError(f"Lead {lead_id} not found")
@@ -814,26 +839,36 @@ class PostgresContactStore:
                 name=data.get("name"),
                 normalized_name=sqlite_db.normalize_name(data.get("name")),
                 title=data.get("title"),
-                is_decision_maker=bool(data.get("is_decision_maker")),
-                relevance_reason=data.get("relevance_reason"),
+                is_decision_maker=role_fields["is_decision_maker"],
+                relevance_reason=role_fields["relevance_reason"],
                 legacy_metadata={
                     "department": data.get("department"),
                     "seniority": data.get("seniority"),
-                    "is_relevant_contact": data.get("is_relevant_contact", 0),
+                    "is_relevant_contact": role_fields["is_relevant_contact"],
+                    "role_type": role_fields["role_type"],
                     "confidence": data.get("confidence", 0.0),
+                    **email_metadata,
                     "raw_source_id": raw_source_id,
                 },
             )
             session.add(person)
             session.flush()
-            if data.get("email"):
+            if normalized_email:
+                verification_status = (
+                    "verified"
+                    if email_metadata["email_status"] == "verified"
+                    else "source_confirmed"
+                    if email_metadata["email_status"] == "published"
+                    else "unverified"
+                )
                 session.add(
                     ContactMethod(
                         person_id=person.id,
                         kind="email",
-                        value=data["email"],
-                        normalized_value=sqlite_db.normalize_email(data["email"]),
-                        verification_status="unverified",
+                        value=normalized_email,
+                        normalized_value=normalized_email,
+                        confidence=email_metadata["email_confidence"],
+                        verification_status=verification_status,
                     )
                 )
             if data.get("linkedin_url"):

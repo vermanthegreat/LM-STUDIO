@@ -23,11 +23,22 @@ detection; merges remain explicit and auditable.
 - `id` UUID primary key
 - `organization_id` nullable foreign key
 - `name`, `normalized_name`, `title`
+- `role_type`: economic_buyer, operational_owner, technical_influencer,
+  workflow_user, other
 - `is_decision_maker`
+- Phase 0 SQLite compatibility fields: `email_status`, `email_confidence`,
+  `last_verified_at`, and `updated_at`
 - `relevance_score`, `relevance_reason`
 - timestamps
 
 People may temporarily exist without a known organization.
+
+In Phase 0 SQLite, leads also carry `enrichment_status`: pending, in_progress,
+people_found, email_pending, ready, needs_review, or no_result. The research
+view includes pending/in-progress/review leads with fewer than two people or no
+decision maker. PostgreSQL remains experimental; its compatibility repository
+projects these additions through legacy metadata pending a later accepted
+schema phase.
 
 ## contact_methods
 
@@ -127,8 +138,9 @@ Avoid storing complete prompts or private raw source text in ordinary logs.
 - Merge operations preserve redirects/history and never silently delete source
   evidence.
 - In the Phase 0 SQLite runtime, source-specific LinkedIn company metadata
-  (company URL, industry, location, follower/employee counts, associated-member
-  count, and workforce distributions) is retained in `raw_sources.parsed_json`.
+  (company URL, tagline, industry, location, follower/employee counts,
+  associated-member count, and workforce distributions) is retained in
+  `raw_sources.parsed_json`.
   It does not overwrite canonical Shopify website, service, description, or
   partner-profile fields.
 - Phase 0 company aliases are source-level evidence in

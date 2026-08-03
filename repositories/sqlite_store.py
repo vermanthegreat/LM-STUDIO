@@ -51,8 +51,8 @@ class SqliteContactStore:
     def get_all_leads_simple(self) -> List[Dict[str, Any]]:
         return db.get_all_leads_simple(**self._kwargs())
 
-    def list_leads(self) -> List[Dict[str, Any]]:
-        return db.list_leads(**self._kwargs())
+    def list_leads(self, research_only: bool = False) -> List[Dict[str, Any]]:
+        return db.list_leads(research_only=research_only, **self._kwargs())
 
     def get_lead(self, lead_id: int) -> Optional[Dict[str, Any]]:
         return db.get_lead(lead_id, **self._kwargs())

@@ -34,6 +34,7 @@ Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://l
 |-------|---------|
 | `/` | Paste box + parse |
 | `/leads` | Lead list |
+| `/leads?research=true` | Existing lead list filtered to companies requiring research |
 | `/leads/{id}` | Lead detail |
 | `/ask` | Natural-language DB queries |
 | `/export/csv` | CSV download |

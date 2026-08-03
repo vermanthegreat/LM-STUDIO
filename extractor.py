@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import db
 from llm import EXTRACTION_SYSTEM, extract_structured
 from extraction_schema import extraction_to_dict, try_validate_extraction
-from scoring import classify_person_title, compute_fit_score
+from scoring import compute_fit_score
 
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
@@ -32,7 +32,7 @@ TIER_RATING_RE = re.compile(
 )
 LINKEDIN_RE = re.compile(r"https?://(?:www\.)?linkedin\.com/[^\s<>\"']+", re.I)
 LINKEDIN_COMPANY_URL_RE = re.compile(
-    r"https?://(?:www\.)?linkedin\.com/company/[^\s<>\"']+", re.I
+    r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/[^\s<>\"']+", re.I
 )
 LINKEDIN_DEGREE_RE = re.compile(
     r"^(?P<name>.+?)\s+(?:1st|2nd|3rd)\+?\s+degree connection$", re.I
@@ -888,11 +888,6 @@ def classify_linkedin_input(
     if people_score >= 4 and "people" in lines:
         return "linkedin_company_people"
 
-    if "/in/" in url_low or "/pub/" in url_low:
-        return "linkedin_person_profile"
-    if declared_source_type == "linkedin_person":
-        return "linkedin_person_profile"
-
     company_tabs = {"home", "about", "posts", "jobs", "people"}
     if has_company_logo and len(company_tabs & lines) >= 3:
         if "/about" in url_low or {
@@ -905,6 +900,11 @@ def classify_linkedin_input(
             return "linkedin_company_about"
         return "linkedin_company_home"
 
+    if "/in/" in url_low or "/pub/" in url_low:
+        return "linkedin_person_profile"
+    if declared_source_type == "linkedin_person":
+        return "linkedin_person_profile"
+
     linkedin_detected = (
         "linkedin.com" in url_low
         or "linkedin corporation" in low
@@ -913,40 +913,71 @@ def classify_linkedin_input(
     return "unsupported_linkedin" if linkedin_detected else None
 
 
-def _linkedin_company_header(text: str) -> tuple[Optional[str], Optional[str]]:
-    """Return the company name and its adjacent metadata line."""
+def _linkedin_header_metadata_line(value: str) -> bool:
+    return bool(
+        re.search(
+            r"\b[\d,]+\s+followers?\s+[\d,]+\s*[-\u2013]\s*[\d,]+\s+employees?\s*$",
+            value,
+            re.I,
+        )
+    )
+
+
+def _linkedin_company_header(
+    text: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return the highest-confidence company header, metadata, and tagline."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    candidates: List[tuple[tuple[int, int, int], str, Optional[str], Optional[str]]] = []
+    navigation = {"home", "about", "services", "posts", "jobs", "people"}
+    controls = {"follow", "following", "message"}
     for index, line in enumerate(lines):
         match = re.match(r"^(?P<name>.+?)\s+logo$", line, re.I)
         if not match or line.casefold().endswith(" page logo"):
             continue
         name = match.group("name").strip()
-        following = lines[index + 1:index + 6]
-        if following and following[0].casefold() == name.casefold():
-            metadata = next(
-                (
-                    item for item in following[1:]
-                    if re.search(r"\b[\d,]+\s+followers?\b", item, re.I)
-                ),
-                None,
-            )
-            return name, metadata
+        following = lines[index + 1:index + 8]
+        if not following or following[0].casefold() != name.casefold():
+            continue
+        metadata = None
+        tagline = None
+        for item in following[1:]:
+            low = item.casefold()
+            if low.endswith(" logo") or low in controls or low in navigation:
+                break
+            if _linkedin_header_metadata_line(item):
+                metadata = item
+                break
+            if tagline is None:
+                tagline = item
+            else:
+                break
+        nearby_navigation = sum(
+            item.casefold() in navigation for item in lines[index + 1:index + 14]
+        )
+        score = (int(metadata is not None), nearby_navigation, int(tagline is not None))
+        candidates.append((score, name, metadata, tagline if metadata else None))
+    if candidates:
+        _, name, metadata, tagline = max(candidates, key=lambda candidate: candidate[0])
+        return name, metadata, tagline
+
     # Cropped clipboard text starts at the company name and omits the logo line.
     # Anchor the candidate to the stable follower/employee suffix and company tabs
     # so page chrome, signed-in names, and employee cards cannot become the header.
-    metadata_re = re.compile(
-        r"\b[\d,]+\s+followers?\s+[\d,]+\s*[-–]\s*[\d,]+\s+employees?\s*$",
-        re.I,
-    )
     required_tabs = {"home", "about", "posts", "jobs", "people"}
     for index, line in enumerate(lines):
-        if index == 0 or not metadata_re.search(line):
+        if index == 0 or not _linkedin_header_metadata_line(line):
             continue
-        name = lines[index - 1].strip()
+        tagline = None
+        name_index = index - 1
+        if index == 2:
+            name_index = 0
+            tagline = lines[1].strip()
+        name = lines[name_index].strip()
         following = {item.casefold() for item in lines[index + 1:index + 12]}
         if name and len(required_tabs & following) >= 4:
-            return name, line
-    return None, None
+            return name, line, tagline
+    return None, None, None
 
 
 def _parse_linkedin_header_metadata(metadata: Optional[str]) -> Dict[str, Any]:
@@ -1079,17 +1110,42 @@ def _extract_linkedin_company_people(text: str, company_name: Optional[str]) -> 
     return people
 
 
+def _linkedin_url_kind(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value.strip().rstrip(".,)"))
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").casefold()
+    if hostname != "linkedin.com" and not hostname.endswith(".linkedin.com"):
+        return None
+    segments = [segment.casefold() for segment in parsed.path.split("/") if segment]
+    if not segments:
+        return "linkedin_other"
+    if segments[0] == "company" and len(segments) >= 2:
+        return "company"
+    if segments[0] in {"in", "pub"} and len(segments) >= 2:
+        return "personal"
+    return "linkedin_other"
+
+
 def _parse_linkedin_company_page(
     text: str,
     source_url: Optional[str],
     classification: Optional[str],
 ) -> Dict[str, Any]:
-    company_name, metadata = _linkedin_company_header(text)
+    company_name, metadata, tagline = _linkedin_company_header(text)
     header = _parse_linkedin_header_metadata(metadata)
-    company_url = next(
-        (url.rstrip(".,)") for url in LINKEDIN_COMPANY_URL_RE.findall(text)),
-        source_url if source_url and "linkedin.com/company/" in source_url.casefold() else None,
+    supplied_url_kind = _linkedin_url_kind(source_url)
+    source_url_mismatch = supplied_url_kind in {"personal", "linkedin_other"}
+    embedded_company_url = next(
+        (url.rstrip(".,)") for url in LINKEDIN_COMPANY_URL_RE.findall(text)), None
     )
+    company_url = embedded_company_url or (
+        source_url.rstrip(".,)") if source_url and supplied_url_kind == "company" else None
+    )
+    validated_source_url = company_url or (source_url if supplied_url_kind is None else None)
     associated = re.search(r"\b([\d,]+)\s+associated members?\b", text, re.I)
     is_people = classification == "linkedin_company_people"
     warnings = [
@@ -1102,12 +1158,15 @@ def _parse_linkedin_company_page(
         if value in (None, "")
     ]
     if metadata and not header.get("linkedin_industry") and not header.get("linkedin_location"):
-        warnings.append("linkedin_header_metadata_unparsed")
+        warnings.append("linkedin_header_metadata_ambiguous_split")
+    if source_url_mismatch:
+        warnings.append("linkedin_source_url_classification_mismatch")
     return {
         "classification": classification or "unsupported_linkedin",
         "company_name": company_name,
         "linkedin_company_url": company_url,
-        "source_url": company_url or source_url,
+        "source_url": validated_source_url,
+        "linkedin_tagline": tagline,
         **header,
         "linkedin_associated_members": int(associated.group(1).replace(",", "")) if associated else None,
         "linkedin_function_distribution": _extract_linkedin_distribution(text, "What they do") if is_people else [],
@@ -1531,7 +1590,10 @@ def parse_and_save(
     if source_type == "email":
         _merge_email_fields(parsed, raw_text)
 
-    source_filter_tier = parse_source_filter_tier(source_url)
+    persisted_source_url = (
+        parsed.get("source_url") if linkedin_company_page else source_url
+    )
+    source_filter_tier = parse_source_filter_tier(persisted_source_url)
 
     with store.transaction():
         lead_id = attach_to_lead_id
@@ -1656,7 +1718,7 @@ def parse_and_save(
         raw_source = store.create_raw_source(
             source_type=resolved_source_type,
             raw_text=raw_text,
-            source_url=source_url,
+            source_url=persisted_source_url,
             source_filter_tier=source_filter_tier,
             parsed_json=parsed,
             extraction_status=extraction_status,
@@ -1675,12 +1737,25 @@ def parse_and_save(
                     continue
                 if not lead_id:
                     continue
-                cls = classify_person_title(person.get("title"))
+                email_status = person.get("email_status")
+                if person.get("email") and email_status not in {
+                    "published", "verified", "pattern_derived", "inferred", "unknown"
+                }:
+                    email_status = "unknown"
+                public_contact_source = source_type in {
+                    "shopify_directory", "linkedin_company", "linkedin_person", "website"
+                }
+                if email_status == "verified":
+                    email_status = "published" if public_contact_source else "unknown"
+                if person.get("email") and not email_status:
+                    email_status = "published" if public_contact_source else "unknown"
+                if not person.get("email"):
+                    email_status = "unknown"
                 p = store.add_person(
                     lead_id,
                     {
                         **person,
-                        **cls,
+                        "email_status": email_status or "unknown",
                         "confidence": confidence,
                     },
                     raw_source_id=raw_source["id"],

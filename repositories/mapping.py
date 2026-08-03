@@ -39,6 +39,7 @@ def organization_to_lead_row(org: Organization) -> Dict[str, Any]:
         "status": org.status,
         "confidence": meta.get("confidence", 0.0),
         "extraction_status": meta.get("extraction_status", "ok"),
+        "enrichment_status": meta.get("enrichment_status", "pending"),
         "possible_duplicate": bool(meta.get("possible_duplicate")),
         "created_at": org.created_at.isoformat() if org.created_at else None,
         "updated_at": org.updated_at.isoformat() if org.updated_at else None,
@@ -105,10 +106,15 @@ def person_to_dict(person: Person) -> Dict[str, Any]:
         "linkedin_url": linkedin,
         "is_decision_maker": int(person.is_decision_maker),
         "is_relevant_contact": int(meta.get("is_relevant_contact", 0)),
+        "role_type": meta.get("role_type") or "other",
         "relevance_reason": person.relevance_reason,
         "confidence": meta.get("confidence", 0.0),
+        "email_status": meta.get("email_status") or "unknown",
+        "email_confidence": meta.get("email_confidence", 0.0),
+        "last_verified_at": meta.get("last_verified_at"),
         "raw_source_id": meta.get("raw_source_id"),
         "created_at": person.created_at.isoformat() if person.created_at else None,
+        "updated_at": person.updated_at.isoformat() if person.updated_at else None,
     }
 
 

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS leads (
     status TEXT DEFAULT 'new',
     confidence REAL DEFAULT 0.0,
     extraction_status TEXT DEFAULT 'ok',
+    enrichment_status TEXT DEFAULT 'pending',
     possible_duplicate INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -59,10 +60,15 @@ CREATE TABLE IF NOT EXISTS people (
     linkedin_url TEXT,
     is_decision_maker INTEGER DEFAULT 0,
     is_relevant_contact INTEGER DEFAULT 0,
+    role_type TEXT,
     relevance_reason TEXT,
     confidence REAL DEFAULT 0.0,
+    email_status TEXT DEFAULT 'unknown',
+    email_confidence REAL DEFAULT 0.0,
+    last_verified_at TEXT,
     raw_source_id INTEGER REFERENCES raw_sources(id) ON DELETE SET NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    updated_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_people_lead_id ON people(lead_id);
@@ -264,14 +270,69 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "supported_locations_json": "TEXT",
         "languages_json": "TEXT",
         "featured_work_json": "TEXT",
+        "enrichment_status": "TEXT DEFAULT 'pending'",
     }
     for col, col_type in lead_migrations.items():
         if col not in lead_cols:
             conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {col_type}")
 
     people_cols = {row[1] for row in conn.execute("PRAGMA table_info(people)").fetchall()}
-    if "email" not in people_cols:
-        conn.execute("ALTER TABLE people ADD COLUMN email TEXT")
+    people_migrations = {
+        "email": "TEXT",
+        "role_type": "TEXT",
+        "email_status": "TEXT DEFAULT 'unknown'",
+        "email_confidence": "REAL DEFAULT 0.0",
+        "last_verified_at": "TEXT",
+        "updated_at": "TEXT",
+    }
+    for col, col_type in people_migrations.items():
+        if col not in people_cols:
+            conn.execute(f"ALTER TABLE people ADD COLUMN {col} {col_type}")
+    from models import EMAIL_STATUSES, ROLE_TYPES, normalize_email_enrichment
+    from scoring import derive_person_role_fields
+    for row in conn.execute("SELECT * FROM people").fetchall():
+        stored_role = row["role_type"]
+        role_type = (
+            stored_role
+            if stored_role in ROLE_TYPES
+            else "other"
+            if stored_role
+            else None
+        )
+        stored_email_status = (
+            row["email_status"] if row["email_status"] in EMAIL_STATUSES else "unknown"
+        )
+        stored_email_confidence = row["email_confidence"]
+        try:
+            numeric_email_confidence = float(stored_email_confidence or 0.0)
+        except (TypeError, ValueError):
+            numeric_email_confidence = 0.0
+        if not 0.0 <= numeric_email_confidence <= 1.0:
+            numeric_email_confidence = 0.0
+        classification = derive_person_role_fields(row["title"], role_type)
+        email_metadata = normalize_email_enrichment(
+            has_email=bool(normalize_email(row["email"])),
+            email_status=stored_email_status,
+            email_confidence=numeric_email_confidence,
+            last_verified_at=row["last_verified_at"],
+        )
+        conn.execute(
+            """UPDATE people SET role_type = ?, is_decision_maker = ?,
+               is_relevant_contact = ?, relevance_reason = ?,
+               email_status = ?, email_confidence = ?, last_verified_at = ?,
+               updated_at = COALESCE(updated_at, created_at)
+               WHERE id = ?""",
+            (
+                classification["role_type"],
+                int(classification["is_decision_maker"]),
+                int(classification["is_relevant_contact"]),
+                classification["relevance_reason"],
+                email_metadata["email_status"],
+                email_metadata["email_confidence"],
+                email_metadata["last_verified_at"],
+                row["id"],
+            ),
+        )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_people_email ON people(email)")
 
     task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
@@ -563,6 +624,7 @@ def upsert_lead(
         "status": data.get("status", "new"),
         "confidence": data.get("confidence", 0.0),
         "extraction_status": data.get("extraction_status", "ok"),
+        "enrichment_status": data.get("enrichment_status", "pending"),
         "possible_duplicate": 1 if possible_duplicate else 0,
         "updated_at": now,
     }
@@ -579,6 +641,8 @@ def upsert_lead(
             )
             target_id = cur.lastrowid
         else:
+            if "enrichment_status" not in data:
+                fields.pop("enrichment_status", None)
             existing = c.execute("SELECT company_name FROM leads WHERE id = ?", (target_id,)).fetchone()
             merged_name = merge_company_name(
                 existing["company_name"] if existing else None,
@@ -617,6 +681,35 @@ def add_person(
     em = normalize_email(data.get("email"))
     normalized_person_name = normalize_name(data.get("name"))
     title = (data.get("title") or "").strip() or None
+    from models import EMAIL_STATUSES, normalize_email_enrichment
+    from scoring import derive_person_role_fields
+
+    role_fields = derive_person_role_fields(title, data.get("role_type"))
+    email_metadata = normalize_email_enrichment(
+        has_email=bool(em),
+        email_status=data.get("email_status"),
+        email_confidence=data.get("email_confidence"),
+        last_verified_at=data.get("last_verified_at"),
+    )
+
+    def _stronger_email_status(existing_status: Optional[str]) -> str:
+        priority = {
+            "unknown": 0,
+            "inferred": 1,
+            "pattern_derived": 2,
+            "published": 3,
+            "verified": 4,
+        }
+        current = existing_status if existing_status in EMAIL_STATUSES else "unknown"
+        incoming_status = email_metadata["email_status"]
+        return incoming_status if priority[incoming_status] > priority[current] else current
+
+    def _name_title_conflict(existing: sqlite3.Row) -> bool:
+        existing_title = (existing["title"] or "").strip()
+        if not existing_title or not title:
+            return False
+        old_role = derive_person_role_fields(existing_title, existing["role_type"])["role_type"]
+        return old_role != role_fields["role_type"]
 
     def _run(c: sqlite3.Connection) -> Dict[str, Any]:
         existing = None
@@ -630,38 +723,84 @@ def add_person(
                 "SELECT * FROM people WHERE lead_id = ? AND lower(email) = ?",
                 (lead_id, em),
             ).fetchone()
-        if not existing and normalized_person_name:
-            existing = next(
-                (
-                    row
-                    for row in c.execute(
-                        "SELECT * FROM people WHERE lead_id = ? AND name IS NOT NULL",
-                        (lead_id,),
-                    ).fetchall()
-                    if normalize_name(row["name"]) == normalized_person_name
-                ),
-                None,
-            )
+        if not existing and not li and not em and normalized_person_name:
+            candidates = [
+                row
+                for row in c.execute(
+                    "SELECT * FROM people WHERE lead_id = ? AND name IS NOT NULL",
+                    (lead_id,),
+                ).fetchall()
+                if normalize_name(row["name"]) == normalized_person_name
+                and not _name_title_conflict(row)
+            ]
+            existing = candidates[0] if len(candidates) == 1 else None
         if existing:
+            effective_role = role_fields
+            title_update = title
+            existing_role = derive_person_role_fields(
+                existing["title"], existing["role_type"]
+            )
+            if (
+                data.get("role_type") is None
+                and role_fields["role_type"] == "other"
+                and existing_role["role_type"] != "other"
+            ):
+                effective_role = existing_role
+                title_update = None
+
+            existing_email = normalize_email(existing["email"])
+            same_email = bool(em and (not existing_email or existing_email == em))
+            if same_email:
+                merged_email_status = _stronger_email_status(existing["email_status"])
+                merged_email_confidence = max(
+                    float(existing["email_confidence"] or 0.0),
+                    email_metadata["email_confidence"],
+                )
+                merged_last_verified_at = existing["last_verified_at"]
+                if merged_email_status == "verified":
+                    merged_last_verified_at = (
+                        email_metadata["last_verified_at"] or merged_last_verified_at
+                    )
+                else:
+                    merged_last_verified_at = None
+            else:
+                merged_email_status = (
+                    existing["email_status"]
+                    if existing["email_status"] in EMAIL_STATUSES
+                    else "unknown"
+                )
+                merged_email_confidence = float(existing["email_confidence"] or 0.0)
+                merged_last_verified_at = (
+                    existing["last_verified_at"]
+                    if merged_email_status == "verified"
+                    else None
+                )
             c.execute(
                 """UPDATE people SET title=COALESCE(?,title),
                    department=COALESCE(?,department), seniority=COALESCE(?,seniority),
                    email=COALESCE(email,?), linkedin_url=COALESCE(linkedin_url,?),
-                   is_decision_maker=?, is_relevant_contact=?,
-                   relevance_reason=COALESCE(?,relevance_reason),
-                   confidence=?, raw_source_id=COALESCE(?,raw_source_id)
+                   is_decision_maker=?, is_relevant_contact=?, role_type=?,
+                   relevance_reason=?,
+                   confidence=?, email_status=?, email_confidence=?,
+                   last_verified_at=?,
+                   raw_source_id=COALESCE(?,raw_source_id), updated_at=?
                    WHERE id=?""",
                 (
-                    title,
+                    title_update,
                     data.get("department"),
                     data.get("seniority"),
                     em,
                     li,
-                    int(bool(existing["is_decision_maker"]) or bool(data.get("is_decision_maker", 0))),
-                    int(bool(existing["is_relevant_contact"]) or bool(data.get("is_relevant_contact", 0))),
-                    data.get("relevance_reason"),
+                    int(effective_role["is_decision_maker"]),
+                    int(effective_role["is_relevant_contact"]),
+                    effective_role["role_type"],
+                    effective_role["relevance_reason"],
                     data.get("confidence", 0.0),
+                    merged_email_status,
+                    merged_email_confidence,
+                    merged_last_verified_at,
                     raw_source_id,
+                    now,
                     existing["id"],
                 ),
             )
@@ -670,9 +809,10 @@ def add_person(
         cur = c.execute(
             """INSERT INTO people
                (lead_id, name, title, department, seniority, email, linkedin_url,
-                is_decision_maker, is_relevant_contact, relevance_reason,
-                confidence, raw_source_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                is_decision_maker, is_relevant_contact, role_type, relevance_reason,
+                confidence, email_status, email_confidence, last_verified_at,
+                raw_source_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 lead_id,
                 data.get("name"),
@@ -681,11 +821,16 @@ def add_person(
                 data.get("seniority"),
                 em,
                 li,
-                int(data.get("is_decision_maker", 0)),
-                int(data.get("is_relevant_contact", 0)),
-                data.get("relevance_reason"),
+                int(role_fields["is_decision_maker"]),
+                int(role_fields["is_relevant_contact"]),
+                role_fields["role_type"],
+                role_fields["relevance_reason"],
                 data.get("confidence", 0.0),
+                email_metadata["email_status"],
+                email_metadata["email_confidence"],
+                email_metadata["last_verified_at"],
                 raw_source_id,
+                now,
                 now,
             ),
         )
@@ -831,8 +976,11 @@ def _hydrate_lead_row(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
-def list_leads(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
-    sql = """
+def list_leads(
+    db_path: Path = DB_PATH,
+    research_only: bool = False,
+) -> List[Dict[str, Any]]:
+    base_sql = """
     SELECT l.*,
            (SELECT COUNT(*) FROM people p WHERE p.lead_id = l.id) AS people_count,
            (SELECT COUNT(*) FROM people p WHERE p.lead_id = l.id AND p.is_decision_maker = 1) > 0 AS has_decision_maker,
@@ -843,8 +991,14 @@ def list_leads(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
             LEFT JOIN interactions i ON i.lead_id = l2.id AND i.status = 'open' AND i.deadline IS NOT NULL
             WHERE l2.id = l.id) AS next_deadline
     FROM leads l
-    ORDER BY l.fit_score DESC, l.updated_at DESC
     """
+    if research_only:
+        sql = f"""SELECT * FROM ({base_sql}) AS lead_stats
+        WHERE enrichment_status IN ('pending', 'in_progress', 'needs_review')
+          AND (people_count < 2 OR has_decision_maker = 0)
+        ORDER BY fit_score DESC, has_decision_maker ASC, people_count ASC, updated_at DESC"""
+    else:
+        sql = base_sql + " ORDER BY l.fit_score DESC, l.updated_at DESC"
     with get_conn(db_path) as conn:
         rows = conn.execute(sql).fetchall()
     result = []
@@ -892,7 +1046,9 @@ def get_lead(
             return None
         lead = _hydrate_lead_row(dict(row))
         lead["people"] = [dict(r) for r in c.execute(
-            "SELECT * FROM people WHERE lead_id = ? ORDER BY is_decision_maker DESC, name",
+            """SELECT p.*, rs.source_type, rs.source_url
+               FROM people p LEFT JOIN raw_sources rs ON rs.id = p.raw_source_id
+               WHERE p.lead_id = ? ORDER BY p.is_decision_maker DESC, p.name""",
             (lead_id,),
         ).fetchall()]
         lead["interactions"] = [dict(r) for r in c.execute(
