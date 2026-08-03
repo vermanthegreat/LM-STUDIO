@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Mapping, Optional
 
 from discovery_models import DiscoveryOutcome, DiscoveryOutcomeStatus, DiscoveryRequest, reject_secrets
+from discovery_materialization_models import DiscoveryOutcomeMaterializationResult
 from providers.discovery_base import DiscoveryProvider
 from research_job_models import (
     ADAPTER_KEYS,
@@ -24,6 +27,19 @@ from repositories import ContactStore
 SAFE_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_:-]{0,63}$")
 FAKE_ADAPTER_KEY = "fake"
 DEFAULT_RETRY_DELAY_SECONDS = 60
+MATERIALIZATION_OWNERSHIP_ERRORS = frozenset({
+    "job_not_found", "invalid_claim_state", "stale_job_version", "lease_token_mismatch", "lease_expired",
+})
+MATERIALIZATION_TERMINAL_ERRORS = {
+    "outcome_not_materializable": "materialization_contract_error",
+    "outcome_exceeds_request_bounds": "materialization_bounds_error",
+    "candidate_source_unresolved": "materialization_evidence_error",
+    "materialization_conflict": "materialization_conflict",
+    "invalid_receipt": "materialization_contract_error",
+}
+MATERIALIZATION_RETRY_ERRORS = frozenset({
+    "source_persistence_failure", "candidate_persistence_failure", "materialization_persistence_failure",
+})
 
 
 class ResearchJobRunnerError(ValueError):
@@ -34,12 +50,30 @@ class ResearchJobRunnerError(ValueError):
         self.code = code
 
 
+class DiscoveryOutcomeMaterializerPort(ABC):
+    """Nominal application-owned port for discovery outcome materialization."""
+
+    @abstractmethod
+    def materialize_discovery_outcome(
+        self,
+        *,
+        research_job_id: int,
+        lease_token: str,
+        expected_version: int,
+        outcome: DiscoveryOutcome,
+    ) -> DiscoveryOutcomeMaterializationResult:
+        raise NotImplementedError
+
+
 class ResearchJobExecutionResult:
     """Bounded immutable operational result returned by the runner."""
 
     __slots__ = (
         "job_id", "adapter_key", "provider_status", "final_status",
         "source_count", "candidate_count", "retry_scheduled", "terminal",
+        "materialized", "materialization_receipt_id", "materialization_replayed",
+        "materialized_source_count", "materialized_person_candidate_count",
+        "materialized_contact_candidate_count",
     )
 
     def __init__(
@@ -53,6 +87,12 @@ class ResearchJobExecutionResult:
         candidate_count: int,
         retry_scheduled: bool,
         terminal: bool,
+        materialized: bool = False,
+        materialization_receipt_id: Optional[int] = None,
+        materialization_replayed: bool = False,
+        materialized_source_count: int = 0,
+        materialized_person_candidate_count: int = 0,
+        materialized_contact_candidate_count: int = 0,
     ) -> None:
         self.job_id = job_id
         self.adapter_key = adapter_key
@@ -62,6 +102,12 @@ class ResearchJobExecutionResult:
         self.candidate_count = candidate_count
         self.retry_scheduled = retry_scheduled
         self.terminal = terminal
+        self.materialized = materialized
+        self.materialization_receipt_id = materialization_receipt_id
+        self.materialization_replayed = materialization_replayed
+        self.materialized_source_count = materialized_source_count
+        self.materialized_person_candidate_count = materialized_person_candidate_count
+        self.materialized_contact_candidate_count = materialized_contact_candidate_count
 
     def __setattr__(self, name: str, value: object) -> None:
         if hasattr(self, name):
@@ -77,11 +123,15 @@ class ResearchJobRunner:
         repository: ContactStore,
         providers: Mapping[str, DiscoveryProvider],
         *,
+        materializer: DiscoveryOutcomeMaterializerPort,
         clock: Optional[Callable[[], datetime]] = None,
         default_retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
     ) -> None:
         self.repository = repository
         self.providers = self._validate_registry(providers)
+        if not isinstance(materializer, DiscoveryOutcomeMaterializerPort):
+            raise ResearchJobRunnerError("invalid_materializer_dependency", "materializer dependency is invalid")
+        self._materializer = materializer
         if isinstance(default_retry_delay_seconds, bool) or not isinstance(default_retry_delay_seconds, int) or not 1 <= default_retry_delay_seconds <= 24 * 60 * 60:
             raise ResearchJobRunnerError("invalid_retry_delay", "runner retry delay is invalid")
         self.default_retry_delay_seconds = default_retry_delay_seconds
@@ -141,11 +191,42 @@ class ResearchJobRunner:
                     retry=self._retry_schedule(running, self._safe_code(outcome.safe_error_code, "provider_retryable_error"), outcome.retry_after),
                 )
                 return self._result(final, outcome.status, len(outcome.sources), len(outcome.candidates))
-            finalization = self._finalization(outcome)
+            if outcome.status in {DiscoveryOutcomeStatus.CANCELLED, DiscoveryOutcomeStatus.PERMANENT_ERROR}:
+                final = self.repository.finalize_research_job(
+                    running.id,
+                    lease_token=running.lease_token,
+                    expected_version=running.version,
+                    finalization=self._finalization(outcome),
+                )
+                return self._result(final, outcome.status, len(outcome.sources), len(outcome.candidates))
+            try:
+                materialization = self._materializer.materialize_discovery_outcome(
+                    research_job_id=running.id,
+                    lease_token=running.lease_token,
+                    expected_version=running.version,
+                    outcome=outcome,
+                )
+                materialization = self._validate_materialization(running, outcome, materialization)
+            except ResearchJobError as error:
+                if error.code in MATERIALIZATION_OWNERSHIP_ERRORS:
+                    raise
+                if error.code in MATERIALIZATION_TERMINAL_ERRORS:
+                    return self._finalize_failure(
+                        running, MATERIALIZATION_TERMINAL_ERRORS[error.code], None,
+                        provider_status=outcome.status,
+                    )
+                if error.code in MATERIALIZATION_RETRY_ERRORS:
+                    retry = self._retry_schedule(running, "materialization_persistence_error", None)
+                    final = self.repository.schedule_research_job_retry(
+                        running.id, lease_token=running.lease_token, expected_version=running.version, retry=retry,
+                    )
+                    return self._result(final, outcome.status, 0, 0)
+                raise
+            finalization = self._finalization(outcome, materialization)
             final = self.repository.finalize_research_job(
                 running.id, lease_token=running.lease_token, expected_version=running.version, finalization=finalization,
             )
-            return self._result(final, outcome.status, finalization.summary.source_count, finalization.summary.candidate_count)
+            return self._result(final, outcome.status, finalization.summary.source_count, finalization.summary.candidate_count, materialization)
         except ResearchJobError:
             raise
 
@@ -183,9 +264,9 @@ class ResearchJobRunner:
         except Exception:
             return None
 
-    def _finalization(self, outcome: DiscoveryOutcome) -> ResearchJobFinalization:
-        source_count = len(outcome.sources)
-        candidate_count = len(outcome.candidates)
+    def _finalization(self, outcome: DiscoveryOutcome, materialization: Optional[DiscoveryOutcomeMaterializationResult] = None) -> ResearchJobFinalization:
+        source_count = len(materialization.raw_source_ids) if materialization is not None else len(outcome.sources)
+        candidate_count = len(materialization.person_candidate_ids) if materialization is not None else len(outcome.candidates)
         warning_codes = self._warning_codes(outcome.warnings)
         if outcome.status is DiscoveryOutcomeStatus.SUCCEEDED:
             return ResearchJobFinalization(status="succeeded", summary=ResearchJobResultSummary(source_count=source_count, candidate_count=candidate_count, warning_codes=warning_codes))
@@ -200,6 +281,34 @@ class ResearchJobRunner:
         if outcome.status is DiscoveryOutcomeStatus.PERMANENT_ERROR:
             return ResearchJobFinalization(status="failed", summary=ResearchJobResultSummary(source_count=0, candidate_count=0), safe_error_code=self._safe_code(outcome.safe_error_code, "provider_permanent_error"))
         raise ResearchJobRunnerError("provider_contract_error", "provider outcome status is not terminal")
+
+    @staticmethod
+    def _expected_outcome_digest(outcome: DiscoveryOutcome) -> str:
+        canonical = json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _validate_materialization(
+        cls,
+        job: ResearchJobRecord,
+        outcome: DiscoveryOutcome,
+        value: object,
+    ) -> DiscoveryOutcomeMaterializationResult:
+        if not isinstance(value, DiscoveryOutcomeMaterializationResult):
+            raise ResearchJobRunnerError("materialization_result_mismatch", "materialization result is invalid")
+        if (
+            value.research_job_id != job.id
+            or value.attempt_count != job.attempt_count
+            or value.outcome_status is not outcome.status
+            or value.outcome_digest != cls._expected_outcome_digest(outcome)
+            or value.materialization_id <= 0
+            or any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in (*value.raw_source_ids, *value.person_candidate_ids, *value.contact_candidate_ids))
+            or len(value.raw_source_ids) != len(outcome.sources)
+            or len(value.person_candidate_ids) != len(outcome.candidates)
+            or len(value.contact_candidate_ids) != sum(len(candidate.explicit_contacts) for candidate in outcome.candidates)
+        ):
+            raise ResearchJobRunnerError("materialization_result_mismatch", "materialization result is inconsistent")
+        return value
 
     def _retry_schedule(self, job: ResearchJobRecord, code: str, retry_at: Optional[datetime]) -> ResearchJobRetrySchedule:
         now = self._now()
@@ -238,7 +347,7 @@ class ResearchJobRunner:
         return tuple(sorted({code for code in (cls._safe_code(value, "") for value in values) if code}))
 
     @staticmethod
-    def _result(job: ResearchJobRecord, provider_status: Optional[DiscoveryOutcomeStatus], source_count: int, candidate_count: int) -> ResearchJobExecutionResult:
+    def _result(job: ResearchJobRecord, provider_status: Optional[DiscoveryOutcomeStatus], source_count: int, candidate_count: int, materialization: Optional[DiscoveryOutcomeMaterializationResult] = None) -> ResearchJobExecutionResult:
         return ResearchJobExecutionResult(
             job_id=job.id,
             adapter_key=job.adapter_key,
@@ -252,4 +361,10 @@ class ResearchJobRunner:
                 ResearchJobStatus.NEEDS_REVIEW, ResearchJobStatus.FAILED, ResearchJobStatus.CANCELLED,
                 ResearchJobStatus.ABANDONED,
             },
+            materialized=materialization is not None,
+            materialization_receipt_id=materialization.materialization_id if materialization is not None else None,
+            materialization_replayed=materialization.replayed if materialization is not None else False,
+            materialized_source_count=len(materialization.raw_source_ids) if materialization is not None else 0,
+            materialized_person_candidate_count=len(materialization.person_candidate_ids) if materialization is not None else 0,
+            materialized_contact_candidate_count=len(materialization.contact_candidate_ids) if materialization is not None else 0,
         )
