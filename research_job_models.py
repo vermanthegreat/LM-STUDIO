@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from discovery_models import DiscoveryRequest
+from discovery_models import DiscoveryRequest, reject_secrets
 
 
 ADAPTER_KEYS = ("fake",)
@@ -25,6 +26,11 @@ MIN_LEASE_SECONDS = 30
 DEFAULT_LEASE_SECONDS = 120
 MAX_LEASE_SECONDS = 300
 MAX_WORKER_ID_LENGTH = 128
+MAX_RESULT_WARNING_CODES = 20
+MAX_RESULT_NOTE_LENGTH = 240
+MAX_RETRY_DELAY_SECONDS = 24 * 60 * 60
+MAX_RECOVERY_LIMIT = 100
+SAFE_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_:-]{0,63}$")
 
 
 class ResearchJobError(ValueError):
@@ -47,6 +53,151 @@ class ResearchJobStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     ABANDONED = "abandoned"
+
+
+class ResearchJobTerminalStatus(str, Enum):
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    NO_RESULT = "no_result"
+    NEEDS_REVIEW = "needs_review"
+    FAILED = "failed"
+
+
+def _safe_code(value: str, label: str) -> str:
+    cleaned = value.strip().casefold()
+    if not SAFE_CODE_RE.fullmatch(cleaned):
+        raise ValueError(f"{label} must be a safe controlled code")
+    reject_secrets(cleaned)
+    return cleaned
+
+
+def _utc_datetime(value: datetime, label: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{label} must be timezone-aware UTC")
+    return value.astimezone(timezone.utc)
+
+
+class _RedactedValidationModel(BaseModel):
+    """Lifecycle-only Pydantic boundary that never returns rejected input values."""
+
+    @classmethod
+    def _redacted_errors(cls, error: ValidationError) -> list[dict[str, object]]:
+        redacted: list[dict[str, object]] = []
+        for item in error.errors():
+            clean = {key: value for key, value in item.items() if key not in {"input", "ctx"}}
+            error_type = clean.get("type")
+            if error_type in {"value_error", "assertion_error"}:
+                clean["ctx"] = {"error": ValueError(str(clean.get("msg", "validation failed")))}
+            elif item.get("ctx") is not None:
+                clean["ctx"] = item["ctx"]
+            redacted.append(clean)
+        return redacted
+
+    def __init__(self, **data: object) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as error:
+            raise ValidationError.from_exception_data(self.__class__.__name__, self._redacted_errors(error)) from None
+
+
+class ResearchJobResultSummary(_RedactedValidationModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, hide_input_in_errors=True)
+
+    source_count: int = Field(ge=0)
+    candidate_count: int = Field(ge=0)
+    warning_codes: tuple[str, ...] = Field(default_factory=tuple, max_length=MAX_RESULT_WARNING_CODES)
+    reason_code: Optional[str] = Field(default=None, max_length=64)
+    note: Optional[str] = Field(default=None, max_length=MAX_RESULT_NOTE_LENGTH)
+
+    @field_validator("warning_codes")
+    @classmethod
+    def normalize_warning_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(sorted({_safe_code(item, "warning code") for item in value}))
+        if len(normalized) > MAX_RESULT_WARNING_CODES:
+            raise ValueError("warning codes exceed their bounded count")
+        return normalized
+
+    @field_validator("reason_code")
+    @classmethod
+    def normalize_reason_code(cls, value: Optional[str]) -> Optional[str]:
+        return _safe_code(value, "reason code") if value is not None else None
+
+    @field_validator("note")
+    @classmethod
+    def validate_note(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            reject_secrets(value)
+        return value
+
+    def canonical_json(self) -> str:
+        return json.dumps(self.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+class ResearchJobFinalization(_RedactedValidationModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    status: ResearchJobTerminalStatus
+    summary: ResearchJobResultSummary
+    safe_error_code: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("safe_error_code")
+    @classmethod
+    def normalize_error_code(cls, value: Optional[str]) -> Optional[str]:
+        return _safe_code(value, "error code") if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_status_invariants(self) -> "ResearchJobFinalization":
+        summary = self.summary
+        explained = bool(summary.warning_codes or summary.reason_code)
+        if self.status is ResearchJobTerminalStatus.SUCCEEDED and summary.candidate_count < 1:
+            raise ValueError("succeeded finalization requires candidates")
+        if self.status is ResearchJobTerminalStatus.PARTIAL and (not (summary.source_count or summary.candidate_count) or not explained):
+            raise ValueError("partial finalization requires evidence and an explanation")
+        if self.status is ResearchJobTerminalStatus.NO_RESULT and (summary.candidate_count != 0 or not summary.reason_code):
+            raise ValueError("no_result finalization requires zero candidates and a reason")
+        if self.status is ResearchJobTerminalStatus.NEEDS_REVIEW and not explained:
+            raise ValueError("needs_review finalization requires an explanation")
+        if self.status is ResearchJobTerminalStatus.FAILED and (not self.safe_error_code or summary.candidate_count != 0):
+            raise ValueError("failed finalization requires an error code and zero candidates")
+        if self.status is not ResearchJobTerminalStatus.FAILED and self.safe_error_code is not None:
+            raise ValueError("terminal failure code is only valid for failed jobs")
+        return self
+
+
+class ResearchJobRetrySchedule(_RedactedValidationModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, hide_input_in_errors=True)
+
+    safe_error_code: str = Field(min_length=1, max_length=64)
+    retry_at: datetime
+    reason: Optional[str] = Field(default=None, max_length=MAX_RESULT_NOTE_LENGTH)
+
+    @field_validator("safe_error_code")
+    @classmethod
+    def normalize_retry_code(cls, value: str) -> str:
+        return _safe_code(value, "retry error code")
+
+    @field_validator("retry_at")
+    @classmethod
+    def normalize_retry_at(cls, value: datetime) -> datetime:
+        return _utc_datetime(value, "retry time")
+
+    @field_validator("reason")
+    @classmethod
+    def validate_retry_reason(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            reject_secrets(value)
+        return value
+
+
+class ResearchJobCancellation(_RedactedValidationModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, hide_input_in_errors=True)
+
+    reason_code: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("reason_code")
+    @classmethod
+    def normalize_cancellation_code(cls, value: Optional[str]) -> Optional[str]:
+        return _safe_code(value, "cancellation reason") if value is not None else None
 
 
 class ResearchJobCreate(BaseModel):

@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import db
-from research_job_models import ResearchJobCreate, ResearchJobRecord, ResearchJobStatus
+from research_job_models import (
+    ResearchJobCreate, ResearchJobFinalization, ResearchJobRecord, ResearchJobRetrySchedule, ResearchJobStatus,
+)
 
 _active_sqlite_tx: ContextVar[tuple[Path, Any] | None] = ContextVar("_active_sqlite_tx", default=None)
 
@@ -349,3 +351,15 @@ class SqliteContactStore:
             lease_seconds=lease_seconds,
             **self._kwargs(),
         )
+
+    def finalize_research_job(self, job_id: int, *, lease_token: str, expected_version: int, finalization: ResearchJobFinalization) -> ResearchJobRecord:
+        return db.finalize_research_job(job_id, lease_token=lease_token, expected_version=expected_version, finalization=finalization, **self._kwargs())
+
+    def schedule_research_job_retry(self, job_id: int, *, lease_token: str, expected_version: int, retry: ResearchJobRetrySchedule) -> ResearchJobRecord:
+        return db.schedule_research_job_retry(job_id, lease_token=lease_token, expected_version=expected_version, retry=retry, **self._kwargs())
+
+    def cancel_research_job(self, job_id: int, *, expected_version: int, reason_code: Optional[str] = None) -> ResearchJobRecord:
+        return db.cancel_research_job(job_id, expected_version=expected_version, reason_code=reason_code, **self._kwargs())
+
+    def recover_stale_research_jobs(self, *, limit: int = 20) -> tuple[ResearchJobRecord, ...]:
+        return db.recover_stale_research_jobs(limit=limit, **self._kwargs())

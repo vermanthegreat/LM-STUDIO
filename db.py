@@ -18,12 +18,16 @@ from research_job_models import (
     DEFAULT_LEASE_SECONDS,
     MAX_LEASE_SECONDS,
     MAX_WORKER_ID_LENGTH,
+    MAX_RECOVERY_LIMIT,
+    MAX_RETRY_DELAY_SECONDS,
     MIN_LEASE_SECONDS,
     RESEARCH_JOB_ACTIVE_STATES,
     ResearchJobCreate,
+    ResearchJobFinalization,
     ResearchJobError,
     ResearchJobListFilter,
     ResearchJobRecord,
+    ResearchJobRetrySchedule,
     ResearchJobStatus,
     canonical_request_json,
     research_intent_key,
@@ -2096,3 +2100,169 @@ def renew_research_job_lease(
         return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
 
     return _owned_immediate_transaction(db_path, conn, _run, "lease_update_persistence_failure")
+
+
+def _validate_research_job_id_and_version(job_id: int, expected_version: int) -> None:
+    if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id <= 0:
+        raise ResearchJobError("job_not_found", "research job not found")
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+        raise ResearchJobError("stale_job_version", "research job version is stale")
+
+
+def finalize_research_job(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    finalization: ResearchJobFinalization,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    _validate_research_job_id_and_version(job_id, expected_version)
+    if not isinstance(finalization, ResearchJobFinalization):
+        raise ResearchJobError("invalid_finalization", "research job finalization is invalid")
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("running",), now=now)
+        if finalization.summary.candidate_count > row["requested_result_limit"] or finalization.summary.source_count > min(row["max_pages"], row["max_requests"]):
+            raise ResearchJobError("result_count_exceeds_request_bounds", "research-job result counts exceed request bounds")
+        result = c.execute(
+            """UPDATE research_jobs SET status = ?, completed_at = ?, result_summary_json = ?,
+                       safe_error_code = ?, not_before = NULL, retry_after = NULL,
+                       claimed_by = NULL, lease_token = NULL, claimed_at = NULL, lease_expires_at = NULL,
+                       version = version + 1, updated_at = ?
+               WHERE id = ? AND status = 'running' AND lease_token = ? AND version = ? AND lease_expires_at > ?""",
+            (finalization.status.value, now.isoformat(), finalization.summary.canonical_json(), finalization.safe_error_code,
+             now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("finalization_persistence_failure", "research job finalization failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "finalization_persistence_failure")
+
+
+def schedule_research_job_retry(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    retry: ResearchJobRetrySchedule,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    _validate_research_job_id_and_version(job_id, expected_version)
+    if not isinstance(retry, ResearchJobRetrySchedule):
+        raise ResearchJobError("invalid_retry_schedule", "research job retry schedule is invalid")
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("running",), now=now)
+        if retry.retry_at < now or retry.retry_at > now + timedelta(seconds=MAX_RETRY_DELAY_SECONDS):
+            raise ResearchJobError("retry_time_out_of_bounds", "research-job retry time is outside bounds")
+        exhausted = row["attempt_count"] >= row["max_attempts"]
+        status = "failed" if exhausted else "retry_wait"
+        completed = now.isoformat() if exhausted else None
+        result = c.execute(
+            """UPDATE research_jobs SET status = ?, not_before = ?, retry_after = ?,
+                       safe_error_code = ?, completed_at = ?, result_summary_json = NULL,
+                       started_at = CASE WHEN ? THEN started_at ELSE NULL END,
+                       claimed_by = NULL, lease_token = NULL, claimed_at = NULL, lease_expires_at = NULL,
+                       version = version + 1, updated_at = ?
+               WHERE id = ? AND status = 'running' AND lease_token = ? AND version = ? AND lease_expires_at > ?""",
+            (status, None if exhausted else retry.retry_at.isoformat(), None if exhausted else retry.retry_at.isoformat(),
+             retry.safe_error_code, completed, exhausted, now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("retry_persistence_failure", "research job retry scheduling failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "retry_persistence_failure")
+
+
+def cancel_research_job(
+    job_id: int,
+    *,
+    expected_version: int,
+    reason_code: Optional[str] = None,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    _validate_research_job_id_and_version(job_id, expected_version)
+    try:
+        from research_job_models import ResearchJobCancellation
+        cancellation = ResearchJobCancellation(reason_code=reason_code)
+    except Exception as exc:
+        raise ResearchJobError("invalid_cancellation_reason", "cancellation reason is invalid") from exc
+    safe_reason = cancellation.reason_code or "cancelled_by_operator"
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise ResearchJobError("job_not_found", "research job not found")
+        if row["version"] != expected_version:
+            raise ResearchJobError("stale_job_version", "research job version is stale")
+        if row["status"] not in ("queued", "retry_wait") or any(row[key] is not None for key in ("claimed_by", "lease_token", "claimed_at", "lease_expires_at")):
+            raise ResearchJobError("invalid_cancellation_state", "research job state is not cancellable")
+        result = c.execute(
+            """UPDATE research_jobs SET status = 'cancelled', completed_at = ?, safe_error_code = ?,
+                       not_before = NULL, retry_after = NULL, claimed_by = NULL, lease_token = NULL,
+                       claimed_at = NULL, lease_expires_at = NULL, version = version + 1, updated_at = ?
+               WHERE id = ? AND status IN ('queued', 'retry_wait') AND version = ?
+                 AND claimed_by IS NULL AND lease_token IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL""",
+            (now.isoformat(), safe_reason, now.isoformat(), job_id, expected_version),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("cancellation_persistence_failure", "research job cancellation failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "cancellation_persistence_failure")
+
+
+def _validate_recovery_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_RECOVERY_LIMIT:
+        raise ResearchJobError("invalid_recovery_limit", "stale-recovery limit is invalid")
+    return limit
+
+
+def recover_stale_research_jobs(
+    *,
+    limit: int = 20,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> tuple[ResearchJobRecord, ...]:
+    limit = _validate_recovery_limit(limit)
+
+    def _run(c: sqlite3.Connection) -> tuple[ResearchJobRecord, ...]:
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        rows = c.execute(
+            """SELECT * FROM research_jobs
+               WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+               ORDER BY lease_expires_at ASC, updated_at ASC, id ASC LIMIT ?""",
+            (now_text, limit),
+        ).fetchall()
+        recovered: list[int] = []
+        for row in rows:
+            exhausted = row["attempt_count"] >= row["max_attempts"]
+            status = "abandoned" if exhausted else "retry_wait"
+            result = c.execute(
+                """UPDATE research_jobs SET status = ?, not_before = ?, retry_after = ?, safe_error_code = ?,
+                           started_at = CASE WHEN ? THEN started_at ELSE NULL END,
+                           completed_at = ?, claimed_by = NULL, lease_token = NULL, claimed_at = NULL,
+                           lease_expires_at = NULL, result_summary_json = NULL, version = version + 1, updated_at = ?
+                   WHERE id = ? AND status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL
+                     AND lease_expires_at <= ? AND version = ?""",
+                (status, None if exhausted else now_text, None if exhausted else now_text,
+                 "lease_expired_max_attempts" if exhausted else "lease_expired", exhausted,
+                 now_text if exhausted else None, now_text, row["id"], now_text, row["version"]),
+            )
+            if result.rowcount == 1:
+                recovered.append(row["id"])
+        return tuple(_research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()) for job_id in recovered)
+
+    return _owned_immediate_transaction(db_path, conn, _run, "stale_recovery_persistence_failure")
