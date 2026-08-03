@@ -14,10 +14,12 @@ from pydantic import ValidationError
 from discovery_models import DiscoveryRequest
 from repositories.sqlite_store import SqliteContactStore
 from research_job_models import (
+    ADAPTER_KEYS,
     ResearchJobCreate,
     ResearchJobError,
     ResearchJobStatus,
     canonical_request_json,
+    research_intent_key,
 )
 
 
@@ -114,6 +116,34 @@ def test_enqueue_validates_fake_request_and_round_trips_canonical_snapshot(tmp_p
         "claimed_by", "lease_token", "claimed_at", "lease_expires_at", "started_at",
         "completed_at", "result_summary_json", "safe_error_code", "retry_after",
     ))
+
+
+def test_company_website_adapter_key_is_exact_and_deterministic():
+    assert ADAPTER_KEYS == ("fake", "company_website")
+    fake = create_job(adapter_key="fake")
+    company_website = create_job(adapter_key="company_website")
+    repeated = create_job(adapter_key="company_website")
+    assert company_website.adapter_key == "company_website"
+    assert canonical_request_json(company_website.request) == canonical_request_json(repeated.request)
+    assert research_intent_key(company_website) == research_intent_key(repeated)
+    assert research_intent_key(fake) != research_intent_key(company_website)
+
+
+@pytest.mark.parametrize("adapter_key", [
+    "",
+    " ",
+    "browser",
+    "COMPANY_WEBSITE",
+    "company_website ",
+    "companywebsite",
+    "company_website_v1",
+    "company_website_secret-shaped-value",
+])
+def test_company_website_adapter_key_rejects_unknown_and_malformed_values(adapter_key):
+    with pytest.raises(ValidationError) as error:
+        create_job(adapter_key=adapter_key)
+    if "secret-shaped" in adapter_key:
+        assert adapter_key not in str(error.value)
 
 
 def test_enqueue_rejects_missing_lead_adapter_attempts_priority_and_dict_request(tmp_path):

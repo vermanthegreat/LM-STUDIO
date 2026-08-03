@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from discovery_models import DiscoveryRequest, reject_secrets
 
 
-ADAPTER_KEYS = ("fake",)
+ADAPTER_KEYS = ("fake", "company_website")
 RESEARCH_JOB_ACTIVE_STATES = ("queued", "claimed", "running", "retry_wait")
 RESEARCH_JOB_TERMINAL_STATES = (
     "succeeded", "partial", "no_result", "needs_review", "failed", "cancelled", "abandoned",
@@ -201,7 +201,7 @@ class ResearchJobCancellation(_RedactedValidationModel):
 
 
 class ResearchJobCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, hide_input_in_errors=True)
 
     request: DiscoveryRequest
     adapter_key: str = Field(min_length=1, max_length=64)
@@ -220,6 +220,13 @@ class ResearchJobCreate(BaseModel):
     @classmethod
     def validate_adapter(cls, value: str) -> str:
         if value not in ADAPTER_KEYS:
+            raise ValueError("unsupported research adapter")
+        return value
+
+    @field_validator("adapter_key", mode="before")
+    @classmethod
+    def reject_adapter_whitespace_variants(cls, value: object) -> object:
+        if isinstance(value, str) and value != value.strip():
             raise ValueError("unsupported research adapter")
         return value
 
@@ -272,7 +279,7 @@ class ResearchJobRecord(BaseModel):
 
 
 class ResearchJobListFilter(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, hide_input_in_errors=True)
 
     lead_id: Optional[int] = Field(default=None, gt=0)
     status: Optional[ResearchJobStatus] = None
@@ -283,6 +290,13 @@ class ResearchJobListFilter(BaseModel):
     @classmethod
     def validate_adapter(cls, value: Optional[str]) -> Optional[str]:
         if value is not None and value not in ADAPTER_KEYS:
+            raise ValueError("unsupported research adapter")
+        return value
+
+    @field_validator("adapter_key", mode="before")
+    @classmethod
+    def reject_adapter_whitespace_variants(cls, value: object) -> object:
+        if isinstance(value, str) and value != value.strip():
             raise ValueError("unsupported research adapter")
         return value
 

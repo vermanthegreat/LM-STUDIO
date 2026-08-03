@@ -96,6 +96,24 @@ def test_registry_is_explicit_and_validated_without_provider_calls():
         assert error.value.code == "invalid_provider_registry"
 
 
+def test_company_website_job_without_registered_provider_is_safe_provider_unavailable(tmp_path):
+    path, lead, *_ = setup_db(tmp_path)
+    store = SqliteContactStore(path)
+    job = store.enqueue_research_job(create_job(request=create_job().request.model_copy(update={"lead_id": lead["id"]}), adapter_key="company_website"))
+    runner = ResearchJobRunner(
+        store, {"fake": FakeDiscoveryProvider(discovery_outcome())},
+        materializer=SQLiteMaterializerAdapter(store), clock=lambda: NOW,
+    )
+
+    result = runner.run_next(worker_id="missing-company-website-provider")
+
+    assert result is not None
+    assert result.final_status is ResearchJobStatus.FAILED
+    assert result.provider_status is None
+    assert result.materialized is False
+    assert store.get_research_job(job.id).safe_error_code == "provider_unavailable"
+
+
 def test_materializer_dependency_requires_nominal_port_without_invocation():
     class ValidMaterializer(DiscoveryOutcomeMaterializerPort):
         def __init__(self):
