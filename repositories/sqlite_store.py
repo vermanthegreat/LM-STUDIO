@@ -307,3 +307,45 @@ class SqliteContactStore:
             limit=limit,
             **self._kwargs(),
         )
+
+    def claim_next_research_job(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int = 120,
+    ) -> Optional[ResearchJobRecord]:
+        return db.claim_next_research_job(
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+            **self._kwargs(),
+        )
+
+    def mark_research_job_running(
+        self,
+        job_id: int,
+        *,
+        lease_token: str,
+        expected_version: int,
+    ) -> ResearchJobRecord:
+        return db.mark_research_job_running(
+            job_id,
+            lease_token=lease_token,
+            expected_version=expected_version,
+            **self._kwargs(),
+        )
+
+    def renew_research_job_lease(
+        self,
+        job_id: int,
+        *,
+        lease_token: str,
+        expected_version: int,
+        lease_seconds: int = 120,
+    ) -> ResearchJobRecord:
+        return db.renew_research_job_lease(
+            job_id,
+            lease_token=lease_token,
+            expected_version=expected_version,
+            lease_seconds=lease_seconds,
+            **self._kwargs(),
+        )

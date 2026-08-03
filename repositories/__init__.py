@@ -162,3 +162,27 @@ class ContactStore(Protocol):
         adapter_key: Optional[str] = None,
         limit: int = 50,
     ) -> List[ResearchJobRecord]: ...
+
+    def claim_next_research_job(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int = 120,
+    ) -> Optional[ResearchJobRecord]: ...
+
+    def mark_research_job_running(
+        self,
+        job_id: int,
+        *,
+        lease_token: str,
+        expected_version: int,
+    ) -> ResearchJobRecord: ...
+
+    def renew_research_job_lease(
+        self,
+        job_id: int,
+        *,
+        lease_token: str,
+        expected_version: int,
+        lease_seconds: int = 120,
+    ) -> ResearchJobRecord: ...

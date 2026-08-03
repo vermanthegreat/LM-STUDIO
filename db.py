@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -14,6 +15,10 @@ from urllib.parse import urlparse
 from discovery_models import DiscoveryRequest
 from research_job_models import (
     ADAPTER_KEYS,
+    DEFAULT_LEASE_SECONDS,
+    MAX_LEASE_SECONDS,
+    MAX_WORKER_ID_LENGTH,
+    MIN_LEASE_SECONDS,
     RESEARCH_JOB_ACTIVE_STATES,
     ResearchJobCreate,
     ResearchJobError,
@@ -1903,3 +1908,191 @@ def list_research_jobs_for_lead(
         db_path=db_path,
         conn=conn,
     )
+
+
+def _validate_worker_id(worker_id: str) -> str:
+    if not isinstance(worker_id, str):
+        raise ResearchJobError("invalid_worker_id", "worker identity is invalid")
+    normalized = worker_id.strip()
+    if not normalized or len(normalized) > MAX_WORKER_ID_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        raise ResearchJobError("invalid_worker_id", "worker identity is invalid")
+    return normalized
+
+
+def _validate_lease_seconds(lease_seconds: int) -> int:
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not MIN_LEASE_SECONDS <= lease_seconds <= MAX_LEASE_SECONDS:
+        raise ResearchJobError("invalid_lease_duration", "lease duration is invalid")
+    return lease_seconds
+
+
+def _owned_immediate_transaction(
+    db_path: Path,
+    conn: Optional[sqlite3.Connection],
+    operation,
+    failure_code: str,
+):
+    """Run one short write transaction without nesting a caller transaction."""
+    if conn is not None:
+        if conn.in_transaction:
+            raise ResearchJobError(failure_code, "research-job transaction ownership is invalid")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = operation(conn)
+            conn.commit()
+            return result
+        except ResearchJobError:
+            conn.rollback()
+            raise
+        except sqlite3.Error as exc:
+            conn.rollback()
+            raise ResearchJobError(failure_code, "research-job persistence failed") from exc
+
+    try:
+        with get_conn(db_path) as owned:
+            owned.execute("BEGIN IMMEDIATE")
+            return operation(owned)
+    except ResearchJobError:
+        raise
+    except sqlite3.Error as exc:
+        raise ResearchJobError(failure_code, "research-job persistence failed") from exc
+
+
+def claim_next_research_job(
+    *,
+    worker_id: str,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[ResearchJobRecord]:
+    normalized_worker = _validate_worker_id(worker_id)
+    duration = _validate_lease_seconds(lease_seconds)
+
+    def _run(c: sqlite3.Connection) -> Optional[ResearchJobRecord]:
+        claimed_at = datetime.now(timezone.utc)
+        claimed_at_text = claimed_at.isoformat()
+        lease_expires_text = (claimed_at + timedelta(seconds=duration)).isoformat()
+        row = c.execute(
+            """SELECT * FROM research_jobs
+               WHERE status IN ('queued', 'retry_wait')
+                 AND (not_before IS NULL OR not_before <= ?)
+                 AND attempt_count < max_attempts
+                 AND lease_token IS NULL
+                 AND claimed_by IS NULL
+                 AND lease_expires_at IS NULL
+               ORDER BY priority DESC,
+                        CASE WHEN not_before IS NULL THEN 0 ELSE 1 END ASC,
+                        not_before ASC,
+                        created_at ASC,
+                        id ASC
+               LIMIT 1""",
+            (claimed_at_text,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = c.execute(
+            """UPDATE research_jobs
+               SET status = 'claimed', claimed_by = ?, lease_token = ?,
+                   claimed_at = ?, lease_expires_at = ?, attempt_count = attempt_count + 1,
+                   version = version + 1, updated_at = ?
+               WHERE id = ?
+                 AND status IN ('queued', 'retry_wait')
+                 AND (not_before IS NULL OR not_before <= ?)
+                 AND attempt_count < max_attempts
+                 AND lease_token IS NULL
+                 AND claimed_by IS NULL
+                 AND lease_expires_at IS NULL
+                 AND version = ?""",
+            (
+                normalized_worker,
+                secrets.token_urlsafe(32),
+                claimed_at_text,
+                lease_expires_text,
+                claimed_at_text,
+                row["id"],
+                claimed_at_text,
+                row["version"],
+            ),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("claim_persistence_failure", "research job claim failed")
+        claimed = c.execute("SELECT * FROM research_jobs WHERE id = ?", (row["id"],)).fetchone()
+        return _research_job_record(claimed)
+
+    return _owned_immediate_transaction(db_path, conn, _run, "claim_persistence_failure")
+
+
+def _lease_guard(
+    row: Optional[sqlite3.Row],
+    *,
+    lease_token: str,
+    expected_version: int,
+    allowed_states: tuple[str, ...],
+    now: datetime,
+) -> None:
+    if row is None:
+        raise ResearchJobError("job_not_found", "research job not found")
+    if row["status"] not in allowed_states:
+        raise ResearchJobError("invalid_claim_state", "research job state is not eligible")
+    if row["version"] != expected_version:
+        raise ResearchJobError("stale_job_version", "research job version is stale")
+    if not isinstance(lease_token, str) or not lease_token or lease_token != row["lease_token"]:
+        raise ResearchJobError("lease_token_mismatch", "research job lease token is invalid")
+    expiry = _research_job_datetime(row["lease_expires_at"])
+    if expiry is None or expiry <= now:
+        raise ResearchJobError("lease_expired", "research job lease has expired")
+
+
+def mark_research_job_running(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("claimed",), now=now)
+        result = c.execute(
+            """UPDATE research_jobs
+               SET status = 'running', started_at = ?, version = version + 1, updated_at = ?
+               WHERE id = ? AND status = 'claimed' AND lease_token = ?
+                 AND version = ? AND lease_expires_at > ?""",
+            (now.isoformat(), now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("lease_update_persistence_failure", "research job state update failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "lease_update_persistence_failure")
+
+
+def renew_research_job_lease(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    duration = _validate_lease_seconds(lease_seconds)
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("claimed", "running"), now=now)
+        expiry = (now + timedelta(seconds=duration)).isoformat()
+        result = c.execute(
+            """UPDATE research_jobs
+               SET lease_expires_at = ?, version = version + 1, updated_at = ?
+               WHERE id = ? AND status IN ('claimed', 'running') AND lease_token = ?
+                 AND version = ? AND lease_expires_at > ?""",
+            (expiry, now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("lease_update_persistence_failure", "research job lease update failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "lease_update_persistence_failure")
