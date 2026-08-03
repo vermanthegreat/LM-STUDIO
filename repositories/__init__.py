@@ -6,6 +6,8 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
+from research_job_models import ResearchJobCreate, ResearchJobRecord, ResearchJobStatus
+
 
 @runtime_checkable
 class ContactStore(Protocol):
@@ -138,3 +140,25 @@ class ContactStore(Protocol):
         external_account: Optional[str] = None,
         app_timezone: str = "UTC",
     ) -> List[Dict[str, Any]]: ...
+
+    def enqueue_research_job(self, job: ResearchJobCreate) -> ResearchJobRecord: ...
+
+    def get_research_job(self, job_id: int) -> ResearchJobRecord: ...
+
+    def list_research_jobs(
+        self,
+        *,
+        lead_id: Optional[int] = None,
+        status: Optional[ResearchJobStatus | str] = None,
+        adapter_key: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[ResearchJobRecord]: ...
+
+    def list_research_jobs_for_lead(
+        self,
+        lead_id: int,
+        *,
+        status: Optional[ResearchJobStatus | str] = None,
+        adapter_key: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[ResearchJobRecord]: ...

@@ -11,6 +11,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from discovery_models import DiscoveryRequest
+from research_job_models import (
+    ADAPTER_KEYS,
+    RESEARCH_JOB_ACTIVE_STATES,
+    ResearchJobCreate,
+    ResearchJobError,
+    ResearchJobListFilter,
+    ResearchJobRecord,
+    ResearchJobStatus,
+    canonical_request_json,
+    research_intent_key,
+)
+
 DB_PATH = Path(__file__).parent / "leads.db"
 
 SCHEMA = """
@@ -205,6 +218,49 @@ CREATE INDEX IF NOT EXISTS idx_contact_candidates_lead ON contact_method_candida
 CREATE INDEX IF NOT EXISTS idx_contact_candidates_reuse_candidate ON contact_method_candidates(person_candidate_id, raw_source_id, kind, normalized_value);
 CREATE INDEX IF NOT EXISTS idx_contact_candidates_reuse_person ON contact_method_candidates(person_id, raw_source_id, kind, normalized_value);
 CREATE INDEX IF NOT EXISTS idx_contact_candidates_status ON contact_method_candidates(status);
+
+CREATE TABLE IF NOT EXISTS research_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    adapter_key TEXT NOT NULL,
+    intent_key TEXT NOT NULL,
+    request_job_id TEXT NOT NULL,
+    request_snapshot_json TEXT NOT NULL,
+    target_roles_json TEXT NOT NULL,
+    approved_source_types_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'running', 'retry_wait', 'succeeded', 'partial', 'no_result', 'needs_review', 'failed', 'cancelled', 'abandoned')),
+    priority INTEGER NOT NULL CHECK (priority >= 0 AND priority <= 100),
+    requested_result_limit INTEGER NOT NULL CHECK (requested_result_limit >= 1 AND requested_result_limit <= 5),
+    max_pages INTEGER NOT NULL CHECK (max_pages >= 1 AND max_pages <= 5),
+    max_requests INTEGER NOT NULL CHECK (max_requests >= 1 AND max_requests <= 5),
+    timeout_seconds INTEGER NOT NULL CHECK (timeout_seconds >= 1 AND timeout_seconds <= 30),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1 AND max_attempts <= 3),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    not_before TEXT,
+    requested_by TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    provider_config_ref TEXT NOT NULL,
+    claimed_by TEXT,
+    lease_token TEXT,
+    claimed_at TEXT,
+    lease_expires_at TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    result_summary_json TEXT,
+    safe_error_code TEXT,
+    retry_after TEXT,
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_research_jobs_active_intent
+    ON research_jobs(intent_key)
+    WHERE status IN ('queued', 'claimed', 'running', 'retry_wait');
+CREATE INDEX IF NOT EXISTS idx_research_jobs_lead_created
+    ON research_jobs(lead_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_research_jobs_queue
+    ON research_jobs(status, not_before, priority, created_at, id);
 """
 
 
@@ -1608,3 +1664,242 @@ def export_leads_csv(db_path: Path = DB_PATH) -> str:
             _csv_cell(l.get("next_deadline")),
         ])
     return output.getvalue()
+
+
+def _research_job_datetime(value: Optional[str]) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ResearchJobError("invalid_request_snapshot", "stored research-job timestamp is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ResearchJobError("invalid_request_snapshot", "stored research-job timestamp is not timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _research_job_record(row: sqlite3.Row) -> ResearchJobRecord:
+    try:
+        snapshot_json = str(row["request_snapshot_json"])
+        snapshot = DiscoveryRequest.model_validate(json.loads(snapshot_json))
+        target_roles = tuple(json.loads(row["target_roles_json"]))
+        source_types = tuple(json.loads(row["approved_source_types_json"]))
+        return ResearchJobRecord(
+            id=int(row["id"]),
+            lead_id=int(row["lead_id"]),
+            adapter_key=str(row["adapter_key"]),
+            intent_key=str(row["intent_key"]),
+            request_job_id=str(row["request_job_id"]),
+            request_snapshot=snapshot,
+            request_snapshot_json=snapshot_json,
+            target_roles=target_roles,
+            approved_source_types=source_types,
+            status=ResearchJobStatus(row["status"]),
+            priority=int(row["priority"]),
+            requested_result_limit=int(row["requested_result_limit"]),
+            max_pages=int(row["max_pages"]),
+            max_requests=int(row["max_requests"]),
+            timeout_seconds=int(row["timeout_seconds"]),
+            max_attempts=int(row["max_attempts"]),
+            attempt_count=int(row["attempt_count"]),
+            not_before=_research_job_datetime(row["not_before"]),
+            requested_by=str(row["requested_by"]),
+            correlation_id=str(row["correlation_id"]),
+            provider_config_ref=str(row["provider_config_ref"]),
+            claimed_by=row["claimed_by"],
+            lease_token=row["lease_token"],
+            claimed_at=_research_job_datetime(row["claimed_at"]),
+            lease_expires_at=_research_job_datetime(row["lease_expires_at"]),
+            started_at=_research_job_datetime(row["started_at"]),
+            completed_at=_research_job_datetime(row["completed_at"]),
+            result_summary_json=row["result_summary_json"],
+            safe_error_code=row["safe_error_code"],
+            retry_after=_research_job_datetime(row["retry_after"]),
+            version=int(row["version"]),
+            created_at=_research_job_datetime(row["created_at"]),
+            updated_at=_research_job_datetime(row["updated_at"]),
+        )
+    except ResearchJobError:
+        raise
+    except Exception as exc:
+        raise ResearchJobError("invalid_request_snapshot", "stored research-job data is invalid") from exc
+
+
+def _is_active_intent_unique_conflict(exc: sqlite3.IntegrityError) -> bool:
+    """Recognize only the research_jobs.intent_key active uniqueness boundary."""
+    if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+        return False
+    if getattr(exc, "sqlite_errorname", None) != "SQLITE_CONSTRAINT_UNIQUE":
+        return False
+    return str(exc).strip() == "UNIQUE constraint failed: research_jobs.intent_key"
+
+
+def enqueue_research_job(
+    job: ResearchJobCreate,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    if not isinstance(job, ResearchJobCreate):
+        raise ResearchJobError("invalid_request", "enqueue requires a validated ResearchJobCreate")
+    snapshot_json = canonical_request_json(job.request)
+    intent_key = research_intent_key(job)
+    roles_json = json.dumps(sorted(set(job.request.target_roles)), separators=(",", ":"))
+    source_types_json = json.dumps(sorted(set(job.request.approved_source_types)), separators=(",", ":"))
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        lead = c.execute("SELECT id FROM leads WHERE id = ?", (job.request.lead_id,)).fetchone()
+        if lead is None:
+            raise ResearchJobError("lead_not_found", "lead not found")
+        now = _now()
+        values = (
+            job.request.lead_id,
+            job.adapter_key,
+            intent_key,
+            job.request.job_id,
+            snapshot_json,
+            roles_json,
+            source_types_json,
+            ResearchJobStatus.QUEUED.value,
+            job.priority,
+            job.request.result_limit,
+            job.request.max_pages,
+            job.request.max_requests,
+            job.request.timeout_seconds,
+            job.max_attempts,
+            0,
+            job.not_before.isoformat() if job.not_before else None,
+            job.request.requester_identity,
+            job.request.correlation_id,
+            job.request.provider_config_ref,
+            1,
+            now,
+            now,
+        )
+        try:
+            cursor = c.execute(
+                """INSERT INTO research_jobs (
+                    lead_id, adapter_key, intent_key, request_job_id,
+                    request_snapshot_json, target_roles_json, approved_source_types_json,
+                    status, priority, requested_result_limit, max_pages, max_requests,
+                    timeout_seconds, max_attempts, attempt_count, not_before,
+                    requested_by, correlation_id, provider_config_ref, version,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+            row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (cursor.lastrowid,)).fetchone()
+            return _research_job_record(row)
+        except sqlite3.IntegrityError as exc:
+            if not _is_active_intent_unique_conflict(exc):
+                raise ResearchJobError("enqueue_persistence_failure", "research job could not be enqueued") from exc
+            existing = c.execute(
+                """SELECT * FROM research_jobs
+                   WHERE intent_key = ? AND status IN ('queued', 'claimed', 'running', 'retry_wait')
+                   ORDER BY id LIMIT 1""",
+                (intent_key,),
+            ).fetchone()
+            if existing is not None:
+                return _research_job_record(existing)
+            raise ResearchJobError("enqueue_persistence_failure", "research job could not be enqueued")
+
+    try:
+        if conn is not None:
+            return _run(conn)
+        with get_conn(db_path) as c:
+            return _run(c)
+    except ResearchJobError:
+        raise
+    except sqlite3.Error as exc:
+        raise ResearchJobError("enqueue_persistence_failure", "research job could not be enqueued") from exc
+
+
+def get_research_job(
+    job_id: int,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
+        raise ResearchJobError("job_not_found", "research job not found")
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise ResearchJobError("job_not_found", "research job not found")
+        return _research_job_record(row)
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def _research_job_filter(
+    *,
+    lead_id: Optional[int],
+    status: Optional[ResearchJobStatus | str],
+    adapter_key: Optional[str],
+    limit: int,
+) -> ResearchJobListFilter:
+    try:
+        return ResearchJobListFilter(lead_id=lead_id, status=status, adapter_key=adapter_key, limit=limit)
+    except Exception as exc:
+        if status is not None:
+            raise ResearchJobError("invalid_status_filter", "invalid research-job status filter") from exc
+        if adapter_key is not None and adapter_key not in ADAPTER_KEYS:
+            raise ResearchJobError("unsupported_adapter", "unsupported research adapter") from exc
+        raise ResearchJobError("invalid_request", "invalid research-job list filter") from exc
+
+
+def list_research_jobs(
+    *,
+    lead_id: Optional[int] = None,
+    status: Optional[ResearchJobStatus | str] = None,
+    adapter_key: Optional[str] = None,
+    limit: int = 50,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[ResearchJobRecord]:
+    filters = _research_job_filter(lead_id=lead_id, status=status, adapter_key=adapter_key, limit=limit)
+
+    def _run(c: sqlite3.Connection) -> list[ResearchJobRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if filters.lead_id is not None:
+            clauses.append("lead_id = ?")
+            params.append(filters.lead_id)
+        if filters.status is not None:
+            clauses.append("status = ?")
+            params.append(filters.status.value)
+        if filters.adapter_key is not None:
+            clauses.append("adapter_key = ?")
+            params.append(filters.adapter_key)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = c.execute(
+            f"SELECT * FROM research_jobs {where} ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
+            (*params, filters.limit),
+        ).fetchall()
+        return [_research_job_record(row) for row in rows]
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def list_research_jobs_for_lead(
+    lead_id: int,
+    *,
+    status: Optional[ResearchJobStatus | str] = None,
+    adapter_key: Optional[str] = None,
+    limit: int = 50,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[ResearchJobRecord]:
+    return list_research_jobs(
+        lead_id=lead_id,
+        status=status,
+        adapter_key=adapter_key,
+        limit=limit,
+        db_path=db_path,
+        conn=conn,
+    )

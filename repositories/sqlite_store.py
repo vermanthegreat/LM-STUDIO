@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import db
+from research_job_models import ResearchJobCreate, ResearchJobRecord, ResearchJobStatus
 
 _active_sqlite_tx: ContextVar[tuple[Path, Any] | None] = ContextVar("_active_sqlite_tx", default=None)
 
@@ -268,3 +269,41 @@ class SqliteContactStore:
                 external_account=external_account,
             )
         return [gmail_db.row_to_public_dict(row, app_timezone=app_timezone) for row in rows]
+
+    def enqueue_research_job(self, job: ResearchJobCreate) -> ResearchJobRecord:
+        return db.enqueue_research_job(job, **self._kwargs())
+
+    def get_research_job(self, job_id: int) -> ResearchJobRecord:
+        return db.get_research_job(job_id, **self._kwargs())
+
+    def list_research_jobs(
+        self,
+        *,
+        lead_id: Optional[int] = None,
+        status: Optional[ResearchJobStatus | str] = None,
+        adapter_key: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[ResearchJobRecord]:
+        return db.list_research_jobs(
+            lead_id=lead_id,
+            status=status,
+            adapter_key=adapter_key,
+            limit=limit,
+            **self._kwargs(),
+        )
+
+    def list_research_jobs_for_lead(
+        self,
+        lead_id: int,
+        *,
+        status: Optional[ResearchJobStatus | str] = None,
+        adapter_key: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[ResearchJobRecord]:
+        return db.list_research_jobs_for_lead(
+            lead_id,
+            status=status,
+            adapter_key=adapter_key,
+            limit=limit,
+            **self._kwargs(),
+        )
