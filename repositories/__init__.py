@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 from research_job_models import (
     ResearchJobCreate, ResearchJobFinalization, ResearchJobRecord, ResearchJobRetrySchedule, ResearchJobStatus,
 )
+from discovery_models import DiscoveryOutcome
+from discovery_materialization_models import DiscoveryOutcomeMaterializationResult
 
 
 @runtime_checkable
@@ -196,3 +198,12 @@ class ContactStore(Protocol):
     def cancel_research_job(self, job_id: int, *, expected_version: int, reason_code: Optional[str] = None) -> ResearchJobRecord: ...
 
     def recover_stale_research_jobs(self, *, limit: int = 20) -> tuple[ResearchJobRecord, ...]: ...
+
+    def materialize_discovery_outcome(
+        self,
+        *,
+        research_job_id: int,
+        lease_token: str,
+        expected_version: int,
+        outcome: DiscoveryOutcome,
+    ) -> DiscoveryOutcomeMaterializationResult: ...

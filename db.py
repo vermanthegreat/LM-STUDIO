@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import secrets
 import sqlite3
@@ -270,6 +271,46 @@ CREATE INDEX IF NOT EXISTS idx_research_jobs_lead_created
     ON research_jobs(lead_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_research_jobs_queue
     ON research_jobs(status, not_before, priority, created_at, id);
+
+CREATE TABLE IF NOT EXISTS research_job_materializations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    research_job_id INTEGER NOT NULL REFERENCES research_jobs(id) ON DELETE CASCADE,
+    attempt_count INTEGER NOT NULL CHECK (attempt_count > 0),
+    outcome_digest TEXT NOT NULL CHECK (length(outcome_digest) = 64),
+    outcome_status TEXT NOT NULL CHECK (outcome_status IN ('succeeded', 'partial', 'no_result', 'needs_review')),
+    source_count INTEGER NOT NULL CHECK (source_count >= 0),
+    person_candidate_count INTEGER NOT NULL CHECK (person_candidate_count >= 0),
+    contact_candidate_count INTEGER NOT NULL CHECK (contact_candidate_count >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE(research_job_id, attempt_count)
+);
+
+CREATE TABLE IF NOT EXISTS research_job_materialization_sources (
+    materialization_id INTEGER NOT NULL REFERENCES research_job_materializations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    raw_source_id INTEGER NOT NULL REFERENCES raw_sources(id) ON DELETE RESTRICT,
+    PRIMARY KEY (materialization_id, ordinal),
+    UNIQUE(materialization_id, raw_source_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_job_materialization_person_candidates (
+    materialization_id INTEGER NOT NULL REFERENCES research_job_materializations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    person_candidate_id INTEGER NOT NULL REFERENCES person_candidates(id) ON DELETE RESTRICT,
+    PRIMARY KEY (materialization_id, ordinal),
+    UNIQUE(materialization_id, person_candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_job_materialization_contact_candidates (
+    materialization_id INTEGER NOT NULL REFERENCES research_job_materializations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    contact_candidate_id INTEGER NOT NULL REFERENCES contact_method_candidates(id) ON DELETE RESTRICT,
+    PRIMARY KEY (materialization_id, ordinal),
+    UNIQUE(materialization_id, contact_candidate_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_job_materializations_job
+    ON research_job_materializations(research_job_id, attempt_count);
 """
 
 
@@ -2266,3 +2307,200 @@ def recover_stale_research_jobs(
         return tuple(_research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()) for job_id in recovered)
 
     return _owned_immediate_transaction(db_path, conn, _run, "stale_recovery_persistence_failure")
+
+
+def materialize_discovery_outcome(
+    *,
+    research_job_id: int,
+    lease_token: str,
+    expected_version: int,
+    outcome: Any,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+):
+    """Atomically persist one validated outcome without changing its job."""
+    from discovery_models import DiscoveryOutcome, DiscoveryOutcomeStatus
+    from discovery_materialization_models import DiscoveryOutcomeMaterializationResult
+
+    materializable = {
+        DiscoveryOutcomeStatus.SUCCEEDED,
+        DiscoveryOutcomeStatus.PARTIAL,
+        DiscoveryOutcomeStatus.NO_RESULT,
+        DiscoveryOutcomeStatus.NEEDS_REVIEW,
+    }
+    if not isinstance(outcome, DiscoveryOutcome):
+        raise ResearchJobError("outcome_not_materializable", "discovery outcome is not materializable")
+    try:
+        outcome = DiscoveryOutcome.model_validate(outcome.model_dump(mode="python"))
+    except Exception as exc:
+        raise ResearchJobError("outcome_not_materializable", "discovery outcome is not materializable") from exc
+    if outcome.status not in materializable:
+        raise ResearchJobError("outcome_not_materializable", "discovery outcome is not materializable")
+
+    def _run(c: sqlite3.Connection):
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (research_job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("running",), now=now)
+        if row["attempt_count"] <= 0:
+            raise ResearchJobError("invalid_attempt_count", "research job attempt is invalid")
+        try:
+            job = _research_job_record(row)
+            outcome.validate_for_request(job.request_snapshot)
+        except ResearchJobError:
+            raise
+        except Exception as exc:
+            raise ResearchJobError("outcome_exceeds_request_bounds", "discovery outcome exceeds request bounds") from exc
+
+        canonical = json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        existing = c.execute(
+            "SELECT * FROM research_job_materializations WHERE research_job_id = ? AND attempt_count = ?",
+            (research_job_id, row["attempt_count"]),
+        ).fetchone()
+        if existing is not None:
+            if existing["outcome_digest"] != digest:
+                raise ResearchJobError("materialization_conflict", "research-job attempt already materialized")
+            source_ids = tuple(item["raw_source_id"] for item in c.execute(
+                "SELECT raw_source_id FROM research_job_materialization_sources WHERE materialization_id = ? ORDER BY ordinal",
+                (existing["id"],),
+            ).fetchall())
+            person_ids = tuple(item["person_candidate_id"] for item in c.execute(
+                "SELECT person_candidate_id FROM research_job_materialization_person_candidates WHERE materialization_id = ? ORDER BY ordinal",
+                (existing["id"],),
+            ).fetchall())
+            contact_ids = tuple(item["contact_candidate_id"] for item in c.execute(
+                "SELECT contact_candidate_id FROM research_job_materialization_contact_candidates WHERE materialization_id = ? ORDER BY ordinal",
+                (existing["id"],),
+            ).fetchall())
+            if (len(source_ids), len(person_ids), len(contact_ids)) != (
+                existing["source_count"], existing["person_candidate_count"], existing["contact_candidate_count"]
+            ):
+                raise ResearchJobError("invalid_receipt", "materialization receipt is incomplete")
+            return DiscoveryOutcomeMaterializationResult(
+                materialization_id=existing["id"], research_job_id=research_job_id,
+                attempt_count=row["attempt_count"], outcome_status=outcome.status,
+                outcome_digest=digest, raw_source_ids=source_ids,
+                person_candidate_ids=person_ids, contact_candidate_ids=contact_ids, replayed=True,
+            )
+
+        source_matches: dict[str, list[int]] = {}
+        source_ids: list[int] = []
+        for source in outcome.sources:
+            metadata = {
+                "canonical_url": source.canonical_url,
+                "content_hash": source.content_hash,
+                "content_type": source.content_type,
+                "http_status": source.http_status,
+                "page_title": source.page_title,
+                "provider_request_id": source.provider_request_id,
+                "warning_codes": sorted(source.warning_codes),
+            }
+            metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            found = c.execute(
+                """SELECT id FROM raw_sources WHERE lead_id = ? AND source_type = ?
+                   AND source_url = ? AND raw_text = ? AND parsed_json = ? ORDER BY id LIMIT 1""",
+                (row["lead_id"], source.source_type, source.source_url, source.extracted_text, metadata_json),
+            ).fetchone()
+            if found is None:
+                try:
+                    cursor = c.execute(
+                        """INSERT INTO raw_sources
+                           (lead_id, source_type, source_url, source_filter_tier, raw_text,
+                            parsed_json, extraction_status, confidence, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (row["lead_id"], source.source_type, source.source_url, "discovery",
+                         source.extracted_text, metadata_json, "ok", 0.0, now.isoformat()),
+                    )
+                    source_id = int(cursor.lastrowid)
+                except sqlite3.Error as exc:
+                    raise ResearchJobError("source_persistence_failure", "discovery source could not be persisted") from exc
+            else:
+                source_id = int(found["id"])
+            if source_id not in source_ids:
+                source_ids.append(source_id)
+            for reference in {source.source_url, source.canonical_url, source.provider_request_id, source.content_hash}:
+                matches = source_matches.setdefault(reference, [])
+                if source_id not in matches:
+                    matches.append(source_id)
+
+        def resolve_source(reference: str, source_type: Optional[str] = None) -> int:
+            candidates = source_matches.get(reference, [])
+            if source_type is not None:
+                candidates = [source_id for source_id in candidates if c.execute(
+                    "SELECT source_type FROM raw_sources WHERE id = ?", (source_id,)
+                ).fetchone()["source_type"] == source_type]
+            if len(candidates) != 1:
+                raise ResearchJobError("candidate_source_unresolved", "discovery evidence source could not be resolved")
+            return candidates[0]
+
+        person_ids: list[int] = []
+        contact_ids: list[int] = []
+        for candidate in outcome.candidates:
+            source_id = resolve_source(candidate.raw_evidence_reference or candidate.source_url, candidate.source_type)
+            try:
+                person = create_or_reuse_person_candidate(
+                    row["lead_id"], source_id, name=candidate.name, title=candidate.title,
+                    role_type=candidate.role_type, is_decision_maker=candidate.is_decision_maker,
+                    profile_url=candidate.profile_url, source_type=candidate.source_type,
+                    source_url=candidate.source_url, confidence=candidate.confidence,
+                    relevance_reason=candidate.relevance_reason, discovery_method=candidate.discovery_method,
+                    conn=c,
+                )
+            except ResearchJobError:
+                raise
+            except Exception as exc:
+                raise ResearchJobError("candidate_persistence_failure", "person candidate could not be persisted") from exc
+            person_id = int(person["id"])
+            if person_id not in person_ids:
+                person_ids.append(person_id)
+            for contact in candidate.explicit_contacts:
+                contact_source_id = resolve_source(contact.source_url)
+                try:
+                    contact_row = create_or_reuse_contact_candidate(
+                        row["lead_id"], contact_source_id, person_candidate_id=person_id,
+                        kind=contact.kind, value=contact.value, normalized_value=contact.normalized_value,
+                        source_url=contact.source_url, confidence=candidate.confidence,
+                        verification_status=contact.verification_status, evidence_basis=contact.evidence_basis,
+                        discovery_method=candidate.discovery_method, discovered_at=outcome.completed_at.isoformat(),
+                        conn=c,
+                    )
+                except ResearchJobError:
+                    raise
+                except Exception as exc:
+                    raise ResearchJobError("candidate_persistence_failure", "contact candidate could not be persisted") from exc
+                contact_id = int(contact_row["id"])
+                if contact_id not in contact_ids:
+                    contact_ids.append(contact_id)
+
+        try:
+            receipt = c.execute(
+                """INSERT INTO research_job_materializations
+                   (research_job_id, attempt_count, outcome_digest, outcome_status,
+                    source_count, person_candidate_count, contact_candidate_count, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (research_job_id, row["attempt_count"], digest, outcome.status.value,
+                 len(source_ids), len(person_ids), len(contact_ids), now.isoformat()),
+            )
+            materialization_id = int(receipt.lastrowid)
+            c.executemany(
+                "INSERT INTO research_job_materialization_sources(materialization_id, ordinal, raw_source_id) VALUES (?, ?, ?)",
+                [(materialization_id, ordinal, source_id) for ordinal, source_id in enumerate(source_ids)],
+            )
+            c.executemany(
+                "INSERT INTO research_job_materialization_person_candidates(materialization_id, ordinal, person_candidate_id) VALUES (?, ?, ?)",
+                [(materialization_id, ordinal, candidate_id) for ordinal, candidate_id in enumerate(person_ids)],
+            )
+            c.executemany(
+                "INSERT INTO research_job_materialization_contact_candidates(materialization_id, ordinal, contact_candidate_id) VALUES (?, ?, ?)",
+                [(materialization_id, ordinal, candidate_id) for ordinal, candidate_id in enumerate(contact_ids)],
+            )
+        except sqlite3.Error as exc:
+            raise ResearchJobError("materialization_persistence_failure", "discovery materialization could not be persisted") from exc
+        return DiscoveryOutcomeMaterializationResult(
+            materialization_id=materialization_id, research_job_id=research_job_id,
+            attempt_count=row["attempt_count"], outcome_status=outcome.status,
+            outcome_digest=digest, raw_source_ids=tuple(source_ids),
+            person_candidate_ids=tuple(person_ids), contact_candidate_ids=tuple(contact_ids), replayed=False,
+        )
+
+    return _owned_immediate_transaction(db_path, conn, _run, "materialization_persistence_failure")

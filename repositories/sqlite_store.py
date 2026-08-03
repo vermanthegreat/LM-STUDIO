@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import db
+from discovery_models import DiscoveryOutcome
+from discovery_materialization_models import DiscoveryOutcomeMaterializationResult
 from research_job_models import (
     ResearchJobCreate, ResearchJobFinalization, ResearchJobRecord, ResearchJobRetrySchedule, ResearchJobStatus,
 )
@@ -363,3 +365,19 @@ class SqliteContactStore:
 
     def recover_stale_research_jobs(self, *, limit: int = 20) -> tuple[ResearchJobRecord, ...]:
         return db.recover_stale_research_jobs(limit=limit, **self._kwargs())
+
+    def materialize_discovery_outcome(
+        self,
+        *,
+        research_job_id: int,
+        lease_token: str,
+        expected_version: int,
+        outcome: DiscoveryOutcome,
+    ) -> DiscoveryOutcomeMaterializationResult:
+        return db.materialize_discovery_outcome(
+            research_job_id=research_job_id,
+            lease_token=lease_token,
+            expected_version=expected_version,
+            outcome=outcome,
+            **self._kwargs(),
+        )
