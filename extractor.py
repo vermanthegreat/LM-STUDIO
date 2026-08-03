@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import db
 from llm import EXTRACTION_SYSTEM, extract_structured
 from extraction_schema import extraction_to_dict, try_validate_extraction
-from scoring import compute_fit_score
+from scoring import compute_fit_score, derive_person_role_fields
 
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
@@ -1083,8 +1083,9 @@ def _extract_linkedin_company_people(text: str, company_name: Optional[str]) -> 
             previous = _clean_linkedin_person_name(section[index - 1])
             if previous.casefold() != name.casefold():
                 continue
+        card_lines = section[index + 1:index + 8]
         title = None
-        for candidate in section[index + 1:index + 5]:
+        for candidate in card_lines[:4]:
             low = candidate.casefold()
             if LINKEDIN_DEGREE_DECORATION_RE.match(candidate):
                 continue
@@ -1092,6 +1093,18 @@ def _extract_linkedin_company_people(text: str, company_name: Optional[str]) -> 
                 break
             title = candidate.strip()
             break
+        person_url = next(
+            (
+                url.rstrip(".,)")
+                for url in URL_RE.findall("\n".join(card_lines))
+                if _linkedin_url_kind(url) == "personal"
+            ),
+            None,
+        )
+        person_email = next(
+            (value for value in _extract_email_candidates("\n".join(card_lines))),
+            None,
+        )
         key = name.casefold()
         if key in seen:
             continue
@@ -1100,7 +1113,8 @@ def _extract_linkedin_company_people(text: str, company_name: Optional[str]) -> 
             {
                 "name": name,
                 "title": title,
-                "linkedin_url": None,
+                "linkedin_url": person_url,
+                "email": _email_value(person_email) if person_email else None,
                 "department": None,
                 "source_type": "linkedin_company_people",
                 "source_company": company_name,
@@ -1731,7 +1745,56 @@ def parse_and_save(
             raw_source["lead_id"] = lead_id
 
         people_saved = []
-        if not pg_proposal_mode:
+        candidate_source_id = raw_source["id"]
+        if linkedin_classification == "linkedin_company_people" and lead_id:
+            # Retain every raw-source row, while exact replays reuse the
+            # original evidence row so candidate IDs remain stable.
+            lead_with_sources = store.get_lead(lead_id)
+            for prior_source in (lead_with_sources or {}).get("raw_sources", []):
+                if (
+                    prior_source["id"] != raw_source["id"]
+                    and prior_source.get("source_type") == resolved_source_type
+                    and prior_source.get("source_url") == persisted_source_url
+                    and prior_source.get("raw_text") == raw_text
+                ):
+                    candidate_source_id = prior_source["id"]
+                    break
+
+        if not pg_proposal_mode and linkedin_classification == "linkedin_company_people":
+            for person in parsed.get("people") or []:
+                if not person.get("name") or not lead_id:
+                    continue
+                role_fields = derive_person_role_fields(person.get("title"), person.get("role_type"))
+                candidate = store.create_or_reuse_person_candidate(
+                    lead_id,
+                    candidate_source_id,
+                    name=person["name"],
+                    title=person.get("title"),
+                    role_type=role_fields["role_type"],
+                    is_decision_maker=role_fields["is_decision_maker"],
+                    profile_url=person.get("linkedin_url"),
+                    source_type="linkedin_company_people",
+                    source_url=persisted_source_url,
+                    confidence=confidence,
+                    relevance_reason=role_fields["relevance_reason"],
+                    discovery_method="deterministic_parser",
+                )
+                people_saved.append(candidate)
+                for kind, value in (("email", person.get("email")), ("linkedin", person.get("linkedin_url"))):
+                    if value:
+                        store.create_or_reuse_contact_candidate(
+                            lead_id,
+                            candidate_source_id,
+                            person_candidate_id=candidate["id"],
+                            kind=kind,
+                            value=value,
+                            source_url=persisted_source_url,
+                            confidence=confidence,
+                            verification_status="source_confirmed",
+                            evidence_basis="source_confirmed",
+                            discovery_method="deterministic_parser",
+                        )
+        elif not pg_proposal_mode:
             for person in parsed.get("people") or []:
                 if not person.get("name") and not person.get("email"):
                     continue
@@ -1791,7 +1854,7 @@ def parse_and_save(
                     },
                 )
 
-        if lead_id:
+        if lead_id and linkedin_classification != "linkedin_company_people":
             lead_row = store.get_lead(lead_id)
             if lead_row:
                 fit = compute_fit_score(

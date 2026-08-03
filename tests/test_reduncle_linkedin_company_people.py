@@ -89,17 +89,18 @@ def test_people_boundary_and_personal_url_mismatch_persistence(tmp_path):
     assert result["parsed"]["linkedin_company_url"] is None
     assert result["parsed"]["source_url"] is None
     assert saved["website"] is None
-    assert [person["name"] for person in saved["people"]] == [
+    candidates = db.list_person_candidates_for_lead(result["lead_id"], db_path=db_path)
+    assert [person["name"] for person in candidates] == [
         "Daniel Colomer",
         "Sergio Ivorra Puig",
     ]
-    assert all(person["linkedin_url"] is None for person in saved["people"])
+    assert all(person["profile_url"] is None for person in candidates)
     assert all(
         person["source_company"] == "Reduncle | Shopify Plus Partners"
         for person in result["parsed"]["people"]
     )
     assert {"Sam Wright", "Gary Feuerstein", "Nikola Milic", "LinkedIn Member"}.isdisjoint(
-        person["name"] for person in saved["people"]
+        person["name"] for person in candidates
     )
     source = saved["raw_sources"][0]
     assert source["source_type"] == "linkedin_company"
@@ -157,8 +158,9 @@ def test_repeated_ingestion_is_idempotent_and_preserves_source_precedence(tmp_pa
     assert saved is not None
     assert first["lead_id"] == second["lead_id"] == lead["id"]
     assert first["company_match_reason"] == second["company_match_reason"] == "exact_canonical_name"
-    assert len(saved["people"]) == 2
-    normalized = [db.normalize_name(person["name"]) for person in saved["people"]]
+    candidates = db.list_person_candidates_for_lead(lead["id"], db_path=db_path)
+    assert len(candidates) == 2
+    normalized = [person["normalized_name"] for person in candidates]
     assert len(normalized) == len(set(normalized))
     assert len(saved["raw_sources"]) == 2
     assert saved["interactions"] == []

@@ -74,17 +74,17 @@ def test_carlowseo_cross_source_match_source_precedence_and_idempotency(tmp_path
     assert after_second["industries"] == before["industries"]
     assert after_second["description"] == before["description"]
     assert after_second["fit_score"] >= before_score
-    assert len(after_second["people"]) == 1
-    person = after_second["people"][0]
+    candidates = db.list_person_candidates_for_lead(shopify["lead_id"], db_path=db_path)
+    assert len(candidates) == 1
+    person = candidates[0]
     assert person["name"] == "Trevor Carlow"
     assert person["title"] == (
         "Founder at CarlowSEO | E-Commerce & Shopify Specialist | "
         "Driving Growth Through Data-Driven Strategy"
     )
-    assert person["email"] is None
-    assert person["linkedin_url"] is None
+    assert person["profile_url"] is None
     assert person["is_decision_maker"] == 1
-    assert person["is_relevant_contact"] == 1
+    assert person["role_type"] == "economic_buyer"
     assert first["parsed"]["people"][0]["source_type"] == "linkedin_company_people"
     assert first["parsed"]["people"][0]["source_company"] == "CarlowSEO"
     assert first["parsed"]["people"][0]["association_confidence"] == "explicit"

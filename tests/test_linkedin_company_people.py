@@ -4,13 +4,61 @@ from pathlib import Path
 from unittest.mock import patch
 
 import db
+import pytest
 from extractor import classify_linkedin_input, deterministic_parse, parse_and_save
+from repositories.sqlite_store import SqliteContactStore
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LINKEDIN_URL = "https://www.linkedin.com/company/akuna-technologies/people/"
 AKUNA_LINKEDIN = (FIXTURES / "akuna_linkedin_company_people.txt").read_text(encoding="utf-8")
 AKUNA_SHOPIFY = (FIXTURES / "akuna_shopify.txt").read_text(encoding="utf-8")
+
+
+def _synthetic_people_page(
+    *,
+    company: str = "Example Co",
+    name: str = "Jane Doe",
+    title: str = "Founder",
+    email: str | None = None,
+    profile_url: str | None = None,
+    website: str | None = None,
+) -> str:
+    evidence = [
+        f"{company} logo",
+        company,
+        "Home",
+        "About",
+        "Posts",
+        "Jobs",
+        "People",
+    ]
+    if website:
+        evidence.append(website)
+    evidence.extend(
+        [
+            "People you may know",
+            name,
+            f"{name} 2nd degree connection",
+            title,
+        ]
+    )
+    if email:
+        evidence.append(email)
+    if profile_url:
+        evidence.append(profile_url)
+    evidence.extend(["Following", "About"])
+    return "\n".join(evidence)
+
+
+def _ingest_synthetic_people_page(text: str, db_path, source_url: str):
+    with patch("extractor.extract_structured", return_value=(None, "")):
+        return parse_and_save(
+            "linkedin_company",
+            text,
+            source_url=source_url,
+            db_path=db_path,
+        )
 
 
 def test_classifies_and_extracts_linkedin_company_people_fixture():
@@ -154,7 +202,9 @@ def test_linkedin_merge_preserves_shopify_canonical_fields(tmp_path):
     assert after["review_count"] == before["review_count"]
     assert not {"Seo", "Catalog", "Product Management"} & set(after["services"])
     assert len(after["interactions"]) == len(before["interactions"])
-    assert all(person["name"] != "LinkedIn Member" for person in after["people"])
+    candidates = db.list_person_candidates_for_lead(shopify["lead_id"], db_path=db_path)
+    assert result["people_count"] == len(candidates) == 9
+    assert all(candidate["name"] != "LinkedIn Member" for candidate in candidates)
     linked_source = next(
         source for source in after["raw_sources"] if source["source_url"] == LINKEDIN_URL
     )
@@ -212,13 +262,18 @@ def test_repeated_people_ingestion_is_idempotent_and_keeps_raw_history(tmp_path)
         before = db.get_lead(shopify["lead_id"], db_path=db_path)
         first = parse_and_save("linkedin_company", AKUNA_LINKEDIN, db_path=db_path)
         after_first = db.get_lead(shopify["lead_id"], db_path=db_path)
+        first_candidates = db.list_person_candidates_for_lead(shopify["lead_id"], db_path=db_path)
         second = parse_and_save("linkedin_company", AKUNA_LINKEDIN, db_path=db_path)
         after_second = db.get_lead(shopify["lead_id"], db_path=db_path)
 
     assert before is not None and after_first is not None and after_second is not None
     assert first["lead_id"] == second["lead_id"] == shopify["lead_id"]
-    assert len(after_first["people"]) == len(after_second["people"]) == 9
-    normalized = [db.normalize_name(person["name"]) for person in after_second["people"]]
+    first_ids = [candidate["id"] for candidate in first_candidates]
+    second_candidates = db.list_person_candidates_for_lead(shopify["lead_id"], db_path=db_path)
+    assert len(first_candidates) == len(second_candidates) == 9
+    assert [candidate["id"] for candidate in second_candidates] == first_ids
+    assert all(candidate["version"] == 1 and candidate["status"] == "needs_review" for candidate in second_candidates)
+    normalized = [candidate["normalized_name"] for candidate in second_candidates]
     assert len(normalized) == len(set(normalized))
     assert len(after_second["raw_sources"]) == len(before["raw_sources"]) + 2
     assert len(after_second["interactions"]) == len(before["interactions"]) == 0
@@ -269,3 +324,207 @@ def test_person_name_identity_updates_title_and_preserves_stronger_fields(tmp_pa
     assert second["linkedin_url"] == "https://www.linkedin.com/in/praveen-gowda"
     assert second["is_decision_maker"] == 1
     assert second["is_relevant_contact"] == 1
+
+
+def test_people_ingestion_persists_explicit_contact_candidates_only(tmp_path):
+    db_path = tmp_path / "linkedin-explicit-contacts.db"
+    db.init_db(db_path)
+    lead, _ = db.upsert_lead(
+        {"company_name": "Example Co", "website": "example.com"}, db_path=db_path
+    )
+    source_url = "https://www.linkedin.com/company/example/people/"
+    page = _synthetic_people_page(
+        email="jane@example.com",
+        profile_url="https://www.linkedin.com/in/jane-doe/",
+        website="https://example.com",
+    )
+
+    result = _ingest_synthetic_people_page(page, db_path, source_url)
+
+    candidates = db.list_person_candidates_for_lead(lead["id"], db_path=db_path)
+    contacts = db.list_contact_candidates_for_lead(lead["id"], db_path=db_path)
+    saved = db.get_lead(lead["id"], db_path=db_path)
+    assert result["lead_id"] == lead["id"]
+    assert len(candidates) == 1
+    person = candidates[0]
+    assert person["raw_source_id"] == result["raw_source_id"]
+    assert person["source_type"] == "linkedin_company_people"
+    assert person["source_url"] == source_url
+    assert person["name"] == "Jane Doe"
+    assert person["normalized_name"] == "jane doe"
+    assert person["title"] == "Founder"
+    assert person["role_type"] == "economic_buyer"
+    assert person["is_decision_maker"] == 1
+    assert person["profile_url"] == "https://www.linkedin.com/in/jane-doe"
+    assert person["discovery_method"] == "deterministic_parser"
+    assert person["status"] == "needs_review"
+    assert person["version"] == 1
+    assert len(contacts) == 2
+    by_kind = {contact["kind"]: contact for contact in contacts}
+    assert by_kind["email"]["normalized_value"] == "jane@example.com"
+    assert by_kind["linkedin"]["normalized_value"] == (
+        "https://www.linkedin.com/in/jane-doe"
+    )
+    for contact in contacts:
+        assert contact["person_candidate_id"] == person["id"]
+        assert contact["raw_source_id"] == result["raw_source_id"]
+        assert contact["source_url"] == source_url
+        assert contact["evidence_basis"] == "source_confirmed"
+        assert contact["verification_status"] == "source_confirmed"
+        assert contact["verification_status"] != "verified"
+    assert saved["people"] == []
+    assert saved["company_email"] is None
+
+
+def test_people_ingestion_does_not_guess_missing_contacts(tmp_path):
+    db_path = tmp_path / "linkedin-no-guesses.db"
+    db.init_db(db_path)
+    lead, _ = db.upsert_lead(
+        {"company_name": "Example Co", "website": "example.com"}, db_path=db_path
+    )
+    page = _synthetic_people_page(website="https://example.com")
+
+    _ingest_synthetic_people_page(
+        page, db_path, "https://www.linkedin.com/company/example/people/"
+    )
+
+    candidates = db.list_person_candidates_for_lead(lead["id"], db_path=db_path)
+    contacts = db.list_contact_candidates_for_lead(lead["id"], db_path=db_path)
+    saved = db.get_lead(lead["id"], db_path=db_path)
+    assert len(candidates) == 1
+    assert contacts == []
+    assert saved["people"] == []
+    assert saved["company_email"] is None
+
+
+def test_changed_people_source_keeps_separate_candidate_evidence(tmp_path):
+    db_path = tmp_path / "linkedin-source-evidence.db"
+    db.init_db(db_path)
+    lead, _ = db.upsert_lead({"company_name": "Example Co"}, db_path=db_path)
+    source_url = "https://www.linkedin.com/company/example/people/"
+
+    first = _ingest_synthetic_people_page(
+        _synthetic_people_page(title="Founder"), db_path, source_url
+    )
+    second = _ingest_synthetic_people_page(
+        _synthetic_people_page(title="Chief Executive Officer") + "\nUpdated source evidence",
+        db_path,
+        source_url,
+    )
+
+    candidates = db.list_person_candidates_for_lead(lead["id"], db_path=db_path)
+    saved = db.get_lead(lead["id"], db_path=db_path)
+    assert first["raw_source_id"] != second["raw_source_id"]
+    assert len(saved["raw_sources"]) == 2
+    assert len(candidates) == 2
+    assert {candidate["raw_source_id"] for candidate in candidates} == {
+        first["raw_source_id"],
+        second["raw_source_id"],
+    }
+    by_source = {candidate["raw_source_id"]: candidate for candidate in candidates}
+    assert by_source[first["raw_source_id"]]["title"] == "Founder"
+    assert by_source[second["raw_source_id"]]["title"] == "Chief Executive Officer"
+    assert saved["people"] == []
+
+
+def test_people_candidate_transaction_rolls_back_all_intake_records(tmp_path):
+    db_path = tmp_path / "linkedin-candidate-rollback.db"
+    db.init_db(db_path)
+    lead, _ = db.upsert_lead(
+        {
+            "company_name": "Example Co",
+            "company_email": "company@example.com",
+            "company_phone": "555-0100",
+            "website": "example.com",
+        },
+        db_path=db_path,
+    )
+    canonical = db.add_person(
+        lead["id"],
+        {"name": "Existing Person", "title": "Owner", "email": "owner@example.com"},
+        db_path=db_path,
+    )
+    interaction = db.add_interaction(
+        lead["id"], {"type": "note", "summary": "Existing interaction"}, db_path=db_path
+    )
+    task = db.add_task(
+        lead["id"], {"title": "Existing task", "due_date": "2026-08-04"}, db_path=db_path
+    )
+    before = db.get_lead(lead["id"], db_path=db_path)
+    page = _synthetic_people_page(email="jane@example.com")
+
+    with patch.object(
+        SqliteContactStore,
+        "create_or_reuse_contact_candidate",
+        side_effect=RuntimeError("forced candidate failure"),
+    ):
+        with pytest.raises(RuntimeError, match="forced candidate failure"):
+            _ingest_synthetic_people_page(
+                page,
+                db_path,
+                "https://www.linkedin.com/company/example/people/",
+            )
+
+    after = db.get_lead(lead["id"], db_path=db_path)
+    assert after["raw_sources"] == before["raw_sources"]
+    assert db.list_person_candidates_for_lead(lead["id"], db_path=db_path) == []
+    assert db.list_contact_candidates_for_lead(lead["id"], db_path=db_path) == []
+    assert after["people"] == before["people"]
+    assert after["tasks"] == before["tasks"]
+    assert after["interactions"] == before["interactions"]
+    assert after["company_email"] == before["company_email"]
+    assert after["company_phone"] == before["company_phone"]
+    assert after["website"] == before["website"]
+    assert after["people"][0]["id"] == canonical["id"]
+    assert after["tasks"][0]["id"] == task["id"]
+    assert after["interactions"][0]["id"] == interaction["id"]
+    assert db.get_lead(lead["id"], db_path=db_path)["company_name"] == "Example Co"
+
+
+def test_people_ingestion_isolates_populated_canonical_records(tmp_path):
+    db_path = tmp_path / "linkedin-canonical-isolation.db"
+    db.init_db(db_path)
+    lead, _ = db.upsert_lead(
+        {
+            "company_name": "Example Co",
+            "company_email": "company@example.com",
+            "company_phone": "555-0100",
+            "website": "example.com",
+        },
+        db_path=db_path,
+    )
+    canonical = db.add_person(
+        lead["id"],
+        {
+            "name": "Existing Person",
+            "title": "Managing Director",
+            "email": "owner@example.com",
+            "linkedin_url": "https://www.linkedin.com/in/existing-person",
+        },
+        db_path=db_path,
+    )
+    db.add_task(lead["id"], {"title": "Existing task", "due_date": "2026-08-04"}, db_path=db_path)
+    db.add_interaction(
+        lead["id"], {"type": "note", "summary": "Existing interaction"}, db_path=db_path
+    )
+    before = db.get_lead(lead["id"], db_path=db_path)
+
+    result = _ingest_synthetic_people_page(
+        _synthetic_people_page(),
+        db_path,
+        "https://www.linkedin.com/company/example/people/",
+    )
+
+    after = db.get_lead(lead["id"], db_path=db_path)
+    candidates = db.list_person_candidates_for_lead(lead["id"], db_path=db_path)
+    assert result["lead_id"] == lead["id"]
+    assert len(candidates) == 1
+    assert len(after["people"]) == len(before["people"]) == 1
+    assert after["people"] == before["people"]
+    assert after["people"][0]["id"] == canonical["id"]
+    for field in ("company_email", "company_phone", "website"):
+        assert after[field] == before[field]
+    assert after["tasks"] == before["tasks"]
+    assert after["interactions"] == before["interactions"]
+    assert len(after["raw_sources"]) == len(before["raw_sources"]) + 1
+    assert db.list_contact_candidates_for_lead(lead["id"], db_path=db_path) == []
