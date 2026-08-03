@@ -4,17 +4,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+import os
+import tempfile
 
 from gmail_schemas import GMAIL_READONLY_SCOPE, NormalizedGmailMessage
 from providers.gmail_normalize import normalize_gmail_api_message
 
 try:
     from google.auth.transport.requests import Request
+    from google.auth.exceptions import RefreshError
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 except ImportError:  # pragma: no cover - optional until deps installed
     Request = None  # type: ignore
+    RefreshError = None  # type: ignore
     Credentials = None  # type: ignore
     InstalledAppFlow = None  # type: ignore
     build = None  # type: ignore
@@ -25,6 +29,28 @@ class GmailConfigurationError(Exception):
         super().__init__(message)
         self.error_code = error_code
         self.message = message
+
+
+def _write_token_atomic(token_path: Path, credentials: Any) -> None:
+    """Persist credentials without exposing a partially written token file."""
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{token_path.name}.", suffix=".tmp", dir=token_path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(credentials.to_json())
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        os.replace(temp_path, token_path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 class GmailProviderAdapter:
@@ -104,18 +130,32 @@ def load_credentials(token_path: Path) -> Any:
         )
     if not token_path.is_file():
         raise GmailConfigurationError(
-            "gmail_token_missing",
-            f"Gmail token file not found at configured path.",
+            "gmail_authorization_required",
+            "Gmail authorization is required. Run the authorization script.",
         )
     creds = Credentials.from_authorized_user_file(str(token_path), [GMAIL_READONLY_SCOPE])
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        token_path.write_text(creds.to_json(), encoding="utf-8")
+        try:
+            creds.refresh(Request())
+        except Exception as exc:
+            if RefreshError is not None and isinstance(exc, RefreshError):
+                raise GmailConfigurationError(
+                    "gmail_token_refresh_rejected",
+                    "Gmail authorization expired or was revoked. Reauthorization is required.",
+                ) from exc
+            raise
     if not creds or not creds.valid:
         raise GmailConfigurationError(
-            "gmail_token_invalid",
-            "Gmail token is missing or invalid. Run the authorization script.",
+            "gmail_authorization_required",
+            "Gmail authorization is required. Run the authorization script.",
         )
+    if creds.expired and not creds.refresh_token:
+        raise GmailConfigurationError(
+            "gmail_authorization_required",
+            "Gmail authorization is required. Run the authorization script.",
+        )
+    if creds.valid and creds.refresh_token and creds.expired is False:
+        _write_token_atomic(token_path, creds)
     return creds
 
 
@@ -133,7 +173,12 @@ def build_gmail_provider(
     return GmailProviderAdapter(creds, email)
 
 
-def run_local_authorization(client_secret_path: Path, token_path: Path) -> dict[str, str]:
+def run_local_authorization(
+    client_secret_path: Path,
+    token_path: Path,
+    *,
+    expected_account: str | None = None,
+) -> dict[str, str]:
     if InstalledAppFlow is None:
         raise GmailConfigurationError(
             "gmail_dependencies_missing",
@@ -149,9 +194,18 @@ def run_local_authorization(client_secret_path: Path, token_path: Path) -> dict[
         scopes=[GMAIL_READONLY_SCOPE],
     )
     creds = flow.run_local_server(port=0)
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(creds.to_json(), encoding="utf-8")
+    if not creds.refresh_token:
+        raise GmailConfigurationError(
+            "gmail_refresh_token_missing",
+            "Google did not return a refresh token; authorization was not saved.",
+        )
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     profile = service.users().getProfile(userId="me").execute()
     email = profile.get("emailAddress") or "unknown"
+    if expected_account and email.lower() != expected_account.lower():
+        raise GmailConfigurationError(
+            "gmail_account_mismatch",
+            "The authorized Gmail account does not match the configured account.",
+        )
+    _write_token_atomic(token_path, creds)
     return {"status": "authorized", "account_email": email}

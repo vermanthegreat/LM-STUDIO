@@ -23,6 +23,7 @@
 
     <div class="card">
       <h2>Status</h2>
+      {% if status.status_message %}<p class="msg">{{ status.status_message }}</p>{% endif %}
       <ul>
         <li>Enabled: {{ status.enabled }}</li>
         <li>Runtime capability: {{ status.runtime_capability }}</li>

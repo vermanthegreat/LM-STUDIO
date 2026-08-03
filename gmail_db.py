@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS gmail_sync_state (
     last_success_at TEXT,
     last_status TEXT,
     last_result_summary_json TEXT,
-    last_error_code TEXT
+    last_error_code TEXT,
+    reauthorization_required INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -97,6 +98,11 @@ def ensure_gmail_tables(conn: sqlite3.Connection) -> None:
         )
     if "target_company_name" not in columns:
         conn.execute("ALTER TABLE gmail_messages ADD COLUMN target_company_name TEXT")
+    sync_columns = {row["name"] for row in conn.execute("PRAGMA table_info(gmail_sync_state)").fetchall()}
+    if "reauthorization_required" not in sync_columns:
+        conn.execute(
+            "ALTER TABLE gmail_sync_state ADD COLUMN reauthorization_required INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gmail_messages_role ON gmail_messages(message_role)")
 
 
@@ -136,6 +142,7 @@ def update_sync_state(
     last_status: str,
     last_result_summary: Optional[dict[str, Any]],
     last_error_code: Optional[str],
+    reauthorization_required: bool = False,
 ) -> None:
     get_sync_state(conn, configured_label=configured_label)
     conn.execute(
@@ -147,7 +154,8 @@ def update_sync_state(
             last_success_at = ?,
             last_status = ?,
             last_result_summary_json = ?,
-            last_error_code = ?
+            last_error_code = ?,
+            reauthorization_required = ?
         WHERE id = 1
         """,
         (
@@ -158,6 +166,7 @@ def update_sync_state(
             last_status,
             _json_dumps(last_result_summary),
             last_error_code,
+            int(reauthorization_required),
         ),
     )
 

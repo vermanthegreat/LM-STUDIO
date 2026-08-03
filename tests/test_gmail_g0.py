@@ -14,6 +14,7 @@ from config import AppConfig
 from fastapi.testclient import TestClient
 from gmail_schemas import GMAIL_READONLY_SCOPE, AttentionMarker, MessageRole, PrimaryIntent
 from providers.fake_gmail import FakeGmailProvider
+from providers.gmail import GmailConfigurationError, _write_token_atomic, load_credentials
 from providers.gmail_normalize import normalize_gmail_api_message
 from repositories.sqlite_store import SqliteContactStore
 from services.command_log import CommandStatus
@@ -97,7 +98,7 @@ def test_gmail_disabled_by_default():
 def test_missing_token_controlled_error(sqlite_store, gmail_cfg):
     result, entry = sync_gmail_label(sqlite_store, gmail_cfg)
     assert result.status == "error"
-    assert result.error_code in {"gmail_token_missing", "gmail_not_configured", "gmail_disabled"}
+    assert result.error_code in {"gmail_authorization_required", "gmail_disabled"}
     if entry:
         assert entry.intent == "gmail_sync"
 
@@ -681,3 +682,113 @@ def test_sqlite_gmail_status_reports_sqlite_only(sqlite_store, gmail_cfg):
     status = gmail_integration_status(sqlite_store, gmail_cfg)
     assert status["runtime_capability"] == "sqlite_only"
     assert status["runtime_backend"] == "sqlite"
+
+
+def _sync_state(store, cfg):
+    import gmail_db
+
+    with db.get_conn(store.database_path) as conn:
+        gmail_db.ensure_gmail_tables(conn)
+        return gmail_db.get_sync_state(conn, configured_label=cfg.gmail_sync_label)
+
+
+def test_refresh_rejection_persists_auth_state_and_preserves_success(sqlite_store, gmail_cfg):
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=_seed_provider(), use_llm=False)
+    previous = _sync_state(sqlite_store, gmail_cfg)
+
+    class RejectedProvider:
+        account_email = "operator@example.com"
+
+        def get_account_profile(self):
+            raise GmailConfigurationError(
+                "gmail_token_refresh_rejected",
+                "Gmail authorization expired or was revoked. Reauthorization is required.",
+            )
+
+    result, _ = sync_gmail_label(sqlite_store, gmail_cfg, provider=RejectedProvider(), use_llm=False)
+    state = _sync_state(sqlite_store, gmail_cfg)
+    assert result.error_code == "gmail_token_refresh_rejected"
+    assert state["last_status"] == "error"
+    assert state["last_error_code"] == "gmail_token_refresh_rejected"
+    assert state["reauthorization_required"] == 1
+    assert state["last_success_at"] == previous["last_success_at"]
+    assert state["last_sync_at"] != previous["last_sync_at"]
+    assert "Reauthorization is required" in gmail_integration_status(sqlite_store, gmail_cfg)["status_message"]
+
+
+def test_invalid_grant_during_refresh_maps_to_safe_auth_category(tmp_path, monkeypatch):
+    from google.auth.exceptions import RefreshError
+
+    token = tmp_path / "token.json"
+    token.write_text("{}", encoding="utf-8")
+
+    class ExpiredCredentials:
+        expired = True
+        refresh_token = "refresh-secret"
+
+        @classmethod
+        def from_authorized_user_file(cls, path, scopes):
+            return cls()
+
+        def refresh(self, request):
+            raise RefreshError("invalid_grant: Bad Request")
+
+    monkeypatch.setattr("providers.gmail.Credentials", ExpiredCredentials)
+    with pytest.raises(GmailConfigurationError) as exc_info:
+        load_credentials(token)
+    assert exc_info.value.error_code == "gmail_token_refresh_rejected"
+    assert "invalid_grant" not in exc_info.value.message
+    assert "refresh-secret" not in exc_info.value.message
+
+
+def test_generic_sync_failure_is_distinct_from_auth_rejection(sqlite_store, gmail_cfg):
+    class BrokenProvider:
+        account_email = "operator@example.com"
+
+        def get_account_profile(self):
+            raise RuntimeError("provider unavailable")
+
+    result, _ = sync_gmail_label(sqlite_store, gmail_cfg, provider=BrokenProvider(), use_llm=False)
+    state = _sync_state(sqlite_store, gmail_cfg)
+    assert result.error_code == "gmail_sync_failed"
+    assert state["last_error_code"] == "gmail_sync_failed"
+    assert state["reauthorization_required"] == 0
+    assert "succeeded, but synchronization failed" in gmail_integration_status(sqlite_store, gmail_cfg)["status_message"]
+
+
+def test_success_clears_prior_auth_failure(sqlite_store, gmail_cfg):
+    class RejectedProvider:
+        account_email = "operator@example.com"
+
+        def get_account_profile(self):
+            raise GmailConfigurationError("gmail_token_refresh_rejected", "reauthorization required")
+
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=RejectedProvider(), use_llm=False)
+    sync_gmail_label(sqlite_store, gmail_cfg, provider=_seed_provider(), use_llm=False)
+    state = _sync_state(sqlite_store, gmail_cfg)
+    assert state["last_status"] == "ok"
+    assert state["last_error_code"] is None
+    assert state["reauthorization_required"] == 0
+
+
+class _TokenForTest:
+    def __init__(self, value):
+        self.value = value
+
+    def to_json(self):
+        return self.value
+
+
+def test_atomic_token_write_replaces_target_and_preserves_on_serialization_failure(tmp_path):
+    target = tmp_path / "token.json"
+    target.write_text("old", encoding="utf-8")
+    _write_token_atomic(target, _TokenForTest("new"))
+    assert target.read_text(encoding="utf-8") == "new"
+
+    class BrokenToken:
+        def to_json(self):
+            raise RuntimeError("serialization failed")
+
+    with pytest.raises(RuntimeError):
+        _write_token_atomic(target, BrokenToken())
+    assert target.read_text(encoding="utf-8") == "new"

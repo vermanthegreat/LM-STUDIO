@@ -106,7 +106,7 @@ def _provider_from_config(cfg: AppConfig, provider: Any | None) -> Any:
         raise GmailConfigurationError("gmail_disabled", "Gmail integration is disabled.")
     if cfg.gmail_client_secret_path is None or cfg.gmail_token_path is None:
         raise GmailConfigurationError(
-            "gmail_not_configured",
+            "gmail_authorization_required",
             "Gmail credentials or token path is not configured.",
         )
     return build_gmail_provider(
@@ -404,6 +404,7 @@ def sync_gmail_label(
                 last_status="ok" if counts.failed == 0 else "partial",
                 last_result_summary=counts.model_dump(),
                 last_error_code=None,
+                reauthorization_required=False,
             )
 
         transition(entry, CommandStatus.SUCCEEDED)
@@ -432,31 +433,54 @@ def sync_gmail_label(
         command_log.update(entry)
         with db.get_conn(store.database_path) as conn:
             gmail_db.ensure_gmail_tables(conn)
+            previous = gmail_db.get_sync_state(conn, configured_label=cfg.gmail_sync_label)
             update_sync_state(
                 conn,
                 account_email=account_email,
                 configured_label=cfg.gmail_sync_label,
                 last_sync_at=datetime.now(timezone.utc).isoformat(),
-                last_success_at=None,
+                last_success_at=previous.get("last_success_at"),
                 last_status="error",
                 last_result_summary=counts.model_dump(),
                 last_error_code=exc.error_code,
+                reauthorization_required=exc.error_code
+                in {
+                    "gmail_authorization_required",
+                    "gmail_refresh_token_missing",
+                    "gmail_token_refresh_rejected",
+                    "gmail_scope_error",
+                    "gmail_account_mismatch",
+                },
             )
         return GmailSyncResult(status="error", counts=counts, warnings=warnings, error_code=error_code, message=message), entry
     except Exception as exc:
         logger.exception("gmail sync failed")
         transition(entry, CommandStatus.FAILED)
         entry.error_code = "gmail_sync_failed"
-        entry.error_message = "Gmail synchronization failed."
+        entry.error_message = "Gmail authentication succeeded, but synchronization failed."
         entry.result_summary = {"counts": counts.model_dump(), "warnings": warnings}
         command_log.update(entry)
+        with db.get_conn(store.database_path) as conn:
+            gmail_db.ensure_gmail_tables(conn)
+            previous = gmail_db.get_sync_state(conn, configured_label=cfg.gmail_sync_label)
+            update_sync_state(
+                conn,
+                account_email=account_email,
+                configured_label=cfg.gmail_sync_label,
+                last_sync_at=datetime.now(timezone.utc).isoformat(),
+                last_success_at=previous.get("last_success_at"),
+                last_status="error",
+                last_result_summary=counts.model_dump(),
+                last_error_code="gmail_sync_failed",
+                reauthorization_required=False,
+            )
         return (
             GmailSyncResult(
                 status="error",
                 counts=counts,
                 warnings=warnings,
                 error_code="gmail_sync_failed",
-                message=str(exc),
+                message=entry.error_message,
             ),
             entry,
         )
@@ -491,6 +515,23 @@ def gmail_integration_status(store: Any, cfg: AppConfig) -> dict[str, Any]:
     backend = getattr(store, "backend", "sqlite")
     runtime_capability = "sqlite_only" if backend == "sqlite" else "postgresql_unsupported"
 
+    last_error_code = state.get("last_error_code")
+    reauthorization_required = bool(state.get("reauthorization_required"))
+    if not cfg.gmail_enabled:
+        status_message = "Gmail synchronization is disabled by configuration."
+    elif reauthorization_required or last_error_code in {
+        "gmail_authorization_required",
+        "gmail_refresh_token_missing",
+        "gmail_token_refresh_rejected",
+    }:
+        status_message = "Gmail authorization expired or was revoked. Reauthorization is required."
+    elif state.get("last_status") == "ok":
+        status_message = "Gmail synchronized successfully."
+    elif state.get("last_status") in {"error", "partial"}:
+        status_message = "Gmail authentication succeeded, but synchronization failed."
+    else:
+        status_message = None
+
     return {
         "enabled": cfg.gmail_enabled,
         "runtime_capability": runtime_capability,
@@ -505,6 +546,8 @@ def gmail_integration_status(store: Any, cfg: AppConfig) -> dict[str, Any]:
         "last_success_at": state.get("last_success_at"),
         "last_status": state.get("last_status"),
         "last_result_summary": gmail_db._json_loads(state.get("last_result_summary_json")),
-        "last_error_code": state.get("last_error_code"),
+        "last_error_code": last_error_code,
+        "reauthorization_required": reauthorization_required,
+        "status_message": status_message,
         "app_timezone": cfg.app_timezone,
     }

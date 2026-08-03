@@ -6,6 +6,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from dotenv import load_dotenv
 
 from config import AppConfig
@@ -23,7 +26,11 @@ def main() -> int:
         print("ERROR: GMAIL_TOKEN_PATH is not configured.", file=sys.stderr)
         return 1
     try:
-        result = run_local_authorization(cfg.gmail_client_secret_path, cfg.gmail_token_path)
+        result = run_local_authorization(
+            cfg.gmail_client_secret_path,
+            cfg.gmail_token_path,
+            expected_account="commercegov.dev@gmail.com",
+        )
     except GmailConfigurationError as exc:
         print(f"ERROR [{exc.error_code}]: {exc.message}", file=sys.stderr)
         return 1
