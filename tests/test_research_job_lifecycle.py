@@ -80,6 +80,7 @@ def test_finalization_is_typed_bounded_canonical_and_lease_guarded(tmp_path):
     assert finished.status is ResearchJobStatus.SUCCEEDED
     assert json.loads(finished.result_summary_json) == {
         "candidate_count": 1, "note": None, "reason_code": None, "source_count": 1, "warning_codes": ["late"],
+        "underlying_result_code": None,
     }
     assert finished.started_at == running.started_at
     assert finished.completed_at is not None
@@ -207,6 +208,10 @@ def test_result_summary_bounds_canonicalization_and_round_trip(tmp_path):
     assert normalized.reason_code == "no_result"
     assert normalized.canonical_json() == normalized.canonical_json()
     assert ResearchJobResultSummary.model_validate_json(normalized.canonical_json()) == normalized
+    legacy = ResearchJobResultSummary.model_validate_json(
+        '{"candidate_count":0,"note":null,"reason_code":null,"source_count":0,"warning_codes":[]}'
+    )
+    assert legacy.underlying_result_code is None
     with pytest.raises(ResearchJobError) as candidate_bound:
         store.finalize_research_job(running.id, lease_token=running.lease_token, expected_version=running.version, finalization=ResearchJobFinalization(status="succeeded", summary=ResearchJobResultSummary(source_count=1, candidate_count=3)))
     assert candidate_bound.value.code == "result_count_exceeds_request_bounds"

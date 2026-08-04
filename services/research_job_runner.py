@@ -188,7 +188,12 @@ class ResearchJobRunner:
                     running.id,
                     lease_token=running.lease_token,
                     expected_version=running.version,
-                    retry=self._retry_schedule(running, self._safe_code(outcome.safe_error_code, "provider_retryable_error"), outcome.retry_after),
+                    retry=self._retry_schedule(
+                        running,
+                        self._safe_code(outcome.safe_error_code, "provider_retryable_error"),
+                        outcome.retry_after,
+                        underlying_result_code=outcome.underlying_result_code,
+                    ),
                 )
                 return self._result(final, outcome.status, len(outcome.sources), len(outcome.candidates))
             if outcome.status in {DiscoveryOutcomeStatus.CANCELLED, DiscoveryOutcomeStatus.PERMANENT_ERROR}:
@@ -310,10 +315,21 @@ class ResearchJobRunner:
             raise ResearchJobRunnerError("materialization_result_mismatch", "materialization result is inconsistent")
         return value
 
-    def _retry_schedule(self, job: ResearchJobRecord, code: str, retry_at: Optional[datetime]) -> ResearchJobRetrySchedule:
+    def _retry_schedule(
+        self,
+        job: ResearchJobRecord,
+        code: str,
+        retry_at: Optional[datetime],
+        *,
+        underlying_result_code: Optional[str] = None,
+    ) -> ResearchJobRetrySchedule:
         now = self._now()
         target = retry_at or (now + timedelta(seconds=self.default_retry_delay_seconds))
-        return ResearchJobRetrySchedule(safe_error_code=code, retry_at=target)
+        return ResearchJobRetrySchedule(
+            safe_error_code=code,
+            retry_at=target,
+            underlying_result_code=underlying_result_code,
+        )
 
     def _finalize_failure(self, job: ResearchJobRecord, code: str, _detail: Optional[str], *, provider_status: Optional[DiscoveryOutcomeStatus]) -> ResearchJobExecutionResult:
         final = self.repository.finalize_research_job(

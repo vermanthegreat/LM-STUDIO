@@ -37,6 +37,17 @@ MAX_JSON_LD_BYTES = 100_000
 MAX_JSON_LD_ITEMS = 50
 MAX_PERSON_NAME_WORDS = 6
 SAFE_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_:-]{0,63}$")
+BOUNDED_TRANSPORT_ERROR_CODES = frozenset({
+    "company_website_timeout",
+    "company_website_response_too_large",
+    "company_website_invalid_response",
+    "company_website_redirect_blocked",
+    "company_website_redirect_limit",
+    "company_website_dns_failed",
+    "company_website_destination_blocked",
+    "company_website_connect_failed",
+    "company_website_tls_failed",
+})
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 PHONE_RE = re.compile(r"^[+()\d][+()\d .-]{5,31}$")
 PERSON_TYPES = {"person", "https://schema.org/person", "http://schema.org/person"}
@@ -302,7 +313,17 @@ def _clean_text(value: str, limit: int = MAX_PAGE_TEXT) -> str:
 
 
 def _safe_code(value: Optional[str], fallback: str) -> str:
-    return value if value and SAFE_CODE_RE.fullmatch(value) else fallback
+    if not isinstance(value, str):
+        return fallback
+    normalized = value.strip().casefold()
+    return normalized if SAFE_CODE_RE.fullmatch(normalized) else fallback
+
+
+def _safe_transport_code(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    return normalized if normalized in BOUNDED_TRANSPORT_ERROR_CODES else None
 
 
 class CompanyWebsiteDiscoveryProvider(DiscoveryProvider):
@@ -336,11 +357,17 @@ class CompanyWebsiteDiscoveryProvider(DiscoveryProvider):
                 response = self._fetcher.fetch(
                     url=url, timeout_seconds=request.timeout_seconds, max_response_bytes=MAX_RESPONSE_BYTES,
                 )
-            except Exception:
+            except Exception as error:
+                # Transport implementations may expose a bounded, stable code
+                # without importing the concrete transport here (the transport
+                # imports this module for the fetch-port contract). Never retain
+                # exception text or arbitrary attributes.
+                transport_code = _safe_transport_code(getattr(error, "code", None))
                 if url == base_url:
                     return self._outcome(
                         request, DiscoveryOutcomeStatus.RETRYABLE_ERROR, started_at,
                         safe_error_code="company_website_fetch_failed",
+                        underlying_result_code=transport_code,
                     )
                 warnings.append("secondary_page_fetch_failed")
                 continue
@@ -592,12 +619,14 @@ class CompanyWebsiteDiscoveryProvider(DiscoveryProvider):
         retry_after: Optional[datetime] = None,
         no_result_reason: Optional[str] = None,
         safe_error_code: Optional[str] = None,
+        underlying_result_code: Optional[str] = None,
     ) -> DiscoveryOutcome:
         return DiscoveryOutcome(
             provider_name=PROVIDER_NAME, provider_request_id=request.correlation_id, status=status,
             started_at=started_at, completed_at=started_at, sources=sources or [], candidates=candidates or [],
             warnings=list(dict.fromkeys(warnings or []))[:20], retry_after=retry_after,
             no_result_reason=no_result_reason, safe_error_code=safe_error_code,
+            underlying_result_code=underlying_result_code,
         )
 
 

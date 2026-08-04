@@ -353,6 +353,21 @@ class DiscoveryOutcome(ContractModel):
     retry_after: Optional[datetime] = None
     no_result_reason: Optional[str] = Field(default=None, max_length=MAX_REASON)
     safe_error_code: Optional[str] = Field(default=None, max_length=MAX_IDENTIFIER)
+    underlying_result_code: Optional[str] = Field(default=None, max_length=MAX_IDENTIFIER)
+
+    @field_validator("underlying_result_code")
+    @classmethod
+    def normalize_underlying_result_code(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip().casefold()
+        if not re.fullmatch(r"^[a-z0-9][a-z0-9_:-]{0,63}$", normalized):
+            return None
+        try:
+            reject_secrets(normalized)
+        except ValueError:
+            return None
+        return normalized
 
     @model_validator(mode="after")
     def validate_outcome(self) -> "DiscoveryOutcome":

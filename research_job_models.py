@@ -100,6 +100,19 @@ class _RedactedValidationModel(BaseModel):
             raise ValidationError.from_exception_data(self.__class__.__name__, self._redacted_errors(error)) from None
 
 
+def _optional_bounded_code(value: Optional[str]) -> Optional[str]:
+    if value is None or not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    if not SAFE_CODE_RE.fullmatch(normalized):
+        return None
+    try:
+        reject_secrets(normalized)
+    except ValueError:
+        return None
+    return normalized
+
+
 class ResearchJobResultSummary(_RedactedValidationModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, hide_input_in_errors=True)
 
@@ -108,6 +121,7 @@ class ResearchJobResultSummary(_RedactedValidationModel):
     warning_codes: tuple[str, ...] = Field(default_factory=tuple, max_length=MAX_RESULT_WARNING_CODES)
     reason_code: Optional[str] = Field(default=None, max_length=64)
     note: Optional[str] = Field(default=None, max_length=MAX_RESULT_NOTE_LENGTH)
+    underlying_result_code: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("warning_codes")
     @classmethod
@@ -128,6 +142,11 @@ class ResearchJobResultSummary(_RedactedValidationModel):
         if value is not None:
             reject_secrets(value)
         return value
+
+    @field_validator("underlying_result_code")
+    @classmethod
+    def normalize_underlying_code(cls, value: Optional[str]) -> Optional[str]:
+        return _optional_bounded_code(value)
 
     def canonical_json(self) -> str:
         return json.dumps(self.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -170,6 +189,7 @@ class ResearchJobRetrySchedule(_RedactedValidationModel):
     safe_error_code: str = Field(min_length=1, max_length=64)
     retry_at: datetime
     reason: Optional[str] = Field(default=None, max_length=MAX_RESULT_NOTE_LENGTH)
+    underlying_result_code: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("safe_error_code")
     @classmethod
@@ -187,6 +207,11 @@ class ResearchJobRetrySchedule(_RedactedValidationModel):
         if value is not None:
             reject_secrets(value)
         return value
+
+    @field_validator("underlying_result_code")
+    @classmethod
+    def normalize_underlying_code(cls, value: Optional[str]) -> Optional[str]:
+        return _optional_bounded_code(value)
 
 
 class ResearchJobCancellation(_RedactedValidationModel):

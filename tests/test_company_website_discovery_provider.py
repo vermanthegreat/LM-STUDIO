@@ -317,6 +317,7 @@ def test_no_result_and_controlled_transport_statuses():
     result = site.execute(request(max_requests=1, max_pages=1))
     assert result.status is DiscoveryOutcomeStatus.NO_RESULT
     assert result.no_result_reason == "no_matching_company_people"
+    assert result.underlying_result_code is None
 
     retry, _ = provider({"https://example.com": response("https://example.com", "", status=500)})
     assert retry.execute(request(max_requests=1, max_pages=1)).status is DiscoveryOutcomeStatus.RETRYABLE_ERROR
@@ -324,6 +325,36 @@ def test_no_result_and_controlled_transport_statuses():
     assert limited.execute(request(max_requests=1, max_pages=1)).status is DiscoveryOutcomeStatus.RATE_LIMITED
     denied, _ = provider({"https://example.com": response("https://example.com", "", status=403)})
     assert denied.execute(request(max_requests=1, max_pages=1)).safe_error_code == "company_website_access_denied"
+
+
+def test_primary_transport_error_preserves_only_its_bounded_code():
+    class BoundedTransportError(Exception):
+        code = "company_website_connect_failed"
+
+    site, _ = provider({"https://example.com": BoundedTransportError("raw details must not escape")})
+
+    result = site.execute(request(max_requests=1, max_pages=1))
+
+    assert result.status is DiscoveryOutcomeStatus.RETRYABLE_ERROR
+    assert result.safe_error_code == "company_website_fetch_failed"
+    assert result.underlying_result_code == "company_website_connect_failed"
+    assert "raw details" not in str(result)
+
+
+@pytest.mark.parametrize("code", ["arbitrary", "company_website_unknown", "https://evil.example", "token=secret", "", 123])
+def test_primary_transport_error_omits_malformed_or_unapproved_code(code):
+    class UnapprovedTransportError(Exception):
+        pass
+
+    error = UnapprovedTransportError("raw exception details")
+    error.code = code
+    site, _ = provider({"https://example.com": error})
+
+    result = site.execute(request(max_requests=1, max_pages=1))
+
+    assert result.safe_error_code == "company_website_fetch_failed"
+    assert result.underlying_result_code is None
+    assert "raw exception details" not in str(result)
 
 
 def test_secondary_failure_is_partial_and_does_not_discard_valid_candidates():

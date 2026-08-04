@@ -206,7 +206,7 @@ def test_terminal_outcome_mapping_persists_only_compact_summary(tmp_path, status
     assert result.final_status is expected
     record = store.get_research_job(job.id)
     summary = json.loads(record.result_summary_json)
-    assert set(summary) == {"candidate_count", "note", "reason_code", "source_count", "warning_codes"}
+    assert set(summary) == {"candidate_count", "note", "reason_code", "source_count", "warning_codes", "underlying_result_code"}
     serialized = record.result_summary_json
     for forbidden in ("Jane Doe", "https://example.com/about", "Visible evidence", "provider-1"):
         assert forbidden not in serialized
@@ -234,6 +234,25 @@ def test_retryable_missing_retry_time_uses_bounded_default_and_exhaustion_fails(
     assert record.status is ResearchJobStatus.FAILED
     assert record.safe_error_code == "temporary"
     assert record.completed_at is not None and record.retry_after is None
+
+
+def test_retryable_transport_code_persists_separately_from_public_code(tmp_path):
+    outcome = discovery_outcome(
+        DiscoveryOutcomeStatus.RETRYABLE_ERROR,
+        sources=[], candidates=[], safe_error_code="company_website_fetch_failed",
+        underlying_result_code="company_website_connect_failed",
+    )
+    path, store, job, _, runner = make_runner(tmp_path, outcome)
+
+    result = runner.run_next(worker_id="worker")
+    record = store.get_research_job(job.id)
+
+    assert result.retry_scheduled is True
+    assert record.status is ResearchJobStatus.RETRY_WAIT
+    assert record.safe_error_code == "company_website_fetch_failed"
+    assert record.not_before == record.retry_after
+    assert json.loads(record.result_summary_json)["underlying_result_code"] == "company_website_connect_failed"
+    assert "safe_error_code" not in json.loads(record.result_summary_json)
 
 
 def test_provider_exception_retries_once_without_exposing_exception(tmp_path):

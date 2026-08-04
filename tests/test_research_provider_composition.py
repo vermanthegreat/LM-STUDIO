@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ from discovery_models import DiscoveryRequest
 from repositories.sqlite_store import SqliteContactStore
 from research_job_models import ResearchJobStatus
 from services.company_website_discovery_provider import CompanyWebsiteDiscoveryProvider
-from services.company_website_http_transport import HardenedCompanyWebsiteHttpTransport
+from services.company_website_http_transport import CompanyWebsiteTransportError, HardenedCompanyWebsiteHttpTransport
 from services.research_job_runner import DiscoveryOutcomeMaterializerPort, ResearchJobRunner
 from services.research_provider_composition import (
     CompanyWebsiteTransportDependencies,
@@ -151,7 +152,7 @@ def test_transport_failure_does_not_materialize_or_expose_raw_error(tmp_path):
     factory.responses = []
     def fail_connect(**kwargs):
         factory.calls.append(kwargs)
-        raise OSError("private socket secret=never-expose")
+        raise CompanyWebsiteTransportError("company_website_connect_failed")
 
     factory.connect = fail_connect
     runner = build_research_job_runner(
@@ -163,8 +164,10 @@ def test_transport_failure_does_not_materialize_or_expose_raw_error(tmp_path):
     result = runner.run_next(worker_id="failure")
 
     assert result is not None and result.final_status is ResearchJobStatus.RETRY_WAIT
-    assert store.get_research_job(job.id).safe_error_code == "company_website_fetch_failed"
-    assert "private socket" not in str(result.__dict__) if hasattr(result, "__dict__") else True
+    record = store.get_research_job(job.id)
+    assert record.safe_error_code == "company_website_fetch_failed"
+    assert json.loads(record.result_summary_json)["underlying_result_code"] == "company_website_connect_failed"
+    assert "private" not in json.dumps(record.model_dump(mode="json"))
     with db.get_conn(path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM raw_sources WHERE lead_id = ?", (lead["id"],)).fetchone()[0] == before_sources
         assert conn.execute("SELECT COUNT(*) FROM person_candidates WHERE lead_id = ?", (lead["id"],)).fetchone()[0] == before_person_candidates

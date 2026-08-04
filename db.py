@@ -29,6 +29,7 @@ from research_job_models import (
     ResearchJobListFilter,
     ResearchJobRecord,
     ResearchJobRetrySchedule,
+    ResearchJobResultSummary,
     ResearchJobStatus,
     canonical_request_json,
     research_intent_key,
@@ -2207,15 +2208,24 @@ def schedule_research_job_retry(
         exhausted = row["attempt_count"] >= row["max_attempts"]
         status = "failed" if exhausted else "retry_wait"
         completed = now.isoformat() if exhausted else None
+        result_summary_json = (
+            ResearchJobResultSummary(
+                source_count=0,
+                candidate_count=0,
+                underlying_result_code=retry.underlying_result_code,
+            ).canonical_json()
+            if retry.underlying_result_code is not None
+            else None
+        )
         result = c.execute(
             """UPDATE research_jobs SET status = ?, not_before = ?, retry_after = ?,
-                       safe_error_code = ?, completed_at = ?, result_summary_json = NULL,
+                       safe_error_code = ?, completed_at = ?, result_summary_json = ?,
                        started_at = CASE WHEN ? THEN started_at ELSE NULL END,
                        claimed_by = NULL, lease_token = NULL, claimed_at = NULL, lease_expires_at = NULL,
                        version = version + 1, updated_at = ?
                WHERE id = ? AND status = 'running' AND lease_token = ? AND version = ? AND lease_expires_at > ?""",
             (status, None if exhausted else retry.retry_at.isoformat(), None if exhausted else retry.retry_at.isoformat(),
-             retry.safe_error_code, completed, exhausted, now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+             retry.safe_error_code, completed, result_summary_json, exhausted, now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
         )
         if result.rowcount != 1:
             raise ResearchJobError("retry_persistence_failure", "research job retry scheduling failed")
