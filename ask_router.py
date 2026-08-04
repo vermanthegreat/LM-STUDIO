@@ -13,11 +13,13 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 from uuid import UUID
 
 import db
 from llm import chat_completion, call_lmstudio_for_text
 from repositories.sqlite_store import SqliteContactStore
+from response_presentation import presentation_data, render_plain_text
 from services.command_log import CommandLogError, CommandStatus
 from services.command_service import CommandService
 from tools.planner import PlannerClarify, PlannerToolCall
@@ -157,7 +159,7 @@ def answer_question(
         )
         if tool_response.get("intent") != "tool_error":
             answer = tool_response["answer"]
-            if use_llm and tool_response.get("data") and not _is_structured_list_intent(tool_response.get("intent")):
+            if use_llm and tool_response.get("data") and _can_polish_result(tool_response):
                 polished = _polish_answer(q, answer, tool_response["data"])
                 if polished:
                     answer = polished
@@ -169,7 +171,7 @@ def answer_question(
     result = _execute_intent(intent, store=store)
     answer = result["answer"]
 
-    if use_llm and result.get("data") and not _is_structured_list_intent(result.get("intent")):
+    if use_llm and result.get("data") and _can_polish_result(result):
         polished = _polish_answer(q, answer, result["data"])
         if polished:
             answer = polished
@@ -489,7 +491,7 @@ def execute_tool_route(
             },
         }
 
-    return _tool_result_to_ask_response(question, tool_name, result, entry)
+    return _tool_result_to_ask_response(question, tool_name, result, entry, store=store)
 
 
 def execute_planner_tool_route(
@@ -550,6 +552,7 @@ def execute_planner_read_tool_route(
         outcome["tool_name"],
         outcome["result"],
         outcome["entry"],
+        store=store,
     )
 
 
@@ -790,6 +793,8 @@ def _tool_result_to_ask_response(
     tool_name: str,
     result,
     entry,
+    *,
+    store,
 ) -> Dict[str, Any]:
     data: Dict[str, Any] = {
         "command_id": str(entry.id),
@@ -797,45 +802,32 @@ def _tool_result_to_ask_response(
         "tool_name": tool_name,
         "record_count": result.record_count,
     }
+    data.update(presentation_data(tool_name, result))
+    data["warnings"] = [*result.warnings, *data.pop("presentation_warnings")]
+    data["provenance"] = result.provenance
     if tool_name == "find_companies_missing_email":
-        data["leads"] = result.records
+        leads = _attach_contact_fields(result.records, store=store)
+        data["leads"] = leads
         return {
             "question": question,
             "intent": "leads_without_email",
-            "answer": _format_leads(result.records, "Companies missing email:"),
+            "answer": render_plain_text(tool_name, result),
             "data": data,
         }
     if tool_name == "list_due_followups":
         data["items"] = result.records
-        lines = ["Follow-ups due:"]
-        for item in result.records[:10]:
-            lines.append(
-                f"- {item.get('company_name')}: {item.get('title') or item.get('subject')} "
-                f"(due {item.get('due_date')})"
-            )
-        if len(lines) == 1:
-            lines.append("(none)")
         return {
             "question": question,
             "intent": "followups_due",
-            "answer": "\n".join(lines),
+            "answer": render_plain_text(tool_name, result),
             "data": data,
         }
     if tool_name == "list_email_messages":
         data["emails"] = result.records
-        lines = [result.summary]
-        for row in result.records[:15]:
-            lines.append(
-                f"- {row.get('occurred_at_local')}: {row.get('subject') or '(no subject)'} "
-                f"[{row.get('message_role') or 'conversation_message'} / {row.get('primary_intent')}] "
-                f"({row.get('link_status')})"
-            )
-        if len(result.records) > 15:
-            lines.append(f"... and {len(result.records) - 15} more in this page.")
         return {
             "question": question,
             "intent": "imported_emails",
-            "answer": "\n".join(lines),
+            "answer": render_plain_text(tool_name, result),
             "data": data,
         }
     if tool_name == "get_email_thread":
@@ -843,14 +835,14 @@ def _tool_result_to_ask_response(
         return {
             "question": question,
             "intent": "imported_email_thread",
-            "answer": result.summary,
+            "answer": render_plain_text(tool_name, result),
             "data": data,
         }
     data["records"] = result.records
     return {
         "question": question,
         "intent": tool_name,
-        "answer": result.summary,
+        "answer": render_plain_text(tool_name, result),
         "data": data,
     }
 
@@ -965,8 +957,46 @@ def _attach_contact_fields(leads: List[Dict[str, Any]], *, store) -> List[Dict[s
         emails = _collect_emails(enriched)
         enriched["emails"] = emails
         enriched["email_display"] = ", ".join(emails) if emails else "n/a"
+        website = str(enriched.get("website") or "").strip()
+        parsed = urlparse(website)
+        enriched["valid_website"] = website if parsed.scheme in {"http", "https"} and parsed.netloc else None
+        enriched["contact_evidence_status"] = _contact_evidence_status(enriched, store=store)
         result.append(enriched)
     return result
+
+
+def _contact_evidence_status(lead: Dict[str, Any], *, store) -> str:
+    """Use only directional interaction evidence; generic fields are not evidence."""
+    lead_id = lead.get("id")
+    directional: list[tuple[str, str]] = []
+    ambiguous_interaction = False
+    for interaction in lead.get("interactions") or []:
+        if not isinstance(interaction, dict):
+            continue
+        direction = str(interaction.get("direction") or "").strip().lower()
+        if direction in {"inbound", "outbound"}:
+            directional.append((direction, str(interaction.get("occurred_at") or interaction.get("created_at") or "")))
+        elif interaction:
+            ambiguous_interaction = True
+
+    if lead_id is not None:
+        try:
+            imported, _ = store.list_imported_email_messages(lead_id=int(lead_id), limit=50, app_timezone="UTC")
+            for message in imported:
+                direction = str(message.get("direction") or "").strip().lower()
+                if direction in {"inbound", "outbound"}:
+                    directional.append((direction, str(message.get("occurred_at") or "")))
+        except Exception:
+            pass
+
+    outbound = [when for direction, when in directional if direction == "outbound"]
+    inbound = [when for direction, when in directional if direction == "inbound"]
+    if outbound:
+        latest_outbound = max(outbound)
+        return "Replied" if any(when >= latest_outbound for when in inbound) else "Contacted"
+    if ambiguous_interaction:
+        return "Contact state unavailable"
+    return "No contact evidence"
 
 
 def _collect_emails(lead: Dict[str, Any]) -> List[str]:
@@ -1011,7 +1041,7 @@ def _format_leads(leads: List[Dict[str, Any]], header: str) -> str:
     if not leads:
         return f"{header}\n(none)"
     lines = [header]
-    for lead in leads[:20]:
+    for lead in leads:
         lines.append(
             f"- {lead.get('company_name') or '?'} "
             f"(fit={lead.get('fit_score', 0)}, status={lead.get('status')}, email={lead.get('email_display')})"
@@ -1145,6 +1175,12 @@ def _is_structured_list_intent(intent: Any) -> bool:
         "search_leads",
         "list_emails",
     }
+
+
+def _can_polish_result(result: Dict[str, Any]) -> bool:
+    """Keep application-owned structured results outside the prose LLM path."""
+    data = result.get("data") or {}
+    return not data.get("response_spec") and not _is_structured_list_intent(result.get("intent"))
 
 
 def _norm(text: str) -> str:

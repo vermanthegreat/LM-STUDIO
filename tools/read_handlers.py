@@ -86,6 +86,7 @@ def handle_search_contacts(store: ContactStore, args: BaseModel) -> ToolResult:
             if not any(needle in value.casefold() for value in haystacks if value):
                 continue
         records.append(lead)
+    records.sort(key=lambda row: (str(row.get("company_name") or "").casefold(), int(row.get("id") or 0)))
     total = len(records)
     page = records[params.offset : params.offset + params.limit]
     return ToolResult(
@@ -94,6 +95,10 @@ def handle_search_contacts(store: ContactStore, args: BaseModel) -> ToolResult:
         summary=f"Matched {total} organization(s).",
         records=page,
         record_count=total,
+        total_count=total,
+        returned_count=len(page),
+        requested_count=params.limit,
+        offset=params.offset,
         provenance=["repository:list_leads"],
     )
 
@@ -110,6 +115,7 @@ def handle_find_companies_missing_email(store: ContactStore, args: BaseModel) ->
         detail = store.get_lead(lead["id"]) or lead
         if not _lead_has_email(detail, params.missing_definition, store=store):
             missing.append(lead)
+    missing.sort(key=lambda row: (str(row.get("company_name") or "").casefold(), int(row.get("id") or 0)))
     page = missing[: params.limit]
     warnings = [f"missing_definition={params.missing_definition.value}"]
     warnings.extend(
@@ -127,6 +133,9 @@ def handle_find_companies_missing_email(store: ContactStore, args: BaseModel) ->
         ),
         records=page,
         record_count=len(missing),
+        total_count=len(missing),
+        returned_count=len(page),
+        requested_count=params.limit,
         provenance=["repository:list_leads", "repository:get_lead"],
         warnings=warnings,
     )
@@ -163,6 +172,9 @@ def handle_list_due_followups(store: ContactStore, args: BaseModel) -> ToolResul
         summary=f"Found {len(filtered)} follow-up task(s).",
         records=page,
         record_count=len(filtered),
+        total_count=len(filtered),
+        returned_count=len(page),
+        requested_count=params.limit,
         provenance=["repository:get_followups_due"],
         warnings=warnings,
     )
@@ -208,6 +220,9 @@ def handle_list_unverified_contact_methods(store: ContactStore, args: BaseModel)
         summary=f"Found {len(records)} unverified contact method(s).",
         records=page,
         record_count=len(records),
+        total_count=len(records),
+        returned_count=len(page),
+        requested_count=params.limit,
         provenance=["repository:list_contact_method_records"],
         warnings=warnings,
     )
@@ -242,6 +257,9 @@ def handle_calculate_pipeline_analytics(store: ContactStore, args: BaseModel) ->
         summary=f"{label}={value}",
         records=[{"metric": label, "value": value}],
         record_count=1,
+        total_count=1,
+        returned_count=1,
+        requested_count=1,
         provenance=["repository:get_contact_summary", "repository:get_followups_due"],
         warnings=warnings,
     )
@@ -260,6 +278,9 @@ def _gmail_runtime_error_result(tool_name: str, exc: GmailRuntimeUnsupportedErro
         summary=exc.message,
         records=[],
         record_count=0,
+        total_count=0,
+        returned_count=0,
+        requested_count=0,
         warnings=[exc.error_code],
         provenance=["gmail_runtime:unsupported"],
     )
@@ -290,6 +311,10 @@ def handle_list_email_messages(store: ContactStore, args: BaseModel) -> ToolResu
         summary=summary,
         records=records,
         record_count=total,
+        total_count=total,
+        returned_count=len(records),
+        requested_count=params.limit,
+        offset=params.offset,
         provenance=["repository:list_imported_email_messages"],
     )
 
@@ -318,6 +343,9 @@ def handle_get_email_thread(store: ContactStore, args: BaseModel) -> ToolResult:
         summary=summary,
         records=records,
         record_count=len(records),
+        total_count=len(records),
+        returned_count=len(records),
+        requested_count=len(records),
         provenance=["repository:get_imported_email_thread"],
         warnings=[],
     )

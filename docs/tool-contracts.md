@@ -118,10 +118,20 @@ All tools return:
 - `summary`
 - `records` or `proposal`
 - `record_count`
+- `total_count`, `returned_count`, `requested_count`, and `offset` for
+  unambiguous paginated read results. `record_count` remains the total matching
+  count for compatibility with existing clients.
 - `warnings`
 - `provenance`
 - `command_id`
 
 The communication layer may shorten wording but cannot change identifiers,
 counts, dates, verification states, or warnings.
+
+Ask responses for typed tools additionally include an application-validated
+`response_spec` and `result_metadata` (`total_matching`, `returned`,
+`requested`, and `offset`). Presentation columns are allowlisted by tool; an
+invalid specification falls back to the tool's deterministic default. The
+plain-text `answer` remains a deterministic compatibility projection and does
+not replace the structured records.
 
