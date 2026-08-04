@@ -42,6 +42,7 @@ class AskIntent:
 
 _ALLOWED_INTENTS = {
     "count_leads",
+    "list_leads",
     "top_leads",
     "leads_without_contacts",
     "leads_without_email",
@@ -156,7 +157,7 @@ def answer_question(
         )
         if tool_response.get("intent") != "tool_error":
             answer = tool_response["answer"]
-            if use_llm and tool_response.get("data"):
+            if use_llm and tool_response.get("data") and not _is_structured_list_intent(tool_response.get("intent")):
                 polished = _polish_answer(q, answer, tool_response["data"])
                 if polished:
                     answer = polished
@@ -168,7 +169,7 @@ def answer_question(
     result = _execute_intent(intent, store=store)
     answer = result["answer"]
 
-    if use_llm and result.get("data"):
+    if use_llm and result.get("data") and not _is_structured_list_intent(result.get("intent")):
         polished = _polish_answer(q, answer, result["data"])
         if polished:
             answer = polished
@@ -208,6 +209,9 @@ def _deterministic_intent(question: str) -> AskIntent:
         if any(term in q for term in ("email", "contact", "kontakt")):
             return AskIntent("contact_summary", confidence=1.0)
         return AskIntent("count_leads", confidence=1.0)
+
+    if _is_generic_list_request(q):
+        return AskIntent("list_leads", limit=_extract_limit(q), confidence=1.0)
 
     if any(term in q for term in (
         "all email", "list email", "print email", "show email", "email addresses",
@@ -258,6 +262,7 @@ Return JSON only. No prose. No SQL.
 
 Allowed intents:
 - count_leads
+- list_leads
 - top_leads
 - leads_without_contacts
 - leads_without_email
@@ -345,6 +350,21 @@ def _execute_intent(intent: AskIntent, *, store) -> Dict[str, Any]:
     if intent.name == "count_leads":
         count = store.count_potential_clients()
         return {"intent": intent.name, "answer": f"Imamo {count} potencijalnih klijenata u bazi.", "data": {"count": count}}
+
+    if intent.name == "list_leads":
+        all_leads = store.list_leads()
+        leads = _attach_contact_fields(all_leads[:intent.limit], store=store)
+        data = {
+            "leads": leads,
+            "requested_count": intent.limit,
+            "returned_count": len(leads),
+            "total_available": len(all_leads),
+        }
+        return {
+            "intent": intent.name,
+            "answer": _format_leads(leads, "Companies:"),
+            "data": data,
+        }
 
     if intent.name == "top_leads":
         leads = store.get_top_leads(intent.limit)
@@ -1096,16 +1116,35 @@ def _as_list(value: Any) -> List[str]:
 
 
 def _extract_limit(text: str, default: int = 10) -> int:
-    match = re.search(r"\b(\d{1,2})\b", text)
+    match = re.search(r"\b(\d{1,3})\b", text)
     return _clamp_limit(match.group(1) if match else None, default=default)
 
 
-def _clamp_limit(value: Any, default: int = 10, maximum: int = 25) -> int:
+def _clamp_limit(value: Any, default: int = 10, maximum: int = 250) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return default
     return max(1, min(parsed, maximum))
+
+
+def _is_generic_list_request(question: str) -> bool:
+    return bool(re.search(
+        r"^(?:izlistaj|prikazi|prikaži|list|show)\s+(?:mi\s+)?\d{1,3}\s+"
+        r"(?:kompanij[aeu]?|companies|company|leads?|leadove)$",
+        question,
+    ))
+
+
+def _is_structured_list_intent(intent: Any) -> bool:
+    return intent in {
+        "list_leads",
+        "top_leads",
+        "leads_without_contacts",
+        "leads_without_email",
+        "search_leads",
+        "list_emails",
+    }
 
 
 def _norm(text: str) -> str:

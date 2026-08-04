@@ -1,6 +1,7 @@
 """Tests for database query counts and intent routing."""
 
 import json
+import pytest
 from unittest.mock import patch
 
 import db
@@ -32,6 +33,17 @@ def _seed(db_path):
     )
 
 
+def _seed_many(db_path, count=150):
+    db.init_db(db_path)
+    for index in range(count):
+        db.upsert_lead(
+            {
+                "company_name": f"Company {index:03d}",
+                "fit_score": count - index,
+                "status": "qualified",
+            },
+            db_path=db_path,
+        )
 def test_count_potential_clients(tmp_path):
     db_path = tmp_path / "test.db"
     _seed(db_path)
@@ -146,7 +158,74 @@ def test_parse_llm_intent_limit_clamp() -> None:
 
     payload = json.dumps({"intent": "top_leads", "limit": 30})
     intent = parse_llm_intent_payload(payload)
-    assert intent.limit == 25
+    assert intent.limit == 30
+
+    payload = json.dumps({"intent": "top_leads", "limit": 300})
+    intent = parse_llm_intent_payload(payload)
+    assert intent.limit == 250
+
+
+@pytest.mark.parametrize("limit", [30, 100, 150])
+def test_generic_list_returns_exact_requested_count(tmp_path, limit):
+    db_path = tmp_path / "test.db"
+    _seed_many(db_path)
+
+    result = answer_question(f"izlistaj mi {limit} kompanija", db_path=db_path, use_llm=False)
+
+    assert result["intent"] == "list_leads"
+    assert result["data"]["requested_count"] == limit
+    assert result["data"]["returned_count"] == limit
+    assert result["data"]["total_available"] == 150
+    ids = [lead["id"] for lead in result["data"]["leads"]]
+    assert len(ids) == limit
+    assert len(set(ids)) == limit
+
+
+def test_generic_list_above_available_returns_each_lead_once(tmp_path):
+    db_path = tmp_path / "test.db"
+    _seed_many(db_path, count=42)
+
+    result = answer_question("show 100 leads", db_path=db_path, use_llm=False)
+
+    leads = result["data"]["leads"]
+    assert result["data"] == {
+        "leads": leads,
+        "requested_count": 100,
+        "returned_count": 42,
+        "total_available": 42,
+    }
+    assert len(leads) == 42
+    assert len({lead["id"] for lead in leads}) == 42
+
+
+def test_generic_list_with_llm_cannot_rewrite_structured_rows(tmp_path):
+    db_path = tmp_path / "test.db"
+    _seed_many(db_path, count=30)
+
+    with patch("ask_router._polish_answer", side_effect=AssertionError("structured rows must not be polished")):
+        result = answer_question("prikaži 30 kompanija", db_path=db_path, use_llm=True)
+
+    assert result["intent"] == "list_leads"
+    assert len(result["data"]["leads"]) == 30
+    assert "Company 000" in result["answer"]
+    assert "Company 029" in result["answer"]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "list emails",
+        "show companies without email",
+        "show leads without contacts",
+        "show Gmail messages",
+        "summarize company Acme",
+        "show 30 companies in Shopify",
+    ],
+)
+def test_generic_list_does_not_intercept_other_queries(question):
+    from ask_router import deterministic_ask_intent
+
+    assert deterministic_ask_intent(question) is None or deterministic_ask_intent(question).name != "list_leads"
 
 
 def test_parse_llm_intent_null_fields() -> None:

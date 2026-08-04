@@ -1388,7 +1388,7 @@ def list_leads(
           AND (people_count < 2 OR has_decision_maker = 0)
         ORDER BY fit_score DESC, has_decision_maker ASC, people_count ASC, updated_at DESC"""
     else:
-        sql = base_sql + " ORDER BY l.fit_score DESC, l.updated_at DESC"
+        sql = base_sql + " ORDER BY l.fit_score DESC, l.updated_at DESC, l.id ASC"
     with get_conn(db_path) as conn:
         rows = conn.execute(sql).fetchall()
     result = []
