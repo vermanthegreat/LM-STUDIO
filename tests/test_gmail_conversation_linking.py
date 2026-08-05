@@ -29,3 +29,14 @@ def test_ambiguous_and_counterparty_extraction_are_safe_and_stable():
     assert ambiguous.link_status.value == "ambiguous" and ambiguous.evidence["candidate_lead_ids"] == [1, 3]
     message = _message("operator@example.com", ["z@x.test", "operator@example.com", "a@x.test"], ["z@x.test"])
     assert extract_counterparties(message) == (["a@x.test", "z@x.test"], [])
+
+
+def test_outbound_counterparties_include_to_and_cc_and_strip_aliases():
+    message = _message("operator@example.com", ["z@x.test", "alias@example.com"], ["a@x.test", "z@x.test"])
+    assert extract_counterparties(message, operator_aliases={"alias@example.com"}) == (["a@x.test", "z@x.test"], [])
+
+
+def test_malformed_counterparty_is_ignored_with_warning():
+    message = _message("not-an-address", ["good@x.test"])
+    emails, warnings = extract_counterparties(message)
+    assert emails == [] and warnings == ["malformed_counterparty_address"]

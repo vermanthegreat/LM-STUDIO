@@ -33,3 +33,16 @@ def test_default_full_sync_page_size_is_100_and_fake_failure_is_deterministic():
         assert str(exc) == "injected_page_failure"
     else:
         raise AssertionError("expected injected failure")
+
+
+def test_empty_mailbox_and_repeated_listing_are_deterministic():
+    provider = FakeGmailProvider("empty@example.com")
+    assert provider.list_message_page(page_token=None, max_results=100).messages == []
+    assert provider.list_message_page(page_token=None, max_results=100).model_dump() == provider.list_message_page(page_token=None, max_results=100).model_dump()
+
+
+def test_page_size_contract_clamps_to_safe_range():
+    provider = _provider()
+    assert len(provider.list_message_page(page_token=None, max_results=10).messages) == 10
+    assert len(provider.list_message_page(page_token=None, max_results=500).messages) == 12
+    assert len(provider.list_message_page(page_token=None, max_results=1000).messages) == 12
