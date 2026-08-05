@@ -25,6 +25,19 @@ class LinkStatus(str, Enum):
     AMBIGUOUS = "ambiguous"
 
 
+class GmailMessageRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    thread_id: Optional[str] = None
+
+
+class GmailMessagePage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    messages: list[GmailMessageRef] = Field(default_factory=list)
+    next_page_token: Optional[str] = None
+    result_size_estimate: Optional[int] = None
+
+
 class PrimaryIntent(str, Enum):
     OUTREACH = "outreach"
     POSITIVE_INTEREST = "positive_interest"

@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS gmail_messages (
     requires_followup INTEGER NOT NULL DEFAULT 0,
     lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
     person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+    link_reason TEXT NOT NULL DEFAULT 'unmatched',
+    link_strength INTEGER NOT NULL DEFAULT 0,
+    link_evidence_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -82,6 +85,48 @@ CREATE TABLE IF NOT EXISTS gmail_sync_state (
     last_error_code TEXT,
     reauthorization_required INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS gmail_mailbox_sync_state (
+    external_account TEXT NOT NULL,
+    sync_mode TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'not_started',
+    started_at TEXT, updated_at TEXT, completed_at TEXT,
+    next_page_token TEXT, pages_processed INTEGER NOT NULL DEFAULT 0,
+    messages_discovered INTEGER NOT NULL DEFAULT 0, messages_processed INTEGER NOT NULL DEFAULT 0,
+    messages_imported INTEGER NOT NULL DEFAULT 0, messages_updated INTEGER NOT NULL DEFAULT 0,
+    messages_already_present INTEGER NOT NULL DEFAULT 0, messages_failed INTEGER NOT NULL DEFAULT 0,
+    last_error_code TEXT, latest_history_id TEXT,
+    PRIMARY KEY (external_account, sync_mode)
+);
+
+CREATE TABLE IF NOT EXISTS gmail_conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_account TEXT NOT NULL, external_thread_id TEXT NOT NULL,
+    lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+    primary_person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+    link_status TEXT NOT NULL, link_reason TEXT NOT NULL, link_confidence INTEGER NOT NULL DEFAULT 0,
+    link_evidence_json TEXT,
+    message_count INTEGER NOT NULL, first_message_at TEXT, last_message_at TEXT,
+    first_outbound_at TEXT, last_outbound_at TEXT, first_inbound_at TEXT, last_inbound_at TEXT,
+    last_message_direction TEXT, last_subject TEXT, requires_reply INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(external_account, external_thread_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gmail_conversations_lead ON gmail_conversations(lead_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_conversations_person ON gmail_conversations(primary_person_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_conversations_status ON gmail_conversations(link_status);
+CREATE INDEX IF NOT EXISTS idx_gmail_conversations_latest ON gmail_conversations(last_message_at);
+CREATE INDEX IF NOT EXISTS idx_gmail_conversations_reply ON gmail_conversations(requires_reply);
+
+CREATE TABLE IF NOT EXISTS lead_communication_state (
+    lead_id INTEGER PRIMARY KEY REFERENCES leads(id) ON DELETE CASCADE,
+    contacted INTEGER NOT NULL DEFAULT 0, first_contacted_at TEXT, last_contacted_at TEXT,
+    replied INTEGER NOT NULL DEFAULT 0, first_reply_at TEXT, last_reply_at TEXT,
+    last_message_at TEXT, last_message_direction TEXT, last_thread_id TEXT,
+    primary_person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+    primary_external_email TEXT, conversation_count INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0, requires_reply INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+);
 """
 
 
@@ -98,12 +143,100 @@ def ensure_gmail_tables(conn: sqlite3.Connection) -> None:
         )
     if "target_company_name" not in columns:
         conn.execute("ALTER TABLE gmail_messages ADD COLUMN target_company_name TEXT")
+    if "link_reason" not in columns:
+        conn.execute("ALTER TABLE gmail_messages ADD COLUMN link_reason TEXT NOT NULL DEFAULT 'unmatched'")
+    if "link_strength" not in columns:
+        conn.execute("ALTER TABLE gmail_messages ADD COLUMN link_strength INTEGER NOT NULL DEFAULT 0")
+    if "link_evidence_json" not in columns:
+        conn.execute("ALTER TABLE gmail_messages ADD COLUMN link_evidence_json TEXT")
+    conv_columns = {row["name"] for row in conn.execute("PRAGMA table_info(gmail_conversations)").fetchall()}
+    if "link_evidence_json" not in conv_columns:
+        conn.execute("ALTER TABLE gmail_conversations ADD COLUMN link_evidence_json TEXT")
     sync_columns = {row["name"] for row in conn.execute("PRAGMA table_info(gmail_sync_state)").fetchall()}
     if "reauthorization_required" not in sync_columns:
         conn.execute(
             "ALTER TABLE gmail_sync_state ADD COLUMN reauthorization_required INTEGER NOT NULL DEFAULT 0"
         )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gmail_messages_role ON gmail_messages(message_role)")
+
+
+def get_mailbox_sync_state(conn: sqlite3.Connection, *, external_account: str) -> Dict[str, Any]:
+    row = conn.execute("SELECT * FROM gmail_mailbox_sync_state WHERE external_account = ? AND sync_mode = 'full_mailbox'", (external_account.lower(),)).fetchone()
+    if row is None:
+        now = _now()
+        conn.execute("INSERT INTO gmail_mailbox_sync_state (external_account, sync_mode, status, updated_at) VALUES (?, 'full_mailbox', 'not_started', ?)", (external_account.lower(), now))
+        row = conn.execute("SELECT * FROM gmail_mailbox_sync_state WHERE external_account = ? AND sync_mode = 'full_mailbox'", (external_account.lower(),)).fetchone()
+    return dict(row) if row else {}
+
+
+def update_mailbox_sync_state(conn: sqlite3.Connection, *, external_account: str, status: str, next_page_token: Optional[str], counts: SyncResultCounts, pages_processed: int, last_error_code: Optional[str] = None, completed: bool = False) -> None:
+    previous = get_mailbox_sync_state(conn, external_account=external_account)
+    now = _now()
+    conn.execute("""UPDATE gmail_mailbox_sync_state SET status=?, started_at=COALESCE(started_at, ?), updated_at=?, completed_at=?, next_page_token=?, pages_processed=?, messages_discovered=?, messages_processed=?, messages_imported=?, messages_updated=?, messages_already_present=?, messages_failed=?, last_error_code=? WHERE external_account=? AND sync_mode='full_mailbox'""", (status, now, now, now if completed else previous.get("completed_at"), next_page_token, pages_processed, int(previous.get("messages_discovered") or 0) + counts.discovered, int(previous.get("messages_processed") or 0) + counts.discovered, int(previous.get("messages_imported") or 0) + counts.imported, int(previous.get("messages_updated") or 0) + counts.updated, int(previous.get("messages_already_present") or 0) + counts.already_present, int(previous.get("messages_failed") or 0) + counts.failed, last_error_code, external_account.lower()))
+
+
+def rebuild_gmail_projections(conn: sqlite3.Connection) -> None:
+    """Rebuild only derived CRM views from immutable Gmail source/message evidence."""
+    now = _now()
+    conn.execute("DELETE FROM gmail_conversations")
+    rows = conn.execute("""SELECT gm.*, gs.external_account, gs.external_thread_id, gs.external_message_id
+        FROM gmail_messages gm JOIN gmail_sources gs ON gs.id=gm.gmail_source_id
+        ORDER BY gs.external_account, gs.external_thread_id, gm.occurred_at, gs.external_message_id""").fetchall()
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row); groups.setdefault((item["external_account"], item["external_thread_id"]), []).append(item)
+    for (account, thread), messages in groups.items():
+        lead_ids = {m["lead_id"] for m in messages if m["link_status"] == "linked" and m["lead_id"] is not None and int(m.get("link_strength") or 0) >= 200}
+        if len(lead_ids) > 1:
+            status, reason, strength, lead_id, person_id = "ambiguous", "conflicting_thread_links", 0, None, None
+        elif lead_ids:
+            lead_id = int(next(iter(lead_ids))); ranked = [m for m in messages if m["lead_id"] == lead_id]
+            strongest = max(ranked, key=lambda m: (int(m.get("link_strength") or 0), -int(m["id"])))
+            people = [m["person_id"] for m in ranked if m["person_id"] is not None and int(m.get("link_strength") or 0) >= 500]
+            status, reason, strength, person_id = "linked", strongest.get("link_reason") or "thread_inherited", int(strongest.get("link_strength") or 0), min(people) if people else None
+        else:
+            status, reason, strength, lead_id, person_id = "unlinked", "unmatched", 0, None, None
+        latest = messages[-1]
+        evidence = _json_loads(str(strongest.get("link_evidence_json") if lead_ids else ""), {}) if lead_ids else {}
+        if status == "ambiguous":
+            evidence = {"candidate_lead_ids": sorted(lead_ids), "reason": reason}
+        real_latest = latest["message_role"] == "conversation_message" and latest["primary_intent"] != "automated" and not latest.get("classification_warning")
+        requires_reply = bool(latest["direction"] == "inbound" and real_latest)
+        outbound = [m["occurred_at"] for m in messages if m["direction"] == "outbound"]
+        inbound = [m["occurred_at"] for m in messages if m["direction"] == "inbound"]
+        conn.execute("""INSERT INTO gmail_conversations (external_account,external_thread_id,lead_id,primary_person_id,link_status,link_reason,link_confidence,link_evidence_json,message_count,first_message_at,last_message_at,first_outbound_at,last_outbound_at,first_inbound_at,last_inbound_at,last_message_direction,last_subject,requires_reply,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (account,thread,lead_id,person_id,status,reason,strength,_json_dumps(evidence),len(messages),messages[0]["occurred_at"],latest["occurred_at"],outbound[0] if outbound else None,outbound[-1] if outbound else None,inbound[0] if inbound else None,inbound[-1] if inbound else None,latest["direction"],latest["subject"],int(requires_reply),now,now))
+    conn.execute("DELETE FROM lead_communication_state")
+    leads = conn.execute("SELECT DISTINCT lead_id FROM gmail_conversations WHERE lead_id IS NOT NULL AND link_status='linked'").fetchall()
+    for lead_row in leads:
+        lead_id = int(lead_row[0]); conversations = [dict(r) for r in conn.execute("SELECT * FROM gmail_conversations WHERE lead_id=? AND link_status='linked' ORDER BY last_message_at, id", (lead_id,)).fetchall()]
+        messages = [dict(r) for r in conn.execute("SELECT gm.*, gs.external_thread_id FROM gmail_messages gm JOIN gmail_sources gs ON gs.id=gm.gmail_source_id WHERE gm.lead_id=? ORDER BY gm.occurred_at, gs.external_message_id", (lead_id,)).fetchall()]
+        outbound = [m for m in messages if m["direction"] == "outbound"]
+        first = outbound[0]["occurred_at"] if outbound else None
+        inbound = [m for m in messages if first and m["direction"] == "inbound" and m["occurred_at"] >= first and m["message_role"] == "conversation_message" and m["primary_intent"] != "automated"]
+        latest = conversations[-1] if conversations else {}
+        conn.execute("INSERT INTO lead_communication_state (lead_id,contacted,first_contacted_at,last_contacted_at,replied,first_reply_at,last_reply_at,last_message_at,last_message_direction,last_thread_id,primary_person_id,primary_external_email,conversation_count,message_count,requires_reply,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (lead_id,int(bool(outbound)),first,outbound[-1]["occurred_at"] if outbound else None,int(bool(inbound)),inbound[0]["occurred_at"] if inbound else None,inbound[-1]["occurred_at"] if inbound else None,latest.get("last_message_at"),latest.get("last_message_direction"),latest.get("external_thread_id"),latest.get("primary_person_id"),None,len(conversations),len(messages),int(any(c["requires_reply"] for c in conversations)),now))
+
+
+def list_conversations(conn: sqlite3.Connection, *, bucket: str, lead_id: Optional[int] = None, limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    clauses: list[str] = []; params: list[Any] = []
+    if bucket == "agencies": clauses.append("c.link_status='linked' AND c.lead_id IS NOT NULL")
+    elif bucket == "ambiguous": clauses.append("c.link_status='ambiguous'")
+    elif bucket == "unmatched": clauses.append("c.link_status='unlinked' AND c.lead_id IS NULL")
+    elif bucket != "all": raise ValueError("invalid conversation bucket")
+    if lead_id is not None: clauses.append("c.lead_id=?"); params.append(lead_id)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    count = conn.execute("SELECT COUNT(*) FROM gmail_conversations c" + where, params).fetchone()[0]
+    rows = conn.execute("SELECT c.*, l.company_name, p.name AS person_name FROM gmail_conversations c LEFT JOIN leads l ON l.id=c.lead_id LEFT JOIN people p ON p.id=c.primary_person_id" + where + " ORDER BY c.last_message_at DESC, c.id ASC LIMIT ? OFFSET ?", [*params, max(1,min(limit,100)), max(0,offset)]).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row); evidence = _json_loads(item.get("link_evidence_json"), {})
+        ids = sorted({int(value) for value in evidence.get("candidate_lead_ids", []) if str(value).isdigit()})
+        people = sorted({int(value) for value in evidence.get("candidate_person_ids", []) if str(value).isdigit()})
+        item["candidate_agencies"] = [dict(r) for r in conn.execute("SELECT id, company_name FROM leads WHERE id IN (%s) ORDER BY id" % ",".join("?" * len(ids)), ids).fetchall()] if ids else []
+        item["candidate_people"] = [dict(r) for r in conn.execute("SELECT id, name, lead_id, email FROM people WHERE id IN (%s) ORDER BY id" % ",".join("?" * len(people)), people).fetchall()] if people else []
+        item["ambiguity_reason"] = item.get("link_reason")
+        result.append(item)
+    return result, int(count)
 
 
 def _json_dumps(value: Any) -> Optional[str]:
@@ -380,7 +513,7 @@ def find_thread_links(
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT gm.lead_id, gm.person_id, gm.link_status
+        SELECT gm.lead_id, gm.person_id, gm.link_status, gm.link_reason, gm.link_strength
         FROM gmail_messages gm
         JOIN gmail_sources gs ON gs.id = gm.gmail_source_id
         WHERE gs.external_account = ?

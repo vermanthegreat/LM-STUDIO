@@ -54,7 +54,10 @@
       <form method="post" action="/integrations/gmail/sync">
         <button type="submit" {% if not status.enabled %}disabled{% endif %}>Sync Gmail</button>
       </form>
-      <p class="muted-copy">Read-only import from the <code>{{ status.configured_label }}</code> label. Gmail is never modified.</p>
+      <form method="post" action="/integrations/gmail/full-sync">
+        <button type="submit" {% if not status.enabled %}disabled{% endif %}>Sync next mailbox page</button>
+      </form>
+      <p class="muted-copy">Label sync stays limited to <code>{{ status.configured_label }}</code>. Full sync imports bounded Inbox, Sent, and archived pages; Spam and Trash are excluded. Gmail is never modified.</p>
       <details class="gmail-diagnostics">
         <summary>Technical details</summary>
         <dl>

@@ -7,7 +7,7 @@ from typing import Any, Optional
 import os
 import tempfile
 
-from gmail_schemas import GMAIL_READONLY_SCOPE, NormalizedGmailMessage
+from gmail_schemas import GMAIL_READONLY_SCOPE, GmailMessagePage, GmailMessageRef, NormalizedGmailMessage
 from providers.gmail_normalize import normalize_gmail_api_message
 
 try:
@@ -98,6 +98,26 @@ class GmailProviderAdapter:
         if page_token:
             kwargs["pageToken"] = page_token
         return self._service.users().messages().list(**kwargs).execute()
+
+    def list_message_page(
+        self, *, page_token: Optional[str], max_results: int,
+        label_ids: Optional[list[str]] = None, query: Optional[str] = None,
+        include_spam_trash: bool = False,
+    ) -> GmailMessagePage:
+        kwargs: dict[str, Any] = {"userId": "me", "maxResults": max(10, min(max_results, 500)),
+                                  "includeSpamTrash": include_spam_trash}
+        if page_token:
+            kwargs["pageToken"] = page_token
+        if label_ids:
+            kwargs["labelIds"] = label_ids
+        if query:
+            kwargs["q"] = query
+        response = self._service.users().messages().list(**kwargs).execute()
+        return GmailMessagePage(
+            messages=[GmailMessageRef(id=str(item["id"]), thread_id=item.get("threadId")) for item in response.get("messages") or []],
+            next_page_token=response.get("nextPageToken"),
+            result_size_estimate=response.get("resultSizeEstimate"),
+        )
 
     def get_message(self, message_id: str) -> NormalizedGmailMessage:
         api_message = (

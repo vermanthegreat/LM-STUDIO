@@ -39,6 +39,7 @@ class AppConfig:
     gmail_token_path: Path | None = None
     gmail_sync_label: str = "LMStudio"
     gmail_sync_limit: int = 100
+    gmail_full_sync_page_size: int = 100
     app_timezone: str = "Asia/Jerusalem"
 
     @classmethod
@@ -63,5 +64,6 @@ class AppConfig:
             gmail_token_path=Path(token_path) if token_path else None,
             gmail_sync_label=os.getenv("GMAIL_SYNC_LABEL", "LMStudio").strip() or "LMStudio",
             gmail_sync_limit=_env_int("GMAIL_SYNC_LIMIT", 100),
+            gmail_full_sync_page_size=max(10, min(_env_int("GMAIL_FULL_SYNC_PAGE_SIZE", 100), 500)),
             app_timezone=os.getenv("APP_TIMEZONE", "Asia/Jerusalem").strip() or "Asia/Jerusalem",
         )

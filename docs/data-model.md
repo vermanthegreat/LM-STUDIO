@@ -237,3 +237,11 @@ Singleton operator sync status (one row, `id = 1`):
 - Ambiguous temporal phrases (e.g. "next week") are persisted as unresolved or
   ambiguous signals, not guessed into concrete deadlines.
 
+### Gmail G1 SQLite projections
+
+`gmail_messages` additionally persists a bounded link reason, integer evidence
+strength, and safe structured evidence projection. `gmail_conversations` is a
+rebuildable `(external_account, external_thread_id)` projection and
+`lead_communication_state` is a rebuildable agency communication summary.
+These additive SQLite tables do not introduce PostgreSQL Gmail runtime parity.
+

@@ -19,6 +19,7 @@
   </header>
   <main>
     {% if runtime_error %}<div class="msg">{{ runtime_error }}</div>{% endif %}
+    <nav class="email-buckets"><a href="/emails?bucket=agencies">Agencies</a><a href="/emails?bucket=ambiguous">Ambiguous</a><a href="/emails?bucket=unmatched">Unmatched / Other</a><a href="/emails?bucket=all">All Mail</a></nav>
     <div class="card">
       <form method="get" action="/emails">
         <label>Intent <input name="intent" value="{{ filters.intent }}"></label>
@@ -49,6 +50,9 @@
         <tbody>
           {% for row in emails %}
           <tr>
+            {% if conversation_mode %}
+            <td>{{ row.last_message_at or row.occurred_at_local }}</td><td>{{ row.external_account or "n/a" }}</td><td>{{ row.last_message_direction or row.direction }}</td><td>{{ row.company_name or "Unmatched / Other" }}</td><td>{{ row.last_subject or row.subject or "(no subject)" }}</td><td>{{ row.message_count or "" }}</td><td>{{ row.person_name or "n/a" }}</td><td>{{ row.requires_reply and "Requires reply" or "" }}</td><td>{{ row.link_status }}{% if row.link_status == "ambiguous" %}<br><small>Reason: {{ row.ambiguity_reason }}</small>{% for agency in row.candidate_agencies %}<br><a href="/leads/{{ agency.id }}">{{ agency.company_name }} (Lead {{ agency.id }})</a>{% endfor %}{% for person in row.candidate_people %}<br><small>{{ person.name or "Person" }} (Person {{ person.id }})</small>{% endfor %}{% endif %}</td><td><a href="/emails/thread/{{ row.external_thread_id }}">{{ row.external_thread_id[:12] }}</a></td>
+            {% else %}
             <td>{{ row.occurred_at_local }}</td>
             <td>{{ row.external_account or "n/a" }}</td>
             <td>{{ row.direction }}</td>
@@ -81,6 +85,7 @@
             <td>{% if row.requires_followup %}<span class="badge warn">follow-up</span>{% endif %} {{ row.markers|join(", ") }}</td>
             <td>{{ row.link_status }}</td>
             <td><a href="/emails/thread/{{ row.external_thread_id }}">{{ row.thread_short }}</a><br><small>ID: {{ row.message_short }}</small></td>
+            {% endif %}
           </tr>
           {% if row.classification_warning %}
           <tr><td colspan="11">Warning: {{ row.classification_warning }}</td></tr>
@@ -90,6 +95,8 @@
           {% endfor %}
         </tbody>
       </table>
+      {% if offset > 0 %}<a href="/emails?bucket={{ bucket }}&offset={{ [offset - filters.limit, 0]|max }}&limit={{ filters.limit }}">Previous</a>{% endif %}
+      {% if offset + emails|length < total %}<a href="/emails?bucket={{ bucket }}&offset={{ offset + filters.limit }}&limit={{ filters.limit }}">Next</a>{% endif %}
     </div>
   </main>
 </body>

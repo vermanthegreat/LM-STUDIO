@@ -139,7 +139,7 @@ Configuration must be environment-driven and validated at startup:
 
 Secrets never belong in `.env.example`, logs, prompts, or committed fixtures.
 
-## Gmail provider boundary (Phase G0)
+## Gmail provider boundary (G0/G1 SQLite runtime)
 
 Gmail G0 is a bounded read-only intake path:
 
@@ -177,6 +177,16 @@ SQLite gmail_* tables  (supported runtime)
   schema, but Gmail sync and query operations are **SQLite-only** in G0.
   PostgreSQL runtime requests fail closed with
   `gmail_postgresql_runtime_unsupported` rather than returning empty results.
+- **Full mailbox intake (G1):** `POST /integrations/gmail/full-sync` imports a
+  bounded page (10–500, default 100) at a time, excluding Spam and Trash.
+  Its account-scoped cursor is persisted only after a page completes; provider
+  page errors retain the prior cursor. Gmail remains read-only.
+- **Conversation projections (G1):** SQLite rebuilds thread and agency
+  communication projections solely from locally persisted Gmail evidence.
+  Links use ranked deterministic evidence: exact person email, exact company
+  email, inherited exact thread evidence, then a unique non-public company
+  domain. Ambiguous evidence is never guessed. PostgreSQL full-mailbox Gmail
+  runtime remains unsupported and fail-closed.
 - **`/ask` reads:** `list_email_messages` and `get_email_thread` read the local
   database only; they do not call Gmail during ordinary `/ask` queries.
 

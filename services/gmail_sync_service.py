@@ -98,6 +98,14 @@ class _SqliteGmailLinkAdapter:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def find_company_domain_matches(self, domain: str) -> list[dict[str, Any]]:
+        import db
+        query = "SELECT id AS lead_id FROM leads WHERE lower(domain)=? OR lower(substr(company_email, instr(company_email, '@') + 1))=?"
+        if self.conn is not None:
+            return [dict(row) for row in self.conn.execute(query, (domain.lower(), domain.lower())).fetchall()]
+        with db.get_conn(self.store.database_path) as conn:
+            return [dict(row) for row in conn.execute(query, (domain.lower(), domain.lower())).fetchall()]
+
 
 def _provider_from_config(cfg: AppConfig, provider: Any | None) -> Any:
     if provider is not None:
@@ -138,6 +146,11 @@ def _persist_message(
     )
     link_adapter = _SqliteGmailLinkAdapter(store, conn)
     link: LinkDecision = resolve_contact_link(link_adapter, normalized)
+    def _persist_link_metadata(source_id: int) -> None:
+        old = conn.execute("SELECT link_strength FROM gmail_messages WHERE gmail_source_id=?", (source_id,)).fetchone()
+        if old and int(old["link_strength"] or 0) > link.strength and link.link_status.value != "ambiguous":
+            return
+        conn.execute("UPDATE gmail_messages SET link_reason=?, link_strength=?, link_evidence_json=? WHERE gmail_source_id=?", (link.reason, link.strength, gmail_db._json_dumps(link.evidence), source_id))
     if link.link_status.value == "linked":
         counts.linked += 1
     elif link.link_status.value == "ambiguous":
@@ -209,6 +222,7 @@ def _persist_message(
             lead_id=link.lead_id,
             person_id=link.person_id,
         )
+        _persist_link_metadata(int(source["id"]))
         counts.imported += 1
         return
 
@@ -238,6 +252,7 @@ def _persist_message(
             lead_id=link.lead_id,
             person_id=link.person_id,
         )
+        _persist_link_metadata(int(existing["id"]))
         counts.updated += 1
         return
 
@@ -259,6 +274,7 @@ def _persist_message(
         or message_row.get("lead_id") != link.lead_id
         or message_row.get("person_id") != link.person_id
     )
+    _persist_link_metadata(int(existing["id"]))
     if not semantic_changed and existing.get("content_hash") == content_hash:
         return
 
@@ -484,6 +500,68 @@ def sync_gmail_label(
             ),
             entry,
         )
+
+
+def sync_gmail_full_mailbox(
+    store: Any, cfg: AppConfig, *, provider: Any | None = None, use_llm: bool = True,
+    restart: bool = False, max_pages: int = 1,
+) -> GmailSyncResult:
+    """Import bounded mailbox pages.  A page token is committed only after its page finishes."""
+    import db
+    import gmail_db
+    try:
+        require_gmail_sqlite_runtime(store)
+        gmail_provider = _provider_from_config(cfg, provider)
+        profile = gmail_provider.get_account_profile()
+        account = (profile.get("email") or getattr(gmail_provider, "account_email", "")).lower()
+        if not account:
+            raise GmailConfigurationError("gmail_profile_unavailable", "Could not read Gmail account profile.")
+        counts = SyncResultCounts(); pages = 0
+        with db.get_conn(store.database_path) as conn:
+            gmail_db.ensure_gmail_tables(conn)
+            state = gmail_db.get_mailbox_sync_state(conn, external_account=account)
+            token = None if restart else state.get("next_page_token")
+            if restart:
+                conn.execute("DELETE FROM gmail_mailbox_sync_state WHERE external_account=? AND sync_mode='full_mailbox'", (account,))
+                state = gmail_db.get_mailbox_sync_state(conn, external_account=account)
+            for _ in range(max(1, min(max_pages, 10))):
+                try:
+                    page = gmail_provider.list_message_page(page_token=token, max_results=cfg.gmail_full_sync_page_size, include_spam_trash=False)
+                except Exception:
+                    gmail_db.update_mailbox_sync_state(conn, external_account=account, status="failed", next_page_token=token, counts=counts, pages_processed=int(state.get("pages_processed") or 0) + pages, last_error_code="gmail_page_failed")
+                    return GmailSyncResult(status="error", counts=counts, error_code="gmail_page_failed", message="Mailbox page could not be listed; resume will retry this page.")
+                counts.discovered += len(page.messages)
+                for ref in page.messages:
+                    try:
+                        _persist_message(conn, store, cfg, gmail_provider.get_message(ref.id), counts, use_llm=use_llm)
+                    except Exception:
+                        logger.exception("failed importing gmail message %s", ref.id)
+                        counts.failed += 1
+                pages += 1
+                token = page.next_page_token
+                completed = token is None
+                gmail_db.rebuild_gmail_projections(conn)
+                gmail_db.update_mailbox_sync_state(conn, external_account=account, status="completed" if completed else ("partial" if counts.failed else "running"), next_page_token=token, counts=counts, pages_processed=int(state.get("pages_processed") or 0) + pages, completed=completed)
+                if completed:
+                    break
+            return GmailSyncResult(status="ok", counts=counts, warnings=[] if counts.failed == 0 else ["Some messages failed; completed page checkpoints were retained."])
+    except GmailRuntimeUnsupportedError as exc:
+        return GmailSyncResult(status="error", counts=SyncResultCounts(), error_code=exc.error_code, message=exc.message)
+    except GmailConfigurationError as exc:
+        return GmailSyncResult(status="error", counts=SyncResultCounts(), error_code=exc.error_code, message=exc.message)
+    except Exception:
+        logger.exception("full Gmail sync failed")
+        return GmailSyncResult(status="error", counts=SyncResultCounts(), error_code="gmail_sync_failed", message="Gmail mailbox synchronization failed.")
+
+
+def rebuild_gmail_mailbox_projections(store: Any) -> None:
+    """Local-only idempotent backfill; it never calls a Gmail provider."""
+    import db
+    import gmail_db
+    require_gmail_sqlite_runtime(store)
+    with db.get_conn(store.database_path) as conn:
+        gmail_db.ensure_gmail_tables(conn)
+        gmail_db.rebuild_gmail_projections(conn)
 
 
 def gmail_integration_status(store: Any, cfg: AppConfig) -> dict[str, Any]:

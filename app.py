@@ -27,7 +27,7 @@ from extractor import parse_and_save
 from intake import validate_parse_intake
 from repositories.factory import get_contact_store
 from security import assert_safe_mutation_request
-from services.gmail_sync_service import gmail_integration_status, sync_gmail_label
+from services.gmail_sync_service import gmail_integration_status, sync_gmail_full_mailbox, sync_gmail_label
 
 load_dotenv()
 
@@ -293,9 +293,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             },
         )
 
+    @application.post("/integrations/gmail/full-sync", response_class=HTMLResponse)
+    def gmail_full_sync(request: Request):
+        assert_safe_mutation_request(request, port=cfg.port)
+        result = sync_gmail_full_mailbox(request.app.state.store, cfg)
+        return RedirectResponse(url="/integrations/gmail?msg=" + quote(result.message or f"Full mailbox sync: {result.status}."), status_code=303)
+
     @application.get("/emails", response_class=HTMLResponse)
     def emails_list(
         request: Request,
+        bucket: str = "",
+        offset: int = 0,
         intent: str = "",
         marker: str = "",
         direction: str = "",
@@ -307,16 +315,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         runtime_error: str | None = None
         records: list = []
         total = 0
+        conversation_mode = False
         try:
-            records, total = store.list_imported_email_messages(
-                intent=intent or None,
-                marker=marker or None,
-                direction=direction or None,
-                link_status=link_status or None,
-                since=since or None,
-                limit=min(max(limit, 1), 100),
-                app_timezone=cfg.app_timezone,
-            )
+            bounded_limit = min(max(limit, 1), 100)
+            if bucket in {"agencies", "ambiguous", "unmatched", "all"} and not any([intent, marker, direction, link_status, since]):
+                conversation_mode = True
+                method = {"agencies": store.list_agency_conversations, "ambiguous": store.list_ambiguous_conversations, "unmatched": store.list_unmatched_conversations, "all": store.list_all_conversations}[bucket]
+                records, total = method(offset=max(offset, 0), limit=bounded_limit)
+            else:
+                records, total = store.list_imported_email_messages(intent=intent or None, marker=marker or None, direction=direction or None, link_status=link_status or None, since=since or None, limit=bounded_limit, offset=max(offset, 0), app_timezone=cfg.app_timezone)
         except GmailRuntimeUnsupportedError as exc:
             runtime_error = exc.message
         return templates.TemplateResponse(
@@ -326,6 +333,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "request": request,
                 "emails": records,
                 "total": total,
+                "bucket": bucket if bucket in {"agencies", "ambiguous", "unmatched", "all"} else "all",
+                "offset": max(offset, 0),
+                "conversation_mode": conversation_mode,
                 "runtime_error": runtime_error,
                 "filters": {
                     "intent": intent,

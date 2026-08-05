@@ -274,6 +274,25 @@ class SqliteContactStore:
             )
         return [gmail_db.row_to_public_dict(row, app_timezone=app_timezone) for row in rows]
 
+    def list_agency_conversations(self, lead_id: Optional[int] = None, offset: int = 0, limit: int = 50) -> tuple[List[Dict[str, Any]], int]:
+        return self._list_conversations("agencies", lead_id, offset, limit)
+
+    def list_ambiguous_conversations(self, offset: int = 0, limit: int = 50) -> tuple[List[Dict[str, Any]], int]:
+        return self._list_conversations("ambiguous", None, offset, limit)
+
+    def list_unmatched_conversations(self, offset: int = 0, limit: int = 50) -> tuple[List[Dict[str, Any]], int]:
+        return self._list_conversations("unmatched", None, offset, limit)
+
+    def list_all_conversations(self, offset: int = 0, limit: int = 50) -> tuple[List[Dict[str, Any]], int]:
+        return self._list_conversations("all", None, offset, limit)
+
+    def _list_conversations(self, bucket: str, lead_id: Optional[int], offset: int, limit: int) -> tuple[List[Dict[str, Any]], int]:
+        import gmail_db
+        gmail_db.init_gmail_db(self.database_path)
+        with db.get_conn(self.database_path) as conn:
+            gmail_db.ensure_gmail_tables(conn)
+            return gmail_db.list_conversations(conn, bucket=bucket, lead_id=lead_id, offset=offset, limit=limit)
+
     def enqueue_research_job(self, job: ResearchJobCreate) -> ResearchJobRecord:
         return db.enqueue_research_job(job, **self._kwargs())
 

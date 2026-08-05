@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from gmail_schemas import EmailAddress, NormalizedGmailMessage
+from gmail_schemas import EmailAddress, GmailMessagePage, GmailMessageRef, NormalizedGmailMessage
 
 
 class FakeGmailProvider:
@@ -19,6 +19,7 @@ class FakeGmailProvider:
         self._messages: dict[str, dict[str, Any]] = {}
         self._threads: dict[str, list[str]] = {}
         self.list_message_calls: list[dict[str, Any]] = []
+        self.fail_page_token: Optional[str] = None
 
     def seed_message(
         self,
@@ -94,6 +95,21 @@ class FakeGmailProvider:
 
         api_message = self._messages[message_id]
         return normalize_gmail_api_message(self.account_email, api_message)
+
+    def list_message_page(self, *, page_token: Optional[str], max_results: int,
+                          label_ids: Optional[list[str]] = None, query: Optional[str] = None,
+                          include_spam_trash: bool = False) -> GmailMessagePage:
+        del query
+        if self.fail_page_token is not None and self.fail_page_token == page_token:
+            raise RuntimeError("injected_page_failure")
+        size = max(10, min(max_results, 500))
+        start = int(page_token or "0")
+        items = [m for m in self._messages.values() if (not label_ids or any(label in (m.get("labelIds") or []) for label in label_ids))]
+        if not include_spam_trash:
+            items = [m for m in items if "SPAM" not in (m.get("labelIds") or []) and "TRASH" not in (m.get("labelIds") or [])]
+        chunk = items[start:start + size]
+        next_token = str(start + size) if start + size < len(items) else None
+        return GmailMessagePage(messages=[GmailMessageRef(id=m["id"], thread_id=m.get("threadId")) for m in chunk], next_page_token=next_token, result_size_estimate=len(items))
 
     def get_thread(self, thread_id: str) -> list[NormalizedGmailMessage]:
         from providers.gmail_normalize import normalize_gmail_api_message
