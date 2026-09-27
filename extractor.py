@@ -9,7 +9,8 @@ from urllib.parse import parse_qs, urlparse
 
 import db
 from llm import EXTRACTION_SYSTEM, extract_structured
-from scoring import classify_person_title, compute_fit_score
+from extraction_schema import extraction_to_dict, try_validate_extraction
+from scoring import compute_fit_score, derive_person_role_fields
 
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
@@ -30,6 +31,13 @@ TIER_RATING_RE = re.compile(
     re.I,
 )
 LINKEDIN_RE = re.compile(r"https?://(?:www\.)?linkedin\.com/[^\s<>\"']+", re.I)
+LINKEDIN_COMPANY_URL_RE = re.compile(
+    r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/[^\s<>\"']+", re.I
+)
+LINKEDIN_DEGREE_RE = re.compile(
+    r"^(?P<name>.+?)\s+(?:1st|2nd|3rd)\+?\s+degree connection$", re.I
+)
+LINKEDIN_DEGREE_DECORATION_RE = re.compile(r"^(?:Â·|·)?\s*(?:1st|2nd|3rd)$", re.I)
 DATE_RE = re.compile(
     r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|"
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b",
@@ -41,6 +49,39 @@ TIER_LINE_RE = re.compile(
 )
 RATING_LINE_RE = re.compile(r"^\d+(?:\.\d+)?$")
 REVIEW_COUNT_LINE_RE = re.compile(r"^\((\d+)\)$")
+ADDITIONAL_COUNT_RE = re.compile(r"^\+(\d+)\s+more$", re.I)
+
+SHOPIFY_PROFILE_MARKERS = (
+    "service partner",
+    "partner since",
+    "contact information",
+    "primary location",
+    "supported locations",
+    "languages",
+    "specialized services",
+)
+
+# Conservative subset of LinkedIn's standard company-industry labels.  Header
+# metadata is split only when one of these labels is an exact prefix.
+LINKEDIN_INDUSTRY_VOCABULARY = (
+    "Advertising Services",
+    "Business Consulting and Services",
+    "Design Services",
+    "Financial Services",
+    "Hospitals and Health Care",
+    "IT Services and IT Consulting",
+    "Marketing Services",
+    "Professional Services",
+    "Retail",
+    "Retail Apparel and Fashion",
+    "Software Development",
+    "Technology, Information and Internet",
+)
+
+SHOPIFY_PROMOTIONAL_SUFFIX_SIGNALS = (
+    "helping", "grow", "growth", "years", "businesses", "shopify", "e-commerce",
+    "ecommerce", "expert", "specialist", "agency", "services", "solutions",
+)
 
 
 def parse_source_filter_tier(source_url: Optional[str]) -> Optional[str]:
@@ -227,13 +268,91 @@ def _section_text(text: str, header: str, stop_headers: tuple[str, ...] = ()) ->
     return " ".join(lines).strip()[:2000] or None
 
 
+def _section_lines(text: str, header: str, stop_headers: tuple[str, ...]) -> List[str]:
+    """Return a labeled section while tolerating blank lines between visible values."""
+    collecting = False
+    result: List[str] = []
+    header_low = header.lower()
+    stop_low = {item.lower() for item in stop_headers}
+    for raw in text.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if not collecting:
+            if low == header_low or low.startswith(header_low + ":"):
+                collecting = True
+                if ":" in line:
+                    value = line.split(":", 1)[1].strip()
+                    if value:
+                        result.append(_clean_line(value))
+            continue
+        if not line:
+            continue
+        if low in stop_low or any(low.startswith(item + ":") for item in stop_low):
+            break
+        result.append(_clean_line(line))
+    return result
+
+
+def _is_shopify_individual_profile(text: str) -> bool:
+    """Recognize a single profile from stable labels, independent of agency name."""
+    lines = {line.strip().lower() for line in text.splitlines() if line.strip()}
+    present = {marker for marker in SHOPIFY_PROFILE_MARKERS if marker in lines}
+    return (
+        "partner since" in present
+        and "contact information" in present
+        and len(present) >= 5
+    ) or (
+        any(line.startswith("partner since ") for line in lines)
+        and "contact information" in present
+        and len(present) >= 4
+    )
+
+
+def _dedupe_source_values(values: List[str]) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.casefold()
+        if value and key not in seen:
+            result.append(value)
+            seen.add(key)
+    return result
+
+
+def _extract_explicit_list(
+    text: str,
+    header: str,
+    stop_headers: tuple[str, ...],
+) -> tuple[List[str], Optional[int]]:
+    values: List[str] = []
+    additional_count: Optional[int] = None
+    for line in _section_lines(text, header, stop_headers):
+        count_match = ADDITIONAL_COUNT_RE.match(line)
+        if count_match:
+            additional_count = int(count_match.group(1))
+            continue
+        values.extend(_split_comma_list_items([line]))
+    return _dedupe_source_values(values), additional_count
+
+
 def _extract_tier_signals(text: str) -> Dict[str, Any]:
     """Extract visible tier text, rating, review count, and plus partner signal."""
-    plus_partner_signal = "plus partner" in text.lower()
+    explicit_tier = None
+    for line in _lines(text):
+        if line.lower() in {
+            "shopify plus partner", "plus partner", "premier partner",
+            "select partner", "registered partner",
+        }:
+            explicit_tier = line
+            break
+    plus_partner_signal = bool(
+        explicit_tier
+        and explicit_tier.lower() in {"shopify plus partner", "plus partner"}
+    )
     m = TIER_RATING_RE.search(text)
     if m:
         return {
-            "partner_tier": m.group(1),
+            "partner_tier": explicit_tier or m.group(1),
             "rating": float(m.group(2)),
             "review_count": int(m.group(3)),
             "plus_partner_signal": plus_partner_signal,
@@ -255,7 +374,7 @@ def _extract_tier_signals(text: str) -> Dict[str, Any]:
                 if m_count:
                     review_count = int(m_count.group(1))
             return {
-                "partner_tier": line,
+                "partner_tier": explicit_tier or line,
                 "rating": rating,
                 "review_count": review_count,
                 "plus_partner_signal": plus_partner_signal,
@@ -270,7 +389,7 @@ def _extract_tier_signals(text: str) -> Dict[str, Any]:
 
 
 def _extract_website_shopify(text: str) -> Optional[str]:
-    contact_lines = _section_after(
+    contact_lines = _section_lines(
         text,
         "Contact information",
         (
@@ -316,7 +435,7 @@ def _extract_email_shopify(text: str, website: Optional[str]) -> Optional[str]:
         "Primary location", "Supported locations", "Languages",
         "Business description", "Industries", "Featured work",
     )
-    contact_lines = _section_after(text, "Contact information", stop_headers)
+    contact_lines = _section_lines(text, "Contact information", stop_headers)
     contact_text = "\n".join(contact_lines)
     candidates = _extract_email_candidates(contact_text) or _extract_email_candidates(text)
     if not candidates:
@@ -338,14 +457,15 @@ def _extract_email_shopify(text: str, website: Optional[str]) -> Optional[str]:
 
 
 def _extract_business_description(text: str) -> Optional[str]:
-    desc = _section_text(
+    desc_lines = _section_lines(
         text,
         "Business description",
         (
-            "Plus Partner", "Other services", "More services", "Industries",
+            "Plus Partner", "Specialized services", "Other services", "More services", "Industries",
             "Featured work", "Rating", "Reviews", "What is Shopify?",
         ),
     )
+    desc = " ".join(desc_lines).strip()[:2000] or None
     if desc:
         if TIER_RATING_RE.search(desc) and len(desc.split()) <= 6:
             return None
@@ -401,14 +521,21 @@ def _split_comma_list_items(items: List[str], stop_exact: tuple[str, ...] = ()) 
     return result
 
 
-def _extract_services_shopify(text: str) -> List[str]:
+def _extract_service_sections(text: str) -> tuple[List[str], List[str]]:
     stop_headers = (
         "More services", "Industries", "Featured work", "Rating", "Reviews",
         "Business description", "Contact information",
     )
-    other_lines = _section_after(text, "Other services", stop_headers)
-    if other_lines:
-        return _split_comma_list_items(other_lines)
+    specialized_lines = _section_lines(
+        text,
+        "Specialized services",
+        ("Other services",) + stop_headers,
+    )
+    other_lines = _section_lines(text, "Other services", stop_headers)
+    specialized = _dedupe_source_values(_split_comma_list_items(specialized_lines))
+    other = _dedupe_source_values(_split_comma_list_items(other_lines))
+    if specialized or other:
+        return specialized, other
 
     found: List[str] = []
     lines = _lines(text)
@@ -427,7 +554,12 @@ def _extract_services_shopify(text: str) -> List[str]:
         if in_services and ln and not ln.startswith("http") and "@" not in ln and "+" not in ln[:3]:
             if ln not in found and len(ln) < 120:
                 found.extend(_split_comma_list_items([ln]))
-    return list(dict.fromkeys(found))
+    return [], _dedupe_source_values(found)
+
+
+def _extract_services_shopify(text: str) -> List[str]:
+    specialized, other = _extract_service_sections(text)
+    return _dedupe_source_values(specialized + other)
 
 
 def _is_featured_work_description(line: str) -> bool:
@@ -445,7 +577,7 @@ def _is_featured_work_description(line: str) -> bool:
 
 
 def _extract_featured_work(text: str) -> List[Dict[str, str]]:
-    lines = _section_after(
+    lines = _section_lines(
         text,
         "Featured work",
         (
@@ -603,6 +735,33 @@ def _prepare_shopify_profile_text(text: str) -> str:
     return "\n".join(profile_lines) if profile_lines else "\n".join(tail[:cut_idx])
 
 
+def _shopify_display_name_aliases(text: str, display_name: Optional[str]) -> List[str]:
+    """Derive only high-confidence promotional-suffix aliases from valid profiles."""
+    if not display_name or not _is_shopify_individual_profile(text):
+        return []
+    exact_display_occurrences = sum(
+        _clean_line(line).casefold() == display_name.casefold()
+        for line in text.splitlines()
+        if line.strip()
+    )
+    if exact_display_occurrences < 2:
+        return []
+    match = re.match(r"^(?P<prefix>.+?)\s+(?:-|\||–|—)\s+(?P<suffix>.+)$", display_name)
+    if not match:
+        return []
+    prefix = match.group("prefix").strip()
+    suffix = match.group("suffix").strip().casefold()
+    words = re.findall(r"[\w&'.]+", prefix)
+    if not (2 <= len(prefix) <= 80 and 1 <= len(words) <= 6):
+        return []
+    if not re.search(r"[A-Za-z0-9]", prefix) or "@" in prefix or "://" in prefix:
+        return []
+    signal_count = sum(signal in suffix for signal in SHOPIFY_PROMOTIONAL_SUFFIX_SIGNALS)
+    if signal_count < 2:
+        return []
+    return [prefix]
+
+
 def _parse_shopify_directory(text: str) -> Dict[str, Any]:
     profile_text = _prepare_shopify_profile_text(text)
     lines = _lines(profile_text)
@@ -614,38 +773,69 @@ def _parse_shopify_directory(text: str) -> Dict[str, Any]:
         if not TIER_RATING_RE.search(fallback) and "partner" not in fallback.lower()[:30]:
             description = fallback
 
-    services = _extract_services_shopify(profile_text)
+    specialized_services, other_services = _extract_service_sections(profile_text)
+    services = _dedupe_source_values(specialized_services + other_services)
     industries = _split_comma_list_items(
         _extract_list_section(
             profile_text, "Industries", ("Featured work", "Business description"),
         ),
     )
-    supported = _split_comma_list_items(
-        _extract_list_section(
-            profile_text,
-            "Supported locations",
-            ("Languages", "Business description", "Industries"),
-        ),
+    supported, supported_additional_count = _extract_explicit_list(
+        profile_text,
+        "Supported locations",
+        ("Languages", "About", "Business description", "Industries"),
     )
-    languages = _split_comma_list_items(
-        _extract_list_section(
-            profile_text,
-            "Languages",
-            ("About", "Business description", "Industries", "Featured work"),
-        ),
-        stop_exact=("About",),
+    languages, languages_additional_count = _extract_explicit_list(
+        profile_text,
+        "Languages",
+        ("About", "Business description", "Industries", "Featured work"),
     )
     primary = _section_text(
         profile_text, "Primary location", ("Supported locations", "Languages", "Business description"),
     )
     partner_since = _extract_partner_since(profile_text)
     website = _extract_website_shopify(profile_text)
+    company_aliases = _shopify_display_name_aliases(text, company)
+
+    phone = _extract_phone(
+        "\n".join(
+            _section_lines(
+                profile_text,
+                "Contact information",
+                ("Primary location", "Supported locations", "Languages", "Business description"),
+            )
+        )
+    )
+    explicit_fields = {
+        "company_name": company,
+        "company_website": website,
+        "company_email": _extract_email_shopify(profile_text, website),
+        "company_phone": phone,
+        "rating": tier_info["rating"],
+        "review_count": tier_info["review_count"],
+        "partner_since": partner_since,
+        "partner_tier": tier_info["partner_tier"],
+        "primary_location": primary,
+    }
+    missing = [key for key, value in explicit_fields.items() if value in (None, "")]
 
     return {
         "company_name": company,
+        "source_display_name": company,
+        "company_aliases": company_aliases,
+        "company_alias_candidates": [
+            {
+                "name": alias,
+                "normalized_name": db.normalize_name(alias),
+                "kind": "shopify_promotional_display_name_prefix",
+                "confidence": "high",
+            }
+            for alias in company_aliases
+        ],
+        "company_website": website,
         "website": website,
-        "company_email": _extract_email_shopify(profile_text, website),
-        "company_phone": _extract_phone(profile_text),
+        "company_email": explicit_fields["company_email"],
+        "company_phone": phone,
         "partner_tier": tier_info["partner_tier"],
         "plus_partner_signal": tier_info["plus_partner_signal"],
         "rating": tier_info["rating"],
@@ -653,40 +843,367 @@ def _parse_shopify_directory(text: str) -> Dict[str, Any]:
         "partner_since": partner_since,
         "primary_location": primary,
         "supported_locations": supported,
+        "supported_locations_additional_count": supported_additional_count,
         "languages": languages,
+        "languages_additional_count": languages_additional_count,
+        "specialized_services": specialized_services,
+        "other_services": other_services,
         "services": services,
         "locations": supported,
         "industries": industries,
         "description": description,
+        "business_description": description,
         "featured_work": _extract_featured_work(profile_text),
         "people": [],
         "interaction": None,
-        "confidence": 0.5,
+        "confidence": 0.95 if company and website else 0.75,
+        "extraction_warnings": [f"explicit_field_missing:{key}" for key in missing],
+        "raw_text": text,
+    }
+
+
+def classify_linkedin_input(
+    text: str,
+    source_url: Optional[str] = None,
+    declared_source_type: Optional[str] = None,
+) -> Optional[str]:
+    """Classify LinkedIn paste structure before any generic fallback runs."""
+    low = text.casefold()
+    url_low = (source_url or "").casefold()
+    lines = {line.strip().casefold() for line in text.splitlines() if line.strip()}
+    has_company_logo = any(
+        line.endswith(" logo") and not line.endswith(" page logo") for line in lines
+    )
+    people_markers = (
+        "associated members",
+        "search employees by title, keyword or school",
+        "where they live",
+        "where they studied",
+        "what they do",
+        "people you may know",
+    )
+    people_score = sum(marker in low for marker in people_markers)
+    if "/company/" in url_low and "/people" in url_low:
+        return "linkedin_company_people"
+    if people_score >= 4 and "people" in lines:
+        return "linkedin_company_people"
+
+    company_tabs = {"home", "about", "posts", "jobs", "people"}
+    if has_company_logo and len(company_tabs & lines) >= 3:
+        if "/about" in url_low or {
+            "company size", "headquarters", "founded", "specialties"
+        } & lines:
+            return "linkedin_company_about"
+        return "linkedin_company_home"
+    if "/company/" in url_low:
+        if "/about" in url_low:
+            return "linkedin_company_about"
+        return "linkedin_company_home"
+
+    if "/in/" in url_low or "/pub/" in url_low:
+        return "linkedin_person_profile"
+    if declared_source_type == "linkedin_person":
+        return "linkedin_person_profile"
+
+    linkedin_detected = (
+        "linkedin.com" in url_low
+        or "linkedin corporation" in low
+        or declared_source_type in {"linkedin_company", "linkedin_person"}
+    )
+    return "unsupported_linkedin" if linkedin_detected else None
+
+
+def _linkedin_header_metadata_line(value: str) -> bool:
+    return bool(
+        re.search(
+            r"\b[\d,]+\s+followers?\s+[\d,]+\s*[-\u2013]\s*[\d,]+\s+employees?\s*$",
+            value,
+            re.I,
+        )
+    )
+
+
+def _linkedin_company_header(
+    text: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return the highest-confidence company header, metadata, and tagline."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    candidates: List[tuple[tuple[int, int, int], str, Optional[str], Optional[str]]] = []
+    navigation = {"home", "about", "services", "posts", "jobs", "people"}
+    controls = {"follow", "following", "message"}
+    for index, line in enumerate(lines):
+        match = re.match(r"^(?P<name>.+?)\s+logo$", line, re.I)
+        if not match or line.casefold().endswith(" page logo"):
+            continue
+        name = match.group("name").strip()
+        following = lines[index + 1:index + 8]
+        if not following or following[0].casefold() != name.casefold():
+            continue
+        metadata = None
+        tagline = None
+        for item in following[1:]:
+            low = item.casefold()
+            if low.endswith(" logo") or low in controls or low in navigation:
+                break
+            if _linkedin_header_metadata_line(item):
+                metadata = item
+                break
+            if tagline is None:
+                tagline = item
+            else:
+                break
+        nearby_navigation = sum(
+            item.casefold() in navigation for item in lines[index + 1:index + 14]
+        )
+        score = (int(metadata is not None), nearby_navigation, int(tagline is not None))
+        candidates.append((score, name, metadata, tagline if metadata else None))
+    if candidates:
+        _, name, metadata, tagline = max(candidates, key=lambda candidate: candidate[0])
+        return name, metadata, tagline
+
+    # Cropped clipboard text starts at the company name and omits the logo line.
+    # Anchor the candidate to the stable follower/employee suffix and company tabs
+    # so page chrome, signed-in names, and employee cards cannot become the header.
+    required_tabs = {"home", "about", "posts", "jobs", "people"}
+    for index, line in enumerate(lines):
+        if index == 0 or not _linkedin_header_metadata_line(line):
+            continue
+        tagline = None
+        name_index = index - 1
+        if index == 2:
+            name_index = 0
+            tagline = lines[1].strip()
+        name = lines[name_index].strip()
+        following = {item.casefold() for item in lines[index + 1:index + 12]}
+        if name and len(required_tabs & following) >= 4:
+            return name, line, tagline
+    return None, None, None
+
+
+def _parse_linkedin_header_metadata(metadata: Optional[str]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "linkedin_industry": None,
+        "linkedin_location": None,
+        "linkedin_follower_count": None,
+        "linkedin_employee_range": None,
+        "linkedin_header_metadata_raw": metadata,
+    }
+    if not metadata:
+        return result
+    match = re.match(
+        r"^(?P<prefix>.+?)\s+(?P<followers>[\d,]+)\s+followers?\s+"
+        r"(?P<employee_range>[\d,]+\s*[-–]\s*[\d,]+)\s+employees?$",
+        metadata.strip(),
+        re.I,
+    )
+    if not match:
+        return result
+    prefix = match.group("prefix").strip()
+    for industry in sorted(LINKEDIN_INDUSTRY_VOCABULARY, key=len, reverse=True):
+        if not prefix.casefold().startswith(industry.casefold() + " "):
+            continue
+        location = prefix[len(industry):].strip()
+        if location:
+            result["linkedin_industry"] = industry
+            result["linkedin_location"] = re.sub(r"\s+", " ", location)
+        break
+    result["linkedin_follower_count"] = int(match.group("followers").replace(",", ""))
+    result["linkedin_employee_range"] = re.sub(
+        r"\s*[-–]\s*", "-", match.group("employee_range").replace(",", "")
+    )
+    return result
+
+
+def _linkedin_section_lines(
+    text: str,
+    header: str,
+    stop_headers: tuple[str, ...],
+) -> List[str]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    header_low = header.casefold()
+    start = next(
+        (
+            i for i, line in enumerate(lines)
+            if line.casefold() == header_low or line.casefold().startswith(header_low + " ")
+        ),
+        None,
+    )
+    if start is None:
+        return []
+    stops = {item.casefold() for item in stop_headers}
+    result: List[str] = []
+    for line in lines[start + 1:]:
+        low = line.casefold()
+        if low in stops or any(low.startswith(stop + " ") for stop in stops):
+            break
+        result.append(line)
+    return result
+
+
+def _extract_linkedin_distribution(text: str, header: str) -> List[Dict[str, Any]]:
+    section = _linkedin_section_lines(
+        text,
+        header,
+        ("Where they live", "Where they studied", "What they do", "People you may know"),
+    )
+    result: List[Dict[str, Any]] = []
+    for line in section:
+        match = re.match(r"^(?P<count>[\d,]+)\s+(?P<label>.+?)toggle off\s*$", line, re.I)
+        if match:
+            result.append(
+                {
+                    "label": match.group("label").strip(),
+                    "count": int(match.group("count").replace(",", "")),
+                }
+            )
+    return result
+
+
+def _clean_linkedin_person_name(value: str) -> str:
+    return re.sub(r"\s+is open to work\s*$", "", value, flags=re.I).strip()
+
+
+def _extract_linkedin_company_people(text: str, company_name: Optional[str]) -> List[Dict[str, Any]]:
+    section = _linkedin_section_lines(
+        text,
+        "People you may know",
+        ("Pages people also viewed", "People also follow", "About"),
+    )
+    controls = {"message", "follow", "connect", "show all"}
+    people: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, line in enumerate(section):
+        connection = LINKEDIN_DEGREE_RE.match(line)
+        if not connection:
+            continue
+        name = _clean_linkedin_person_name(connection.group("name"))
+        if not name or name.casefold() == "linkedin member":
+            continue
+        if index > 0:
+            previous = _clean_linkedin_person_name(section[index - 1])
+            if previous.casefold() != name.casefold():
+                continue
+        card_lines = section[index + 1:index + 8]
+        title = None
+        for candidate in card_lines[:4]:
+            low = candidate.casefold()
+            if LINKEDIN_DEGREE_DECORATION_RE.match(candidate):
+                continue
+            if low in controls or re.match(r"^[\d,]+\s+followers?$", candidate, re.I):
+                break
+            title = candidate.strip()
+            break
+        person_url = next(
+            (
+                url.rstrip(".,)")
+                for url in URL_RE.findall("\n".join(card_lines))
+                if _linkedin_url_kind(url) == "personal"
+            ),
+            None,
+        )
+        person_email = next(
+            (value for value in _extract_email_candidates("\n".join(card_lines))),
+            None,
+        )
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        people.append(
+            {
+                "name": name,
+                "title": title,
+                "linkedin_url": person_url,
+                "email": _email_value(person_email) if person_email else None,
+                "department": None,
+                "source_type": "linkedin_company_people",
+                "source_company": company_name,
+                "association_confidence": "explicit",
+            }
+        )
+    return people
+
+
+def _linkedin_url_kind(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value.strip().rstrip(".,)"))
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").casefold()
+    if hostname != "linkedin.com" and not hostname.endswith(".linkedin.com"):
+        return None
+    segments = [segment.casefold() for segment in parsed.path.split("/") if segment]
+    if not segments:
+        return "linkedin_other"
+    if segments[0] == "company" and len(segments) >= 2:
+        return "company"
+    if segments[0] in {"in", "pub"} and len(segments) >= 2:
+        return "personal"
+    return "linkedin_other"
+
+
+def _parse_linkedin_company_page(
+    text: str,
+    source_url: Optional[str],
+    classification: Optional[str],
+) -> Dict[str, Any]:
+    company_name, metadata, tagline = _linkedin_company_header(text)
+    header = _parse_linkedin_header_metadata(metadata)
+    supplied_url_kind = _linkedin_url_kind(source_url)
+    source_url_mismatch = supplied_url_kind in {"personal", "linkedin_other"}
+    embedded_company_url = next(
+        (url.rstrip(".,)") for url in LINKEDIN_COMPANY_URL_RE.findall(text)), None
+    )
+    company_url = embedded_company_url or (
+        source_url.rstrip(".,)") if source_url and supplied_url_kind == "company" else None
+    )
+    validated_source_url = company_url or (source_url if supplied_url_kind is None else None)
+    associated = re.search(r"\b([\d,]+)\s+associated members?\b", text, re.I)
+    is_people = classification == "linkedin_company_people"
+    warnings = [
+        f"linkedin_optional_field_missing:{key}"
+        for key, value in {
+            "company_name": company_name,
+            "linkedin_company_url": company_url,
+            **header,
+        }.items()
+        if value in (None, "")
+    ]
+    if metadata and not header.get("linkedin_industry") and not header.get("linkedin_location"):
+        warnings.append("linkedin_header_metadata_ambiguous_split")
+    if source_url_mismatch:
+        warnings.append("linkedin_source_url_classification_mismatch")
+    return {
+        "classification": classification or "unsupported_linkedin",
+        "company_name": company_name,
+        "linkedin_company_url": company_url,
+        "source_url": validated_source_url,
+        "linkedin_tagline": tagline,
+        **header,
+        "linkedin_associated_members": int(associated.group(1).replace(",", "")) if associated else None,
+        "linkedin_function_distribution": _extract_linkedin_distribution(text, "What they do") if is_people else [],
+        "linkedin_geographic_distribution": {
+            "where_they_live": _extract_linkedin_distribution(text, "Where they live"),
+            "where_they_studied": _extract_linkedin_distribution(text, "Where they studied"),
+        } if is_people else {},
+        "website": None,
+        "partner_tier": None,
+        "services": [],
+        "locations": [],
+        "industries": [],
+        "description": None,
+        "people": _extract_linkedin_company_people(text, company_name) if is_people else [],
+        "interaction": None,
+        "confidence": 0.95 if company_name and metadata else 0.65,
+        "extraction_warnings": warnings,
         "raw_text": text,
     }
 
 
 def _parse_linkedin_company(text: str) -> Dict[str, Any]:
-    lines = _lines(text)
-    company = _guess_company_name(lines, "linkedin_company")
-    li = _first_url(text)
-    website = None
-    for u in URL_RE.findall(text):
-        if "linkedin.com" not in u.lower():
-            website = u.rstrip(".,)")
-            break
-    return {
-        "company_name": company,
-        "website": website,
-        "partner_tier": _extract_partner_tier(text),
-        "services": _extract_services(text),
-        "locations": [],
-        "industries": [],
-        "description": " ".join(lines[1:6])[:500] if len(lines) > 1 else None,
-        "people": [],
-        "interaction": None,
-        "confidence": 0.45,
-    }
+    return _parse_linkedin_company_page(text, None, classify_linkedin_input(text, None, "linkedin_company"))
 
 
 def _parse_linkedin_person(text: str) -> Dict[str, Any]:
@@ -858,7 +1375,21 @@ FALLBACK_PARSERS = {
 }
 
 
-def deterministic_parse(source_type: str, raw_text: str) -> Dict[str, Any]:
+def deterministic_parse(
+    source_type: str,
+    raw_text: str,
+    source_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    linkedin_classification = classify_linkedin_input(raw_text, source_url, source_type)
+    if linkedin_classification in {
+        "linkedin_company_home",
+        "linkedin_company_about",
+        "linkedin_company_people",
+        "unsupported_linkedin",
+    }:
+        return _parse_linkedin_company_page(raw_text, source_url, linkedin_classification)
+    if linkedin_classification == "linkedin_person_profile":
+        return _parse_linkedin_person(raw_text)
     parser = FALLBACK_PARSERS.get(source_type, _parse_note)
     return parser(raw_text)
 
@@ -896,6 +1427,102 @@ def _merge_email_fields(parsed: Dict[str, Any], raw_text: str) -> None:
     parsed["people"] = people
 
 
+SHOPIFY_EXPLICIT_FIELDS = (
+    "company_name", "source_display_name", "company_aliases", "company_alias_candidates",
+    "company_website", "website", "company_email", "company_phone",
+    "rating", "review_count", "partner_since", "partner_tier", "plus_partner_signal",
+    "primary_location", "supported_locations", "supported_locations_additional_count",
+    "languages", "languages_additional_count", "specialized_services", "other_services",
+    "services", "locations", "industries", "business_description", "featured_work",
+)
+
+
+def _merge_shopify_profile_fields(
+    parsed: Dict[str, Any],
+    deterministic: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Give stable labeled profile facts precedence over model output."""
+    merged = dict(parsed)
+    for key in SHOPIFY_EXPLICIT_FIELDS:
+        merged[key] = deterministic.get(key)
+
+    # Directory observations are source evidence, never people or interactions.
+    merged["people"] = []
+    merged["interaction"] = None
+    if not merged.get("description"):
+        merged["description"] = deterministic.get("business_description")
+    merged["confidence"] = deterministic.get("confidence", 0.75)
+    merged["extraction_warnings"] = deterministic.get("extraction_warnings", [])
+    merged["raw_text"] = deterministic.get("raw_text")
+    return merged
+
+
+def _resolved_raw_source_type(
+    declared_source_type: str,
+    linkedin_classification: Optional[str],
+) -> str:
+    if linkedin_classification == "linkedin_person_profile":
+        return "linkedin_person"
+    if linkedin_classification in {
+        "linkedin_company_home",
+        "linkedin_company_about",
+        "linkedin_company_people",
+        "unsupported_linkedin",
+    }:
+        return "linkedin_company"
+    return declared_source_type
+
+
+def _resolve_company_identity(store: Any, parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve one company using ordered exact evidence, failing closed on ambiguity."""
+    evidence: List[tuple[str, str, str]] = []
+    domain = db.extract_domain(parsed.get("website"))
+    if domain:
+        evidence.append(("exact_official_domain", "domain", domain))
+    email_domain = db.email_domain(parsed.get("company_email"))
+    if email_domain and email_domain not in db.PERSONAL_EMAIL_DOMAINS:
+        evidence.append(("exact_email_domain", "email_domain", email_domain))
+    linkedin_url = db.normalize_linkedin_url(parsed.get("linkedin_company_url"))
+    if linkedin_url:
+        evidence.append(("exact_linkedin_company_url", "linkedin_company_url", linkedin_url))
+    normalized_name = db.normalize_name(parsed.get("company_name"))
+    if normalized_name:
+        evidence.append(("exact_canonical_name", "normalized_name", normalized_name))
+    for alias in parsed.get("company_aliases") or []:
+        normalized_alias = db.normalize_name(alias)
+        if normalized_alias:
+            evidence.append(("exact_known_alias", "normalized_name", normalized_alias))
+    if normalized_name:
+        evidence.append(("exact_source_alias", "source_alias", normalized_name))
+
+    for reason, kind, value in evidence:
+        candidates = store.find_company_identity_candidates(kind, value)
+        candidate_ids = sorted({int(candidate["id"]) for candidate in candidates})
+        if len(candidate_ids) == 1:
+            return {
+                "status": "matched",
+                "lead_id": candidate_ids[0],
+                "reason": reason,
+                "confidence": "high",
+                "candidate_lead_ids": candidate_ids,
+            }
+        if len(candidate_ids) > 1:
+            return {
+                "status": "needs_review",
+                "lead_id": None,
+                "reason": f"ambiguous_{reason}",
+                "confidence": None,
+                "candidate_lead_ids": candidate_ids,
+            }
+    return {
+        "status": "unmatched",
+        "lead_id": None,
+        "reason": "no_reliable_company_match",
+        "confidence": None,
+        "candidate_lead_ids": [],
+    }
+
+
 def parse_and_save(
     source_type: str,
     raw_text: str,
@@ -910,39 +1537,98 @@ def parse_and_save(
 
         store = SqliteContactStore(db_path or db.DB_PATH)
 
+    shopify_profile = source_type == "shopify_directory" and _is_shopify_individual_profile(raw_text)
+    deterministic_profile = _parse_shopify_directory(raw_text) if shopify_profile else None
+    linkedin_classification = classify_linkedin_input(raw_text, source_url, source_type)
+    linkedin_company_page = linkedin_classification in {
+        "linkedin_company_home",
+        "linkedin_company_about",
+        "linkedin_company_people",
+        "unsupported_linkedin",
+    }
+    deterministic_linkedin = (
+        _parse_linkedin_company_page(raw_text, source_url, linkedin_classification)
+        if linkedin_company_page
+        else None
+    )
+
     parsed, llm_raw = extract_structured(
         EXTRACTION_SYSTEM,
         f"source_type={source_type}\nsource_url={source_url or ''}\n\nPASTED TEXT:\n{raw_text}",
     )
     extraction_status = "ok"
     confidence = 0.0
+    llm_attempted = bool(llm_raw)
+    pg_proposal_mode = getattr(store, "backend", None) == "postgresql"
 
-    if parsed and isinstance(parsed, dict):
-        confidence = float(parsed.get("confidence") or 0.7)
+    validated = try_validate_extraction(parsed) if parsed and isinstance(parsed, dict) else None
+    contact_proposal_fields: dict[str, Any] = {}
+    if isinstance(parsed, dict):
+        contact_proposal_fields = {
+            "company_email": parsed.get("company_email"),
+            "company_phone": parsed.get("company_phone"),
+            "people": parsed.get("people") or [],
+        }
+    if validated is not None:
+        parsed = extraction_to_dict(validated)
+        confidence = validated.confidence
+        extraction_status = "ok"
     else:
-        parsed = deterministic_parse(source_type, raw_text)
+        parsed = deterministic_parse(source_type, raw_text, source_url)
         extraction_status = "fallback"
         confidence = float(parsed.get("confidence") or 0.4)
-        if llm_raw:
+        if llm_attempted:
             extraction_status = "needs_review"
+    if pg_proposal_mode and validated is not None:
+        for key, value in contact_proposal_fields.items():
+            if value:
+                parsed[key] = value
+
+    if deterministic_profile is not None:
+        parsed = _merge_shopify_profile_fields(parsed, deterministic_profile)
+        confidence = float(parsed.get("confidence") or 0.75)
+        extraction_status = "ok"
+
+    if deterministic_linkedin is not None:
+        parsed = deterministic_linkedin
+        confidence = float(parsed.get("confidence") or 0.65)
+        extraction_status = (
+            "needs_review" if linkedin_classification == "unsupported_linkedin" else "ok"
+        )
 
     if "raw_text" not in parsed:
         parsed["raw_text"] = raw_text
 
+    resolved_source_type = _resolved_raw_source_type(source_type, linkedin_classification)
+
     if source_type == "email":
         _merge_email_fields(parsed, raw_text)
 
-    source_filter_tier = parse_source_filter_tier(source_url)
+    persisted_source_url = (
+        parsed.get("source_url") if linkedin_company_page else source_url
+    )
+    source_filter_tier = parse_source_filter_tier(persisted_source_url)
 
     with store.transaction():
         lead_id = attach_to_lead_id
+        identity = {
+            "status": "matched" if lead_id else "unmatched",
+            "lead_id": lead_id,
+            "reason": "explicit_attachment" if lead_id else "no_reliable_company_match",
+            "confidence": "high" if lead_id else None,
+            "candidate_lead_ids": [lead_id] if lead_id else [],
+        }
         if not lead_id and parsed.get("company_name"):
-            matches = store.find_matching_leads(
-                parsed.get("company_name"),
-                parsed.get("website"),
-            )
-            if matches:
-                lead_id = matches[0]["id"]
+            identity = _resolve_company_identity(store, parsed)
+            lead_id = identity["lead_id"]
+        parsed["company_match_reason"] = identity["reason"]
+        parsed["company_match_confidence"] = identity["confidence"]
+        if identity["candidate_lead_ids"]:
+            parsed["company_match_candidate_lead_ids"] = identity["candidate_lead_ids"]
+        identity_ambiguous = identity["status"] == "needs_review"
+        if identity_ambiguous:
+            extraction_status = "needs_review"
+            parsed.setdefault("extraction_warnings", []).append("company_identity_ambiguous")
 
         if not lead_id and source_type == "email":
             for token in _extract_email_candidates(raw_text):
@@ -952,13 +1638,19 @@ def parse_and_save(
                     break
 
         website_fallback = None
-        if source_url and not _is_directory_listing_url(source_url):
+        if (
+            source_url
+            and not _is_directory_listing_url(source_url)
+            and not linkedin_classification
+        ):
             website_fallback = source_url
 
         lead = None
-        if lead_id or parsed.get("company_name") or source_type in (
+        if not identity_ambiguous and (lead_id or parsed.get("company_name") or (
+            not linkedin_classification and source_type in (
             "shopify_directory", "linkedin_company", "website", "note"
-        ):
+            )
+        )):
             lead_data = {
                 "company_name": store.sanitize_company_name(parsed.get("company_name"))
                 or (f"Unknown ({source_type})" if not lead_id else None),
@@ -981,6 +1673,44 @@ def parse_and_save(
                 "confidence": confidence,
                 "extraction_status": extraction_status,
             }
+            if linkedin_company_page:
+                existing = store.get_lead(lead_id) if lead_id else None
+                if existing:
+                    lead_data = {
+                        "company_name": existing.get("company_name") or parsed.get("company_name"),
+                        "website": existing.get("website"),
+                        "company_email": existing.get("company_email"),
+                        "company_phone": existing.get("company_phone"),
+                        "partner_tier": existing.get("partner_tier"),
+                        "plus_partner_signal": existing.get("plus_partner_signal"),
+                        "rating": existing.get("rating"),
+                        "review_count": existing.get("review_count"),
+                        "partner_since": existing.get("partner_since"),
+                        "primary_location": existing.get("primary_location"),
+                        "supported_locations": existing.get("supported_locations") or [],
+                        "languages": existing.get("languages") or [],
+                        "featured_work": existing.get("featured_work") or [],
+                        "services": existing.get("services") or [],
+                        "locations": existing.get("locations") or [],
+                        "industries": existing.get("industries") or [],
+                        "description": existing.get("description"),
+                        "fit_score": existing.get("fit_score", 0),
+                        "status": existing.get("status", "new"),
+                        "confidence": existing.get("confidence", 0.0),
+                        "extraction_status": existing.get("extraction_status", "ok"),
+                    }
+                else:
+                    lead_data = {
+                        "company_name": parsed.get("company_name"),
+                        "services": [],
+                        "locations": [],
+                        "industries": [],
+                        "confidence": confidence,
+                        "extraction_status": extraction_status,
+                    }
+            if pg_proposal_mode:
+                lead_data.pop("company_email", None)
+                lead_data.pop("company_phone", None)
             if lead_id:
                 if source_type == "email":
                     lead_data.pop("company_name", None)
@@ -989,10 +1719,20 @@ def parse_and_save(
                 lead, _ = store.upsert_lead(lead_data)
                 lead_id = lead["id"]
 
+        if lead_id and linkedin_classification == "linkedin_company_people":
+            context_company = parsed.get("company_name")
+            if not context_company:
+                context_lead = lead or store.get_lead(lead_id)
+                context_company = context_lead.get("company_name") if context_lead else None
+            for person in parsed.get("people") or []:
+                if not person.get("source_company") and context_company:
+                    person["source_company"] = context_company
+                person["source_type"] = "linkedin_company_people"
+
         raw_source = store.create_raw_source(
-            source_type=source_type,
+            source_type=resolved_source_type,
             raw_text=raw_text,
-            source_url=source_url,
+            source_url=persisted_source_url,
             source_filter_tier=source_filter_tier,
             parsed_json=parsed,
             extraction_status=extraction_status,
@@ -1005,22 +1745,85 @@ def parse_and_save(
             raw_source["lead_id"] = lead_id
 
         people_saved = []
-        for person in parsed.get("people") or []:
-            if not person.get("name") and not person.get("email"):
-                continue
-            if not lead_id:
-                continue
-            cls = classify_person_title(person.get("title"))
-            p = store.add_person(
-                lead_id,
-                {
-                    **person,
-                    **cls,
-                    "confidence": confidence,
-                },
-                raw_source_id=raw_source["id"],
-            )
-            people_saved.append(p)
+        candidate_source_id = raw_source["id"]
+        if linkedin_classification == "linkedin_company_people" and lead_id:
+            # Retain every raw-source row, while exact replays reuse the
+            # original evidence row so candidate IDs remain stable.
+            lead_with_sources = store.get_lead(lead_id)
+            for prior_source in (lead_with_sources or {}).get("raw_sources", []):
+                if (
+                    prior_source["id"] != raw_source["id"]
+                    and prior_source.get("source_type") == resolved_source_type
+                    and prior_source.get("source_url") == persisted_source_url
+                    and prior_source.get("raw_text") == raw_text
+                ):
+                    candidate_source_id = prior_source["id"]
+                    break
+
+        if not pg_proposal_mode and linkedin_classification == "linkedin_company_people":
+            for person in parsed.get("people") or []:
+                if not person.get("name") or not lead_id:
+                    continue
+                role_fields = derive_person_role_fields(person.get("title"), person.get("role_type"))
+                candidate = store.create_or_reuse_person_candidate(
+                    lead_id,
+                    candidate_source_id,
+                    name=person["name"],
+                    title=person.get("title"),
+                    role_type=role_fields["role_type"],
+                    is_decision_maker=role_fields["is_decision_maker"],
+                    profile_url=person.get("linkedin_url"),
+                    source_type="linkedin_company_people",
+                    source_url=persisted_source_url,
+                    confidence=confidence,
+                    relevance_reason=role_fields["relevance_reason"],
+                    discovery_method="deterministic_parser",
+                )
+                people_saved.append(candidate)
+                for kind, value in (("email", person.get("email")), ("linkedin", person.get("linkedin_url"))):
+                    if value:
+                        store.create_or_reuse_contact_candidate(
+                            lead_id,
+                            candidate_source_id,
+                            person_candidate_id=candidate["id"],
+                            kind=kind,
+                            value=value,
+                            source_url=persisted_source_url,
+                            confidence=confidence,
+                            verification_status="source_confirmed",
+                            evidence_basis="source_confirmed",
+                            discovery_method="deterministic_parser",
+                        )
+        elif not pg_proposal_mode:
+            for person in parsed.get("people") or []:
+                if not person.get("name") and not person.get("email"):
+                    continue
+                if not lead_id:
+                    continue
+                email_status = person.get("email_status")
+                if person.get("email") and email_status not in {
+                    "published", "verified", "pattern_derived", "inferred", "unknown"
+                }:
+                    email_status = "unknown"
+                public_contact_source = source_type in {
+                    "shopify_directory", "linkedin_company", "linkedin_person", "website"
+                }
+                if email_status == "verified":
+                    email_status = "published" if public_contact_source else "unknown"
+                if person.get("email") and not email_status:
+                    email_status = "published" if public_contact_source else "unknown"
+                if not person.get("email"):
+                    email_status = "unknown"
+                p = store.add_person(
+                    lead_id,
+                    {
+                        **person,
+                        "email_status": email_status or "unknown",
+                        "confidence": confidence,
+                    },
+                    raw_source_id=raw_source["id"],
+                )
+                people_saved.append(p)
 
         interaction_saved = None
         task_saved = None
@@ -1051,7 +1854,7 @@ def parse_and_save(
                     },
                 )
 
-        if lead_id:
+        if lead_id and linkedin_classification != "linkedin_company_people":
             lead_row = store.get_lead(lead_id)
             if lead_row:
                 fit = compute_fit_score(
@@ -1078,4 +1881,7 @@ def parse_and_save(
         "interaction_id": interaction_saved["id"] if interaction_saved else None,
         "task_id": task_saved["id"] if task_saved else None,
         "parsed": parsed,
+        "company_match_status": identity["status"],
+        "company_match_reason": identity["reason"],
+        "company_match_candidate_lead_ids": identity["candidate_lead_ids"],
     }

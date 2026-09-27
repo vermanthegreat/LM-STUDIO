@@ -8,12 +8,14 @@ from uuid import UUID
 import db
 import pytest
 from ask_router import execute_planner_read_tool_route
+from persistence.session import reset_cached_engines
 from repositories.command_log_store import PostgresCommandLogStore, SqliteCommandLogStore
 from repositories.postgres_store import PostgresContactStore
 from repositories.sqlite_store import SqliteContactStore
 from services.command_log import CommandStatus
 from services.command_service import CommandService
 from services.planner_validation import validate_planner_tool_call
+from tests.pg_support import run_alembic_upgrade
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
@@ -118,7 +120,10 @@ def test_sqlite_succeeded_read_tool_execution_persisted(tmp_path):
 
 @pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL is not configured")
 def test_postgres_command_log_persists_across_service_instances():
+    reset_cached_engines()
+    run_alembic_upgrade(TEST_DATABASE_URL, "head")
     store = PostgresContactStore(TEST_DATABASE_URL)
+    store.init_db()
     service1 = CommandService(store)
     result = validate_planner_tool_call(
         service1,

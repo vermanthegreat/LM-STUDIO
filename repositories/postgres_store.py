@@ -8,6 +8,7 @@ import io
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
 
 import db as sqlite_db
 from persistence.models import (
@@ -21,7 +22,9 @@ from persistence.models import (
 )
 from persistence.session import get_session_factory, init_schema
 from persistence.unit_of_work import UnitOfWork
+from gmail_runtime import GmailRuntimeUnsupportedError, require_gmail_sqlite_runtime
 from repositories.mapping import (
+    _org_has_verified_email,
     organization_to_lead_detail,
     organization_to_lead_row,
     person_to_dict,
@@ -82,7 +85,7 @@ class PostgresContactStore:
             if self._session is None:
                 session.close()
 
-    def list_leads(self) -> List[Dict[str, Any]]:
+    def list_leads(self, research_only: bool = False) -> List[Dict[str, Any]]:
         session = self._active_session()
         try:
             orgs = session.scalars(
@@ -107,6 +110,18 @@ class PostgresContactStore:
                 deadlines = [t.due_at for t in org.tasks if t.status == "open" and t.due_at]
                 row["next_deadline"] = min(deadlines).isoformat()[:10] if deadlines else None
                 result.append(row)
+            if research_only:
+                result = [
+                    row for row in result
+                    if row.get("enrichment_status") in {"pending", "in_progress", "needs_review"}
+                    and (row["people_count"] < 2 or not row["has_decision_maker"])
+                ]
+                result.sort(key=lambda row: row.get("updated_at") or "", reverse=True)
+                result.sort(key=lambda row: (
+                    -int(row.get("fit_score") or 0),
+                    bool(row.get("has_decision_maker")),
+                    int(row.get("people_count") or 0),
+                ))
             return result
         finally:
             if self._session is None:
@@ -222,6 +237,7 @@ class PostgresContactStore:
             ) or 0
             with_person_email = 0
             with_any_email = 0
+            with_verified_email = 0
             orgs = session.scalars(
                 select(Organization)
                 .where(active)
@@ -240,6 +256,8 @@ class PostgresContactStore:
                     with_person_email += 1
                 if has_company or has_person:
                     with_any_email += 1
+                if _org_has_verified_email(org):
+                    with_verified_email += 1
             email_interactions = session.scalar(
                 select(func.count())
                 .select_from(Interaction)
@@ -251,6 +269,7 @@ class PostgresContactStore:
                 "with_people": with_people,
                 "with_person_email": with_person_email,
                 "with_any_email": with_any_email,
+                "with_verified_email": with_verified_email,
                 "without_email": companies - with_any_email,
                 "email_interactions": email_interactions,
             }
@@ -295,10 +314,113 @@ class PostgresContactStore:
             if self._session is None:
                 session.close()
 
-    def get_followups_due(self) -> List[Dict[str, Any]]:
+    def list_contact_method_records(self) -> List[Dict[str, Any]]:
         session = self._active_session()
         try:
-            today = datetime.now(timezone.utc).date()
+            records: List[Dict[str, Any]] = []
+            methods = session.scalars(select(ContactMethod)).all()
+            for method in methods:
+                org = None
+                person_name = None
+                if method.organization_id:
+                    org = session.get(Organization, method.organization_id)
+                elif method.person_id:
+                    person = session.get(Person, method.person_id)
+                    if person:
+                        person_name = person.name
+                        org = person.organization
+                if org is None:
+                    continue
+                records.append(
+                    {
+                        "lead_id": org.legacy_lead_id,
+                        "company_name": org.name,
+                        "person_name": person_name,
+                        "kind": method.kind,
+                        "value": method.value,
+                        "verification_status": method.verification_status,
+                        "organization_status": org.status,
+                        "fit_score": int(org.relevance_score or 0),
+                        "proposal": False,
+                    }
+                )
+            records.extend(self._proposed_contact_records_from_extractions(session))
+            return records
+        finally:
+            if self._session is None:
+                session.close()
+
+    def _proposed_contact_records_from_extractions(self, session: Session) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        extractions = session.scalars(select(Extraction).where(Extraction.status == "proposed")).all()
+        for extraction in extractions:
+            source = session.get(Source, extraction.source_id)
+            if source is None or source.organization_id is None:
+                continue
+            org = session.get(Organization, source.organization_id)
+            if org is None:
+                continue
+            output = extraction.structured_output if isinstance(extraction.structured_output, dict) else {}
+            company_email = (output.get("company_email") or "").strip()
+            if company_email:
+                records.append(
+                    {
+                        "lead_id": org.legacy_lead_id,
+                        "company_name": org.name,
+                        "person_name": None,
+                        "kind": "email",
+                        "value": company_email,
+                        "verification_status": "unverified",
+                        "organization_status": org.status,
+                        "fit_score": int(org.relevance_score or 0),
+                        "proposal": True,
+                    }
+                )
+            for person in output.get("people") or []:
+                if not isinstance(person, dict):
+                    continue
+                email = (person.get("email") or "").strip()
+                if not email:
+                    continue
+                records.append(
+                    {
+                        "lead_id": org.legacy_lead_id,
+                        "company_name": org.name,
+                        "person_name": person.get("name"),
+                        "kind": "email",
+                        "value": email,
+                        "verification_status": "unverified",
+                        "organization_status": org.status,
+                        "fit_score": int(org.relevance_score or 0),
+                        "proposal": True,
+                    }
+                )
+        return records
+
+    def get_extraction_status_for_source(self, raw_source_id: int) -> Optional[str]:
+        session = self._active_session()
+        try:
+            source = self._source_by_legacy_id(session, raw_source_id)
+            if source is None:
+                return None
+            extraction = session.scalar(
+                select(Extraction)
+                .where(Extraction.source_id == source.id)
+                .order_by(Extraction.created_at.desc())
+            )
+            return extraction.status if extraction else None
+        finally:
+            if self._session is None:
+                session.close()
+
+    def get_followups_due(self, due_on_or_before: Optional[str] = None) -> List[Dict[str, Any]]:
+        session = self._active_session()
+        try:
+            cutoff = (
+                datetime.fromisoformat(str(due_on_or_before)[:10]).date()
+                if due_on_or_before
+                else datetime.now(timezone.utc).date()
+            )
             items: List[Dict[str, Any]] = []
             tasks = session.scalars(
                 select(Task)
@@ -306,7 +428,7 @@ class PostgresContactStore:
                 .where(Task.status == "open", Task.due_at.is_not(None))
             ).all()
             for task in tasks:
-                if task.due_at and task.due_at.date() <= today and task.organization:
+                if task.due_at and task.due_at.date() <= cutoff and task.organization:
                     items.append({
                         "company_name": task.organization.name,
                         "lead_id": task.organization.legacy_lead_id,
@@ -323,7 +445,7 @@ class PostgresContactStore:
             for item in interactions:
                 meta = item.legacy_metadata or {}
                 deadline = meta.get("deadline")
-                if deadline and deadline <= today.isoformat() and item.organization:
+                if deadline and deadline <= cutoff.isoformat() and item.organization:
                     items.append({
                         "company_name": item.organization.name,
                         "lead_id": item.organization.legacy_lead_id,
@@ -398,6 +520,69 @@ class PostgresContactStore:
             if self._session is None:
                 session.close()
 
+    def find_company_identity_candidates(
+        self,
+        evidence_kind: str,
+        value: str,
+    ) -> List[Dict[str, Any]]:
+        """PostgreSQL equivalent of the exact Phase 0 identity lookup."""
+        allowed = {
+            "domain", "email_domain", "linkedin_company_url", "normalized_name", "source_alias",
+        }
+        if evidence_kind not in allowed or not value:
+            return []
+        session = self._active_session()
+        try:
+            if evidence_kind == "domain":
+                orgs = session.scalars(
+                    select(Organization).where(Organization.normalized_domain == value)
+                ).all()
+            elif evidence_kind == "normalized_name":
+                orgs = session.scalars(
+                    select(Organization).where(Organization.normalized_name == value)
+                ).all()
+            elif evidence_kind == "email_domain":
+                orgs = session.scalars(
+                    select(Organization).options(selectinload(Organization.contact_methods))
+                ).all()
+                orgs = [
+                    org for org in orgs
+                    if org.normalized_domain == value or any(
+                        method.kind == "email"
+                        and sqlite_db.email_domain(method.normalized_value) == value
+                        for method in org.contact_methods
+                    )
+                ]
+            else:
+                sources = session.scalars(
+                    select(Source).where(Source.organization_id.is_not(None))
+                ).all()
+                organization_ids = set()
+                for source in sources:
+                    parsed = (source.legacy_metadata or {}).get("parsed_json") or {}
+                    if evidence_kind == "linkedin_company_url":
+                        matched = (
+                            sqlite_db.normalize_linkedin_url(parsed.get("linkedin_company_url"))
+                            == value
+                        )
+                    else:
+                        matched = any(
+                            sqlite_db.normalize_name(alias) == value
+                            for alias in (parsed.get("company_aliases") or [])
+                            if isinstance(alias, str)
+                        )
+                    if matched:
+                        organization_ids.add(source.organization_id)
+                orgs = session.scalars(
+                    select(Organization).where(Organization.id.in_(organization_ids))
+                ).all() if organization_ids else []
+            return sorted(
+                (organization_to_lead_row(org) for org in orgs), key=lambda row: row["id"]
+            )
+        finally:
+            if self._session is None:
+                session.close()
+
     def find_leads_by_email(self, email: str) -> List[Dict[str, Any]]:
         norm = sqlite_db.normalize_email(email)
         if not norm:
@@ -461,7 +646,7 @@ class PostgresContactStore:
                 "partner_tier", "plus_partner_signal", "rating", "review_count", "partner_since",
                 "primary_location", "supported_locations", "languages", "featured_work",
                 "services", "locations", "industries", "confidence", "extraction_status",
-                "possible_duplicate",
+                "possible_duplicate", "enrichment_status",
             ):
                 if key in data and data[key] is not None:
                     meta[key] = data[key]
@@ -509,6 +694,8 @@ class PostgresContactStore:
             )
         )
         if existing:
+            if existing.verification_status == "verified":
+                return
             existing.value = value
             return
         session.add(
@@ -564,7 +751,6 @@ class PostgresContactStore:
             )
             session.add(extraction)
             session.flush()
-            self._approve_extraction(session, extraction, org)
 
             if own_session:
                 session.commit()
@@ -632,6 +818,19 @@ class PostgresContactStore:
         session = self._active_session()
         own_session = self._session is None
         try:
+            from models import normalize_email_enrichment
+            from scoring import derive_person_role_fields
+
+            role_fields = derive_person_role_fields(
+                data.get("title"), data.get("role_type")
+            )
+            normalized_email = sqlite_db.normalize_email(data.get("email"))
+            email_metadata = normalize_email_enrichment(
+                has_email=bool(normalized_email),
+                email_status=data.get("email_status"),
+                email_confidence=data.get("email_confidence"),
+                last_verified_at=data.get("last_verified_at"),
+            )
             org = self._org_by_lead_id(session, lead_id)
             if not org:
                 raise ValueError(f"Lead {lead_id} not found")
@@ -640,26 +839,36 @@ class PostgresContactStore:
                 name=data.get("name"),
                 normalized_name=sqlite_db.normalize_name(data.get("name")),
                 title=data.get("title"),
-                is_decision_maker=bool(data.get("is_decision_maker")),
-                relevance_reason=data.get("relevance_reason"),
+                is_decision_maker=role_fields["is_decision_maker"],
+                relevance_reason=role_fields["relevance_reason"],
                 legacy_metadata={
                     "department": data.get("department"),
                     "seniority": data.get("seniority"),
-                    "is_relevant_contact": data.get("is_relevant_contact", 0),
+                    "is_relevant_contact": role_fields["is_relevant_contact"],
+                    "role_type": role_fields["role_type"],
                     "confidence": data.get("confidence", 0.0),
+                    **email_metadata,
                     "raw_source_id": raw_source_id,
                 },
             )
             session.add(person)
             session.flush()
-            if data.get("email"):
+            if normalized_email:
+                verification_status = (
+                    "verified"
+                    if email_metadata["email_status"] == "verified"
+                    else "source_confirmed"
+                    if email_metadata["email_status"] == "published"
+                    else "unverified"
+                )
                 session.add(
                     ContactMethod(
                         person_id=person.id,
                         kind="email",
-                        value=data["email"],
-                        normalized_value=sqlite_db.normalize_email(data["email"]),
-                        verification_status="unverified",
+                        value=normalized_email,
+                        normalized_value=normalized_email,
+                        confidence=email_metadata["email_confidence"],
+                        verification_status=verification_status,
                     )
                 )
             if data.get("linkedin_url"):
@@ -740,6 +949,18 @@ class PostgresContactStore:
             org = self._org_by_lead_id(session, lead_id)
             if not org:
                 raise ValueError(f"Lead {lead_id} not found")
+            created_by_command_id = data.get("created_by_command_id")
+            if created_by_command_id:
+                existing = session.scalar(
+                    select(Task).where(Task.created_by_command_id == UUID(str(created_by_command_id)))
+                )
+                if existing is not None:
+                    return {
+                        "id": existing.legacy_task_id,
+                        "lead_id": lead_id,
+                        "title": existing.title,
+                        "status": existing.status,
+                    }
             due = data.get("due_date")
             due_at = None
             if due:
@@ -750,6 +971,7 @@ class PostgresContactStore:
                 priority=data.get("priority"),
                 status=data.get("status", "open"),
                 due_at=due_at,
+                created_by_command_id=UUID(str(created_by_command_id)) if created_by_command_id else None,
                 legacy_task_id=self._next_legacy_task_id(session),
                 legacy_metadata={
                     "source_interaction_id": data.get("source_interaction_id"),
@@ -828,3 +1050,30 @@ class PostgresContactStore:
 
     def extract_domain(self, website: Optional[str]) -> Optional[str]:
         return sqlite_db.extract_domain(website)
+
+    def list_imported_email_messages(
+        self,
+        *,
+        intent: Optional[str] = None,
+        marker: Optional[str] = None,
+        direction: Optional[str] = None,
+        link_status: Optional[str] = None,
+        lead_id: Optional[int] = None,
+        person_id: Optional[int] = None,
+        since: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        app_timezone: str = "UTC",
+    ) -> tuple[List[Dict[str, Any]], int]:
+        require_gmail_sqlite_runtime(self)
+        return [], 0  # pragma: no cover
+
+    def get_imported_email_thread(
+        self,
+        external_thread_id: str,
+        *,
+        external_account: Optional[str] = None,
+        app_timezone: str = "UTC",
+    ) -> List[Dict[str, Any]]:
+        require_gmail_sqlite_runtime(self)
+        return []  # pragma: no cover

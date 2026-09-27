@@ -12,13 +12,19 @@ from tools.envelope import ToolResult
 from tools.read_handlers import (
     handle_calculate_pipeline_analytics,
     handle_find_companies_missing_email,
+    handle_get_email_thread,
     handle_list_due_followups,
+    handle_list_email_messages,
+    handle_list_unverified_contact_methods,
     handle_search_contacts,
 )
 from tools.read_inputs import (
     CalculatePipelineAnalyticsInput,
     FindCompaniesMissingEmailInput,
+    GetEmailThreadInput,
     ListDueFollowupsInput,
+    ListEmailMessagesInput,
+    ListUnverifiedContactMethodsInput,
     SearchContactsInput,
 )
 from tools.risk import RiskClass
@@ -117,11 +123,38 @@ def build_default_registry() -> ToolRegistry:
     )
     registry.register(
         ToolSpec(
+            name="list_unverified_contact_methods",
+            risk_class=RiskClass.READ,
+            input_model=ListUnverifiedContactMethodsInput,
+            handler=handle_list_unverified_contact_methods,
+            description="Read-only unverified contact methods with filterable kind and status.",
+        )
+    )
+    registry.register(
+        ToolSpec(
             name="calculate_pipeline_analytics",
             risk_class=RiskClass.READ,
             input_model=CalculatePipelineAnalyticsInput,
             handler=handle_calculate_pipeline_analytics,
             description="Read-only deterministic pipeline metrics.",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="list_email_messages",
+            risk_class=RiskClass.READ,
+            input_model=ListEmailMessagesInput,
+            handler=handle_list_email_messages,
+            description="Read imported Gmail messages from the local database.",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="get_email_thread",
+            risk_class=RiskClass.READ,
+            input_model=GetEmailThreadInput,
+            handler=handle_get_email_thread,
+            description="Read an imported Gmail thread from the local database.",
         )
     )
     registry.register(

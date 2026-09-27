@@ -21,11 +21,13 @@ from ask_router import (
     list_pending_write_proposals_route,
 )
 from config import AppConfig
-from errors import AppError, ValidationError
+from errors import AppError, ValidationError, parse_command_id
+from gmail_runtime import GmailRuntimeUnsupportedError
 from extractor import parse_and_save
 from intake import validate_parse_intake
 from repositories.factory import get_contact_store
 from security import assert_safe_mutation_request
+from services.gmail_sync_service import gmail_integration_status, sync_gmail_full_mailbox, sync_gmail_label
 
 load_dotenv()
 
@@ -70,6 +72,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     def index(request: Request):
         leads = request.app.state.store.get_all_leads_simple()
         return templates.TemplateResponse(
+            request,
             "index.html",
             {"request": request, "leads": leads, "message": None},
         )
@@ -119,16 +122,22 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 status_code=303,
             )
         return templates.TemplateResponse(
+            request,
             "index.html",
             {"request": request, "leads": leads, "message": msg},
         )
 
     @application.get("/leads", response_class=HTMLResponse)
-    def leads_list(request: Request):
-        leads = request.app.state.store.list_leads()
+    def leads_list(request: Request, research: bool = False):
+        leads = (
+            request.app.state.store.list_leads(research_only=True)
+            if research
+            else request.app.state.store.list_leads()
+        )
         return templates.TemplateResponse(
+            request,
             "leads.html",
-            {"request": request, "leads": leads},
+            {"request": request, "leads": leads, "research": research},
         )
 
     @application.get("/leads/{lead_id}", response_class=HTMLResponse)
@@ -141,6 +150,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 status_code=404,
             )
         return templates.TemplateResponse(
+            request,
             "lead_detail.html",
             {"request": request, "lead": lead, "message": msg},
         )
@@ -148,6 +158,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.get("/ask", response_class=HTMLResponse)
     def ask_page(request: Request):
         return templates.TemplateResponse(
+            request,
             "ask.html",
             {"request": request, "result": None},
         )
@@ -171,6 +182,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         assert_safe_mutation_request(request, port=cfg.port)
         result = answer_question(question, use_llm=use_llm, store=request.app.state.store)
         return templates.TemplateResponse(
+            request,
             "ask.html",
             {"request": request, "result": result},
         )
@@ -178,10 +190,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.post("/ask/commands/{command_id}/approve")
     def ask_approve_command(request: Request, command_id: str):
         assert_safe_mutation_request(request, port=cfg.port)
-        from uuid import UUID
-
         result = approve_write_proposal_route(
-            UUID(command_id),
+            parse_command_id(command_id),
             store=request.app.state.store,
         )
         status_code = 200 if result["status"] == "ok" else 409
@@ -190,10 +200,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.post("/ask/commands/{command_id}/apply")
     def ask_apply_command(request: Request, command_id: str):
         assert_safe_mutation_request(request, port=cfg.port)
-        from uuid import UUID
-
         result = apply_write_proposal_route(
-            UUID(command_id),
+            parse_command_id(command_id),
             store=request.app.state.store,
         )
         status_code = 200 if result["status"] == "ok" else 409
@@ -206,10 +214,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @application.get("/ask/commands/{command_id}")
     def ask_get_write_proposal_detail(request: Request, command_id: str):
-        from uuid import UUID
-
         result = get_write_proposal_detail_route(
-            UUID(command_id),
+            parse_command_id(command_id),
             store=request.app.state.store,
         )
         status_code = 200 if result["status"] == "ok" else 404
@@ -222,6 +228,147 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             csv_data,
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=leads_export.csv"},
+        )
+
+    @application.get("/integrations/gmail", response_class=HTMLResponse)
+    def gmail_integration_page(request: Request):
+        status = gmail_integration_status(request.app.state.store, cfg)
+        runtime_error: str | None = None
+        recent_emails: list = []
+        email_total = 0
+        try:
+            recent_emails, email_total = request.app.state.store.list_imported_email_messages(
+                limit=10,
+                app_timezone=cfg.app_timezone,
+            )
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
+        return templates.TemplateResponse(
+            request,
+            "gmail_integration.html",
+            {
+                "request": request,
+                "status": status,
+                "message": None,
+                "recent_emails": recent_emails,
+                "email_total": email_total,
+                "runtime_error": runtime_error,
+            },
+        )
+
+    @application.post("/integrations/gmail/sync", response_class=HTMLResponse)
+    def gmail_sync(request: Request):
+        assert_safe_mutation_request(request, port=cfg.port)
+        result, entry = sync_gmail_label(request.app.state.store, cfg)
+        status = gmail_integration_status(request.app.state.store, cfg)
+        runtime_error: str | None = None
+        recent_emails: list = []
+        email_total = 0
+        try:
+            recent_emails, email_total = request.app.state.store.list_imported_email_messages(
+                limit=10,
+                app_timezone=cfg.app_timezone,
+            )
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
+        if result.status == "ok":
+            counts = result.counts
+            msg = (
+                f"Gmail sync complete: imported={counts.imported}, updated={counts.updated}, "
+                f"already_present={counts.already_present}, failed={counts.failed}. "
+                f"Command: {entry.id if entry else 'n/a'}"
+            )
+        else:
+            msg = result.message or result.error_code or "Gmail sync failed."
+        return templates.TemplateResponse(
+            request,
+            "gmail_integration.html",
+            {
+                "request": request,
+                "status": status,
+                "message": msg,
+                "recent_emails": recent_emails,
+                "email_total": email_total,
+                "runtime_error": runtime_error,
+            },
+        )
+
+    @application.post("/integrations/gmail/full-sync", response_class=HTMLResponse)
+    def gmail_full_sync(request: Request):
+        assert_safe_mutation_request(request, port=cfg.port)
+        result = sync_gmail_full_mailbox(request.app.state.store, cfg)
+        return RedirectResponse(url="/integrations/gmail?msg=" + quote(result.message or f"Full mailbox sync: {result.status}."), status_code=303)
+
+    @application.get("/emails", response_class=HTMLResponse)
+    def emails_list(
+        request: Request,
+        bucket: str = "",
+        offset: int = 0,
+        intent: str = "",
+        marker: str = "",
+        direction: str = "",
+        link_status: str = "",
+        since: str = "",
+        limit: int = 50,
+    ):
+        store = request.app.state.store
+        runtime_error: str | None = None
+        records: list = []
+        total = 0
+        conversation_mode = False
+        try:
+            bounded_limit = min(max(limit, 1), 100)
+            if bucket in {"agencies", "ambiguous", "unmatched", "all"} and not any([intent, marker, direction, link_status, since]):
+                conversation_mode = True
+                method = {"agencies": store.list_agency_conversations, "ambiguous": store.list_ambiguous_conversations, "unmatched": store.list_unmatched_conversations, "all": store.list_all_conversations}[bucket]
+                records, total = method(offset=max(offset, 0), limit=bounded_limit)
+            else:
+                records, total = store.list_imported_email_messages(intent=intent or None, marker=marker or None, direction=direction or None, link_status=link_status or None, since=since or None, limit=bounded_limit, offset=max(offset, 0), app_timezone=cfg.app_timezone)
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
+        return templates.TemplateResponse(
+            request,
+            "emails.html",
+            {
+                "request": request,
+                "emails": records,
+                "total": total,
+                "bucket": bucket if bucket in {"agencies", "ambiguous", "unmatched", "all"} else "all",
+                "offset": max(offset, 0),
+                "conversation_mode": conversation_mode,
+                "runtime_error": runtime_error,
+                "filters": {
+                    "intent": intent,
+                    "marker": marker,
+                    "direction": direction,
+                    "link_status": link_status,
+                    "since": since,
+                    "limit": limit,
+                },
+            },
+        )
+
+    @application.get("/emails/thread/{thread_id}", response_class=HTMLResponse)
+    def email_thread_detail(request: Request, thread_id: str, account: str = ""):
+        runtime_error: str | None = None
+        messages: list = []
+        try:
+            messages = request.app.state.store.get_imported_email_thread(
+                thread_id,
+                external_account=account or None,
+                app_timezone=cfg.app_timezone,
+            )
+        except GmailRuntimeUnsupportedError as exc:
+            runtime_error = exc.message
+        return templates.TemplateResponse(
+            request,
+            "email_thread.html",
+            {
+                "request": request,
+                "thread_id": thread_id,
+                "messages": messages,
+                "runtime_error": runtime_error,
+            },
         )
 
     return application

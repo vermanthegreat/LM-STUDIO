@@ -34,9 +34,22 @@ Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://l
 |-------|---------|
 | `/` | Paste box + parse |
 | `/leads` | Lead list |
+| `/leads?research=true` | Existing lead list filtered to companies requiring research |
 | `/leads/{id}` | Lead detail |
 | `/ask` | Natural-language DB queries |
 | `/export/csv` | CSV download |
+| `/integrations/gmail` | Gmail G0 status and manual sync |
+| `/emails` | Imported Gmail messages (filtered) |
+
+Gmail G0 is disabled unless `GMAIL_ENABLED=true`. Gmail sync and email queries
+require the **SQLite** runtime; PostgreSQL returns a controlled unsupported-runtime
+error for Gmail operations. Authorization:
+
+```bash
+python scripts/gmail_authorize.py
+```
+
+Create the configured Gmail label (default `LMStudio`) manually before the first sync.
 
 ## Ask database examples
 
@@ -81,6 +94,14 @@ LMSTUDIO_BASE_URL=http://localhost:1234/v1
 LMSTUDIO_MODEL=local-model
 LMSTUDIO_TIMEOUT=60
 LOG_LEVEL=INFO
+
+# Gmail G0 (optional; disabled by default)
+GMAIL_ENABLED=false
+GMAIL_CLIENT_SECRET_PATH=
+GMAIL_TOKEN_PATH=
+GMAIL_SYNC_LABEL=LMStudio
+GMAIL_SYNC_LIMIT=100
+APP_TIMEZONE=Asia/Jerusalem
 ```
 
 Copy `.env.example` to `.env` and adjust paths for your machine. Never commit real credentials.
@@ -95,21 +116,21 @@ Only enable PostgreSQL for disposable development or test databases:
 # Optional: switch runtime (experimental)
 export DATABASE_URL=postgresql://user:password@localhost:5432/contacts_dev
 
-# Create schema (first run on a disposable DB)
-python -c "from persistence.session import init_schema; import os; init_schema(os.environ['DATABASE_URL'])"
+# Initialize schema with Alembic (required before first use)
+DATABASE_URL=postgresql://user:password@localhost:5432/contacts_dev alembic upgrade head
 
 # Migrate existing SQLite data — ALWAYS dry-run first; back up valuable data first
 python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL" --dry-run
 python scripts/migrate_sqlite_to_postgres.py --sqlite-path leads.db --database-url "$DATABASE_URL"
-
-# Alembic baseline (future migrations)
-DATABASE_URL=... alembic upgrade head
 ```
+
+PostgreSQL schema is created only through Alembic migrations (`alembic upgrade head`). Runtime startup does not call SQLAlchemy `create_all()` for PostgreSQL; if migrations have not been applied, the app fails with a clear error.
 
 **Warning:** Do not run migration against production or valuable `leads.db` data without a dry-run, a backup, and a disposable PostgreSQL target. Review the JSON reconciliation report for skipped and conflicting records before trusting results.
 
 PostgreSQL integration tests (optional; requires disposable `TEST_DATABASE_URL`):
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test python -m pytest tests/test_pg_integration.py -v
+DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test alembic upgrade head
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/contacts_test python -m pytest tests/test_pg_integration.py tests/test_pg_schema_initialization.py -v
 ```

@@ -88,6 +88,20 @@ def _org_metadata(lead: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _preload_legacy_maps(
+    session: Session,
+) -> tuple[Dict[int, Organization], Dict[int, Person]]:
+    org_by_legacy: Dict[int, Organization] = {}
+    person_by_legacy: Dict[int, Person] = {}
+    for org in session.scalars(select(Organization)).all():
+        if org.legacy_lead_id is not None:
+            org_by_legacy[org.legacy_lead_id] = org
+    for person in session.scalars(select(Person)).all():
+        if person.legacy_person_id is not None:
+            person_by_legacy[person.legacy_person_id] = person
+    return org_by_legacy, person_by_legacy
+
+
 def migrate(
     sqlite_path: Path,
     database_url: str,
@@ -101,8 +115,7 @@ def migrate(
 
     engine = get_engine(database_url)
     session = Session(bind=engine)
-    org_by_legacy: Dict[int, Organization] = {}
-    person_by_legacy: Dict[int, Person] = {}
+    org_by_legacy, person_by_legacy = _preload_legacy_maps(session)
 
     try:
         for lead in rows["leads"]:
@@ -158,10 +171,20 @@ def migrate(
 
         for person_row in rows["people"]:
             legacy_person_id = person_row.get("id")
+            if legacy_person_id is None:
+                report.skipped.append("person:missing_id")
+                continue
             lead_id = person_row.get("lead_id")
             org = org_by_legacy.get(lead_id)
             if not org:
                 report.skipped.append(f"person:{legacy_person_id}:missing_org")
+                continue
+            existing = session.scalar(
+                select(Person).where(Person.legacy_person_id == legacy_person_id)
+            )
+            if existing:
+                report.conflicts.append(f"person:legacy_person_id:{legacy_person_id}")
+                person_by_legacy[legacy_person_id] = existing
                 continue
             person = Person(
                 organization_id=org.id,
@@ -170,6 +193,7 @@ def migrate(
                 title=person_row.get("title"),
                 is_decision_maker=bool(person_row.get("is_decision_maker")),
                 relevance_reason=person_row.get("relevance_reason"),
+                legacy_person_id=legacy_person_id,
                 legacy_metadata={
                     "legacy_person_id": legacy_person_id,
                     "department": person_row.get("department"),
@@ -251,9 +275,23 @@ def migrate(
             session.add(extraction)
 
         for item in rows["interactions"]:
+            legacy_interaction_id = item.get("id")
+            if legacy_interaction_id is None:
+                report.skipped.append("interaction:missing_id")
+                continue
             org = org_by_legacy.get(item.get("lead_id"))
             if not org:
-                report.skipped.append(f"interaction:{item.get('id')}:missing_org")
+                report.skipped.append(f"interaction:{legacy_interaction_id}:missing_org")
+                continue
+            existing = session.scalar(
+                select(Interaction).where(
+                    Interaction.legacy_interaction_id == legacy_interaction_id
+                )
+            )
+            if existing:
+                report.conflicts.append(
+                    f"interaction:legacy_interaction_id:{legacy_interaction_id}"
+                )
                 continue
             session.add(
                 Interaction(
@@ -261,7 +299,7 @@ def migrate(
                     kind=item.get("type"),
                     summary=item.get("summary"),
                     requires_followup=bool(item.get("reply_needed")),
-                    legacy_interaction_id=item.get("id"),
+                    legacy_interaction_id=legacy_interaction_id,
                     legacy_metadata={
                         "subject": item.get("subject"),
                         "body": item.get("body"),
@@ -277,9 +315,19 @@ def migrate(
             report.migrated_interactions += 1
 
         for item in rows["tasks"]:
+            legacy_task_id = item.get("id")
+            if legacy_task_id is None:
+                report.skipped.append("task:missing_id")
+                continue
             org = org_by_legacy.get(item.get("lead_id"))
             if not org:
-                report.skipped.append(f"task:{item.get('id')}:missing_org")
+                report.skipped.append(f"task:{legacy_task_id}:missing_org")
+                continue
+            existing = session.scalar(
+                select(Task).where(Task.legacy_task_id == legacy_task_id)
+            )
+            if existing:
+                report.conflicts.append(f"task:legacy_task_id:{legacy_task_id}")
                 continue
             due = item.get("due_date")
             due_at = datetime.fromisoformat(due) if due else None
@@ -290,7 +338,7 @@ def migrate(
                     priority=item.get("priority"),
                     status=item.get("status") or "open",
                     due_at=due_at,
-                    legacy_task_id=item.get("id"),
+                    legacy_task_id=legacy_task_id,
                     legacy_metadata={
                         "source_interaction_id": item.get("source_interaction_id"),
                         "person_id": item.get("person_id"),

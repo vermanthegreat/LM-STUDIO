@@ -3,13 +3,37 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+from discovery_models import DiscoveryRequest
+from research_job_models import (
+    ADAPTER_KEYS,
+    DEFAULT_LEASE_SECONDS,
+    MAX_LEASE_SECONDS,
+    MAX_WORKER_ID_LENGTH,
+    MAX_RECOVERY_LIMIT,
+    MAX_RETRY_DELAY_SECONDS,
+    MIN_LEASE_SECONDS,
+    RESEARCH_JOB_ACTIVE_STATES,
+    ResearchJobCreate,
+    ResearchJobFinalization,
+    ResearchJobError,
+    ResearchJobListFilter,
+    ResearchJobRecord,
+    ResearchJobRetrySchedule,
+    ResearchJobResultSummary,
+    ResearchJobStatus,
+    canonical_request_json,
+    research_intent_key,
+)
 
 DB_PATH = Path(__file__).parent / "leads.db"
 
@@ -39,6 +63,7 @@ CREATE TABLE IF NOT EXISTS leads (
     status TEXT DEFAULT 'new',
     confidence REAL DEFAULT 0.0,
     extraction_status TEXT DEFAULT 'ok',
+    enrichment_status TEXT DEFAULT 'pending',
     possible_duplicate INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -59,10 +84,15 @@ CREATE TABLE IF NOT EXISTS people (
     linkedin_url TEXT,
     is_decision_maker INTEGER DEFAULT 0,
     is_relevant_contact INTEGER DEFAULT 0,
+    role_type TEXT,
     relevance_reason TEXT,
     confidence REAL DEFAULT 0.0,
+    email_status TEXT DEFAULT 'unknown',
+    email_confidence REAL DEFAULT 0.0,
+    last_verified_at TEXT,
     raw_source_id INTEGER REFERENCES raw_sources(id) ON DELETE SET NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    updated_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_people_lead_id ON people(lead_id);
@@ -138,6 +168,150 @@ CREATE TABLE IF NOT EXISTS command_log (
 
 CREATE INDEX IF NOT EXISTS idx_command_log_status ON command_log(status);
 CREATE INDEX IF NOT EXISTS idx_command_log_correlation_id ON command_log(correlation_id);
+
+CREATE TABLE IF NOT EXISTS person_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    raw_source_id INTEGER NOT NULL REFERENCES raw_sources(id) ON DELETE CASCADE,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    normalized_name TEXT NOT NULL CHECK (length(trim(normalized_name)) > 0),
+    title TEXT,
+    role_type TEXT NOT NULL,
+    is_decision_maker INTEGER NOT NULL CHECK (is_decision_maker IN (0, 1)),
+    profile_url TEXT,
+    source_type TEXT NOT NULL,
+    source_url TEXT,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    relevance_reason TEXT,
+    discovery_method TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needs_review',
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    applied_person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((status = 'applied' AND applied_person_id IS NOT NULL) OR
+           (status <> 'applied' AND applied_person_id IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_candidates_lead ON person_candidates(lead_id);
+CREATE INDEX IF NOT EXISTS idx_person_candidates_reuse_profile ON person_candidates(lead_id, raw_source_id, profile_url);
+CREATE INDEX IF NOT EXISTS idx_person_candidates_reuse_name ON person_candidates(lead_id, raw_source_id, normalized_name, role_type);
+CREATE INDEX IF NOT EXISTS idx_person_candidates_status ON person_candidates(status);
+
+CREATE TABLE IF NOT EXISTS contact_method_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    raw_source_id INTEGER NOT NULL REFERENCES raw_sources(id) ON DELETE CASCADE,
+    person_candidate_id INTEGER REFERENCES person_candidates(id) ON DELETE CASCADE,
+    person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL CHECK (length(trim(value)) > 0),
+    normalized_value TEXT NOT NULL CHECK (length(trim(normalized_value)) > 0),
+    source_url TEXT,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    verification_status TEXT NOT NULL DEFAULT 'unverified',
+    evidence_basis TEXT NOT NULL,
+    discovery_method TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needs_review',
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    applied_contact_method_id INTEGER,
+    discovered_at TEXT NOT NULL,
+    verified_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((person_candidate_id IS NOT NULL AND person_id IS NULL) OR
+           (person_candidate_id IS NULL AND person_id IS NOT NULL)),
+    CHECK ((status = 'applied' AND applied_contact_method_id IS NOT NULL) OR
+           (status <> 'applied' AND applied_contact_method_id IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_lead ON contact_method_candidates(lead_id);
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_reuse_candidate ON contact_method_candidates(person_candidate_id, raw_source_id, kind, normalized_value);
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_reuse_person ON contact_method_candidates(person_id, raw_source_id, kind, normalized_value);
+CREATE INDEX IF NOT EXISTS idx_contact_candidates_status ON contact_method_candidates(status);
+
+CREATE TABLE IF NOT EXISTS research_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    adapter_key TEXT NOT NULL,
+    intent_key TEXT NOT NULL,
+    request_job_id TEXT NOT NULL,
+    request_snapshot_json TEXT NOT NULL,
+    target_roles_json TEXT NOT NULL,
+    approved_source_types_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'running', 'retry_wait', 'succeeded', 'partial', 'no_result', 'needs_review', 'failed', 'cancelled', 'abandoned')),
+    priority INTEGER NOT NULL CHECK (priority >= 0 AND priority <= 100),
+    requested_result_limit INTEGER NOT NULL CHECK (requested_result_limit >= 1 AND requested_result_limit <= 5),
+    max_pages INTEGER NOT NULL CHECK (max_pages >= 1 AND max_pages <= 5),
+    max_requests INTEGER NOT NULL CHECK (max_requests >= 1 AND max_requests <= 5),
+    timeout_seconds INTEGER NOT NULL CHECK (timeout_seconds >= 1 AND timeout_seconds <= 30),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1 AND max_attempts <= 3),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    not_before TEXT,
+    requested_by TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    provider_config_ref TEXT NOT NULL,
+    claimed_by TEXT,
+    lease_token TEXT,
+    claimed_at TEXT,
+    lease_expires_at TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    result_summary_json TEXT,
+    safe_error_code TEXT,
+    retry_after TEXT,
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_research_jobs_active_intent
+    ON research_jobs(intent_key)
+    WHERE status IN ('queued', 'claimed', 'running', 'retry_wait');
+CREATE INDEX IF NOT EXISTS idx_research_jobs_lead_created
+    ON research_jobs(lead_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_research_jobs_queue
+    ON research_jobs(status, not_before, priority, created_at, id);
+
+CREATE TABLE IF NOT EXISTS research_job_materializations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    research_job_id INTEGER NOT NULL REFERENCES research_jobs(id) ON DELETE CASCADE,
+    attempt_count INTEGER NOT NULL CHECK (attempt_count > 0),
+    outcome_digest TEXT NOT NULL CHECK (length(outcome_digest) = 64),
+    outcome_status TEXT NOT NULL CHECK (outcome_status IN ('succeeded', 'partial', 'no_result', 'needs_review')),
+    source_count INTEGER NOT NULL CHECK (source_count >= 0),
+    person_candidate_count INTEGER NOT NULL CHECK (person_candidate_count >= 0),
+    contact_candidate_count INTEGER NOT NULL CHECK (contact_candidate_count >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE(research_job_id, attempt_count)
+);
+
+CREATE TABLE IF NOT EXISTS research_job_materialization_sources (
+    materialization_id INTEGER NOT NULL REFERENCES research_job_materializations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    raw_source_id INTEGER NOT NULL REFERENCES raw_sources(id) ON DELETE RESTRICT,
+    PRIMARY KEY (materialization_id, ordinal),
+    UNIQUE(materialization_id, raw_source_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_job_materialization_person_candidates (
+    materialization_id INTEGER NOT NULL REFERENCES research_job_materializations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    person_candidate_id INTEGER NOT NULL REFERENCES person_candidates(id) ON DELETE RESTRICT,
+    PRIMARY KEY (materialization_id, ordinal),
+    UNIQUE(materialization_id, person_candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_job_materialization_contact_candidates (
+    materialization_id INTEGER NOT NULL REFERENCES research_job_materializations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    contact_candidate_id INTEGER NOT NULL REFERENCES contact_method_candidates(id) ON DELETE RESTRICT,
+    PRIMARY KEY (materialization_id, ordinal),
+    UNIQUE(materialization_id, contact_candidate_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_job_materializations_job
+    ON research_job_materializations(research_job_id, attempt_count);
 """
 
 
@@ -264,15 +438,82 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "supported_locations_json": "TEXT",
         "languages_json": "TEXT",
         "featured_work_json": "TEXT",
+        "enrichment_status": "TEXT DEFAULT 'pending'",
     }
     for col, col_type in lead_migrations.items():
         if col not in lead_cols:
             conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {col_type}")
 
     people_cols = {row[1] for row in conn.execute("PRAGMA table_info(people)").fetchall()}
-    if "email" not in people_cols:
-        conn.execute("ALTER TABLE people ADD COLUMN email TEXT")
+    people_migrations = {
+        "email": "TEXT",
+        "role_type": "TEXT",
+        "email_status": "TEXT DEFAULT 'unknown'",
+        "email_confidence": "REAL DEFAULT 0.0",
+        "last_verified_at": "TEXT",
+        "updated_at": "TEXT",
+    }
+    for col, col_type in people_migrations.items():
+        if col not in people_cols:
+            conn.execute(f"ALTER TABLE people ADD COLUMN {col} {col_type}")
+    from models import EMAIL_STATUSES, ROLE_TYPES, normalize_email_enrichment
+    from scoring import derive_person_role_fields
+    for row in conn.execute("SELECT * FROM people").fetchall():
+        stored_role = row["role_type"]
+        role_type = (
+            stored_role
+            if stored_role in ROLE_TYPES
+            else "other"
+            if stored_role
+            else None
+        )
+        stored_email_status = (
+            row["email_status"] if row["email_status"] in EMAIL_STATUSES else "unknown"
+        )
+        stored_email_confidence = row["email_confidence"]
+        try:
+            numeric_email_confidence = float(stored_email_confidence or 0.0)
+        except (TypeError, ValueError):
+            numeric_email_confidence = 0.0
+        if not 0.0 <= numeric_email_confidence <= 1.0:
+            numeric_email_confidence = 0.0
+        classification = derive_person_role_fields(row["title"], role_type)
+        email_metadata = normalize_email_enrichment(
+            has_email=bool(normalize_email(row["email"])),
+            email_status=stored_email_status,
+            email_confidence=numeric_email_confidence,
+            last_verified_at=row["last_verified_at"],
+        )
+        conn.execute(
+            """UPDATE people SET role_type = ?, is_decision_maker = ?,
+               is_relevant_contact = ?, relevance_reason = ?,
+               email_status = ?, email_confidence = ?, last_verified_at = ?,
+               updated_at = COALESCE(updated_at, created_at)
+               WHERE id = ?""",
+            (
+                classification["role_type"],
+                int(classification["is_decision_maker"]),
+                int(classification["is_relevant_contact"]),
+                classification["relevance_reason"],
+                email_metadata["email_status"],
+                email_metadata["email_confidence"],
+                email_metadata["last_verified_at"],
+                row["id"],
+            ),
+        )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_people_email ON people(email)")
+
+    task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "created_by_command_id" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN created_by_command_id TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_created_by_command_id "
+        "ON tasks(created_by_command_id) WHERE created_by_command_id IS NOT NULL"
+    )
+
+    from gmail_db import ensure_gmail_tables
+
+    ensure_gmail_tables(conn)
 
 
 def _json_dumps(obj: Any) -> Optional[str]:
@@ -335,6 +576,63 @@ def find_matching_leads(
         return _run(c)
 
 
+def find_company_identity_candidates(
+    evidence_kind: str,
+    value: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[Dict[str, Any]]:
+    """Return leads matching one exact, normalized company-identity fact."""
+    allowed = {
+        "domain", "email_domain", "linkedin_company_url", "normalized_name", "source_alias",
+    }
+    if evidence_kind not in allowed or not value:
+        return []
+
+    def _run(c: sqlite3.Connection) -> List[Dict[str, Any]]:
+        lead_ids: set[int] = set()
+        if evidence_kind == "domain":
+            rows = c.execute("SELECT id FROM leads WHERE lower(domain) = ?", (value,)).fetchall()
+            lead_ids.update(int(row["id"]) for row in rows)
+        elif evidence_kind == "email_domain":
+            rows = c.execute(
+                """SELECT id FROM leads
+                   WHERE lower(domain) = ?
+                      OR lower(substr(company_email, instr(company_email, '@') + 1)) = ?""",
+                (value, value),
+            ).fetchall()
+            lead_ids.update(int(row["id"]) for row in rows)
+        elif evidence_kind == "normalized_name":
+            rows = c.execute("SELECT id FROM leads WHERE normalized_name = ?", (value,)).fetchall()
+            lead_ids.update(int(row["id"]) for row in rows)
+        else:
+            rows = c.execute(
+                "SELECT lead_id, parsed_json FROM raw_sources WHERE lead_id IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                parsed = _json_loads(row["parsed_json"], {}) or {}
+                if evidence_kind == "linkedin_company_url":
+                    stored = normalize_linkedin_url(parsed.get("linkedin_company_url"))
+                    if stored == value:
+                        lead_ids.add(int(row["lead_id"]))
+                else:
+                    aliases = parsed.get("company_aliases") or []
+                    if any(normalize_name(alias) == value for alias in aliases if isinstance(alias, str)):
+                        lead_ids.add(int(row["lead_id"]))
+        if not lead_ids:
+            return []
+        placeholders = ",".join("?" for _ in lead_ids)
+        rows = c.execute(
+            f"SELECT * FROM leads WHERE id IN ({placeholders}) ORDER BY id", sorted(lead_ids)
+        ).fetchall()
+        return [_hydrate_lead_row(dict(row)) for row in rows]
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
 def find_leads_by_email(
     email: str,
     db_path: Path = DB_PATH,
@@ -354,6 +652,49 @@ def find_leads_by_email(
             (domain, norm),
         ).fetchall()
         return [_hydrate_lead_row(dict(r)) for r in rows]
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def find_exact_email_matches(
+    email: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[Dict[str, Any]]:
+    norm = normalize_email(email)
+    if not norm:
+        return []
+
+    def _run(c: sqlite3.Connection) -> List[Dict[str, Any]]:
+        matches: List[Dict[str, Any]] = []
+        people_rows = c.execute(
+            "SELECT id, lead_id, email FROM people WHERE lower(email) = ?",
+            (norm,),
+        ).fetchall()
+        for row in people_rows:
+            matches.append(
+                {
+                    "lead_id": row["lead_id"],
+                    "person_id": row["id"],
+                    "kind": "person",
+                }
+            )
+        lead_rows = c.execute(
+            "SELECT id FROM leads WHERE lower(company_email) = ?",
+            (norm,),
+        ).fetchall()
+        for row in lead_rows:
+            matches.append(
+                {
+                    "lead_id": row["id"],
+                    "person_id": None,
+                    "kind": "organization",
+                }
+            )
+        return matches
 
     if conn is not None:
         return _run(conn)
@@ -399,6 +740,228 @@ def create_raw_source(
     if conn is not None:
         return _run(conn)
     with get_conn(db_path) as c:
+        return _run(c)
+
+
+def _candidate_connection(db_path: Path, conn: Optional[sqlite3.Connection]):
+    if conn is not None:
+        @contextmanager
+        def _existing_connection():
+            yield conn
+        return _existing_connection()
+    return get_conn(db_path)
+
+
+def _begin_candidate_write(c: sqlite3.Connection) -> None:
+    """Serialize the candidate read-then-insert section at SQLite's write boundary."""
+    if not c.in_transaction:
+        c.execute("BEGIN IMMEDIATE")
+
+
+def _candidate_refs(c: sqlite3.Connection, lead_id: int, raw_source_id: int) -> sqlite3.Row:
+    lead = c.execute("SELECT id FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    if lead is None:
+        from candidate_models import CandidateError
+        raise CandidateError("lead_not_found", "lead not found")
+    source = c.execute("SELECT lead_id FROM raw_sources WHERE id = ?", (raw_source_id,)).fetchone()
+    if source is None:
+        from candidate_models import CandidateError
+        raise CandidateError("raw_source_not_found", "raw source not found")
+    if source["lead_id"] != lead_id:
+        from candidate_models import CandidateError
+        raise CandidateError("raw_source_ownership_mismatch", "raw source belongs to another lead")
+    return source
+
+
+def _candidate_status(status: str, applied_id: Optional[int]) -> None:
+    from candidate_models import CANDIDATE_STATUSES, CandidateError, require_enum
+
+    require_enum(status, CANDIDATE_STATUSES, "invalid_candidate_status", "candidate status")
+    if status == "applied" and applied_id is None:
+        raise CandidateError("invalid_applied_binding", "applied status requires an applied identifier")
+    if status != "applied" and applied_id is not None:
+        raise CandidateError("invalid_applied_binding", "only applied status may have an applied identifier")
+
+
+def create_or_reuse_person_candidate(
+    lead_id: int,
+    raw_source_id: int,
+    *,
+    name: str,
+    title: Optional[str] = None,
+    role_type: str = "other",
+    is_decision_maker: bool = False,
+    profile_url: Optional[str] = None,
+    source_type: str,
+    source_url: Optional[str] = None,
+    confidence: float = 0.0,
+    relevance_reason: Optional[str] = None,
+    discovery_method: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    from candidate_models import DISCOVERY_METHODS, CandidateError, normalize_profile_url, require_confidence, require_enum, normalize_candidate_name
+    normalized_name = normalize_candidate_name(name)
+    profile_url = normalize_profile_url(profile_url)
+    require_enum(role_type, __import__("models").ROLE_TYPES, "invalid_role_type", "role_type")
+    require_enum(discovery_method, DISCOVERY_METHODS, "invalid_discovery_method", "discovery_method")
+    numeric_confidence = require_confidence(confidence)
+
+    def _run(c: sqlite3.Connection) -> Dict[str, Any]:
+        _begin_candidate_write(c)
+        _candidate_refs(c, lead_id, raw_source_id)
+        query = """SELECT * FROM person_candidates
+                   WHERE lead_id = ? AND raw_source_id = ? AND
+                   ((? IS NOT NULL AND profile_url = ?) OR
+                    (? IS NULL AND normalized_name = ? AND role_type = ?))
+                   ORDER BY id LIMIT 1"""
+        existing = c.execute(query, (lead_id, raw_source_id, profile_url, profile_url, profile_url, normalized_name, role_type)).fetchone()
+        if existing is not None:
+            return dict(existing)
+        now = _now()
+        cur = c.execute(
+            """INSERT INTO person_candidates
+               (lead_id, raw_source_id, name, normalized_name, title, role_type,
+                is_decision_maker, profile_url, source_type, source_url, confidence,
+                relevance_reason, discovery_method, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lead_id, raw_source_id, name.strip(), normalized_name, title, role_type,
+             int(is_decision_maker), profile_url, source_type, source_url, numeric_confidence,
+             relevance_reason, discovery_method, now, now),
+        )
+        return dict(c.execute("SELECT * FROM person_candidates WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def get_person_candidate(candidate_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Optional[Dict[str, Any]]:
+    def _run(c: sqlite3.Connection):
+        row = c.execute("SELECT * FROM person_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def list_person_candidates_for_lead(lead_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
+    def _run(c: sqlite3.Connection):
+        return [dict(row) for row in c.execute("SELECT * FROM person_candidates WHERE lead_id = ? ORDER BY id", (lead_id,)).fetchall()]
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def update_person_candidate_status(candidate_id: int, expected_version: int, target_status: str, applied_person_id: Optional[int] = None, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    from candidate_models import CandidateError
+    _candidate_status(target_status, applied_person_id)
+    def _run(c: sqlite3.Connection):
+        row = c.execute("SELECT * FROM person_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        if row is None:
+            raise CandidateError("candidate_not_found", "person candidate not found")
+        if row["version"] != expected_version:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        if applied_person_id is not None:
+            person = c.execute("SELECT lead_id FROM people WHERE id = ?", (applied_person_id,)).fetchone()
+            if person is None or person["lead_id"] != row["lead_id"]:
+                raise CandidateError("person_ownership_mismatch", "applied person belongs to another lead")
+        now = _now()
+        result = c.execute("UPDATE person_candidates SET status = ?, applied_person_id = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?", (target_status, applied_person_id, now, candidate_id, expected_version))
+        if result.rowcount != 1:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        return dict(c.execute("SELECT * FROM person_candidates WHERE id = ?", (candidate_id,)).fetchone())
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def create_or_reuse_contact_candidate(
+    lead_id: int,
+    raw_source_id: int,
+    *,
+    person_candidate_id: Optional[int] = None,
+    person_id: Optional[int] = None,
+    kind: str,
+    value: str,
+    normalized_value: Optional[str] = None,
+    source_url: Optional[str] = None,
+    confidence: float = 0.0,
+    verification_status: str = "unverified",
+    evidence_basis: str = "source_confirmed",
+    discovery_method: str,
+    discovered_at: Optional[str] = None,
+    verified_at: Optional[str] = None,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    from candidate_models import CONTACT_KINDS, DISCOVERY_METHODS, CandidateError, normalize_contact_value, require_confidence, require_enum, validate_verification
+    if (person_candidate_id is None) == (person_id is None):
+        raise CandidateError("invalid_owner_binding", "exactly one candidate owner is required")
+    require_enum(kind, CONTACT_KINDS, "invalid_contact_kind", "contact kind")
+    require_enum(discovery_method, DISCOVERY_METHODS, "invalid_discovery_method", "discovery_method")
+    normalized = normalized_value.strip() if normalized_value else normalize_contact_value(kind, value)
+    if not normalized:
+        raise CandidateError("invalid_contact_value", "normalized contact value cannot be blank")
+    numeric_confidence = require_confidence(confidence)
+    validate_verification(evidence_basis, verification_status, verified_at)
+
+    def _run(c: sqlite3.Connection):
+        _begin_candidate_write(c)
+        _candidate_refs(c, lead_id, raw_source_id)
+        if person_candidate_id is not None:
+            owner = c.execute("SELECT lead_id FROM person_candidates WHERE id = ?", (person_candidate_id,)).fetchone()
+            if owner is None or owner["lead_id"] != lead_id:
+                raise CandidateError("person_candidate_ownership_mismatch", "person candidate belongs to another lead")
+            owner_clause, owner_value = "person_candidate_id = ?", person_candidate_id
+        else:
+            owner = c.execute("SELECT lead_id FROM people WHERE id = ?", (person_id,)).fetchone()
+            if owner is None or owner["lead_id"] != lead_id:
+                raise CandidateError("person_ownership_mismatch", "person belongs to another lead")
+            owner_clause, owner_value = "person_id = ?", person_id
+        existing = c.execute(f"SELECT * FROM contact_method_candidates WHERE {owner_clause} AND raw_source_id = ? AND kind = ? AND normalized_value = ? LIMIT 1", (owner_value, raw_source_id, kind, normalized)).fetchone()
+        if existing is not None:
+            return dict(existing)
+        now = _now()
+        cur = c.execute("""INSERT INTO contact_method_candidates
+            (lead_id, raw_source_id, person_candidate_id, person_id, kind, value,
+             normalized_value, source_url, confidence, verification_status, evidence_basis,
+             discovery_method, discovered_at, created_at, updated_at, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (lead_id, raw_source_id, person_candidate_id, person_id, kind, value.strip(), normalized,
+             source_url, numeric_confidence, verification_status, evidence_basis, discovery_method,
+             discovered_at or now, now, now, verified_at))
+        return dict(c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (cur.lastrowid,)).fetchone())
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def get_contact_candidate(candidate_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Optional[Dict[str, Any]]:
+    def _run(c):
+        row = c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def list_contact_candidates_for_lead(lead_id: int, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
+    def _run(c):
+        return [dict(row) for row in c.execute("SELECT * FROM contact_method_candidates WHERE lead_id = ? ORDER BY id", (lead_id,)).fetchall()]
+    with _candidate_connection(db_path, conn) as c:
+        return _run(c)
+
+
+def update_contact_candidate_status(candidate_id: int, expected_version: int, target_status: str, applied_contact_method_id: Optional[int] = None, db_path: Path = DB_PATH, conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    from candidate_models import CandidateError
+    _candidate_status(target_status, applied_contact_method_id)
+    def _run(c):
+        row = c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (candidate_id,)).fetchone()
+        if row is None:
+            raise CandidateError("candidate_not_found", "contact candidate not found")
+        if row["version"] != expected_version:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        now = _now()
+        result = c.execute("UPDATE contact_method_candidates SET status = ?, applied_contact_method_id = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?", (target_status, applied_contact_method_id, now, candidate_id, expected_version))
+        if result.rowcount != 1:
+            raise CandidateError("stale_candidate_version", "candidate version is stale")
+        return dict(c.execute("SELECT * FROM contact_method_candidates WHERE id = ?", (candidate_id,)).fetchone())
+    with _candidate_connection(db_path, conn) as c:
         return _run(c)
 
 
@@ -451,6 +1014,7 @@ def upsert_lead(
         "status": data.get("status", "new"),
         "confidence": data.get("confidence", 0.0),
         "extraction_status": data.get("extraction_status", "ok"),
+        "enrichment_status": data.get("enrichment_status", "pending"),
         "possible_duplicate": 1 if possible_duplicate else 0,
         "updated_at": now,
     }
@@ -467,6 +1031,8 @@ def upsert_lead(
             )
             target_id = cur.lastrowid
         else:
+            if "enrichment_status" not in data:
+                fields.pop("enrichment_status", None)
             existing = c.execute("SELECT company_name FROM leads WHERE id = ?", (target_id,)).fetchone()
             merged_name = merge_company_name(
                 existing["company_name"] if existing else None,
@@ -503,6 +1069,37 @@ def add_person(
     now = _now()
     li = normalize_linkedin_url(data.get("linkedin_url"))
     em = normalize_email(data.get("email"))
+    normalized_person_name = normalize_name(data.get("name"))
+    title = (data.get("title") or "").strip() or None
+    from models import EMAIL_STATUSES, normalize_email_enrichment
+    from scoring import derive_person_role_fields
+
+    role_fields = derive_person_role_fields(title, data.get("role_type"))
+    email_metadata = normalize_email_enrichment(
+        has_email=bool(em),
+        email_status=data.get("email_status"),
+        email_confidence=data.get("email_confidence"),
+        last_verified_at=data.get("last_verified_at"),
+    )
+
+    def _stronger_email_status(existing_status: Optional[str]) -> str:
+        priority = {
+            "unknown": 0,
+            "inferred": 1,
+            "pattern_derived": 2,
+            "published": 3,
+            "verified": 4,
+        }
+        current = existing_status if existing_status in EMAIL_STATUSES else "unknown"
+        incoming_status = email_metadata["email_status"]
+        return incoming_status if priority[incoming_status] > priority[current] else current
+
+    def _name_title_conflict(existing: sqlite3.Row) -> bool:
+        existing_title = (existing["title"] or "").strip()
+        if not existing_title or not title:
+            return False
+        old_role = derive_person_role_fields(existing_title, existing["role_type"])["role_type"]
+        return old_role != role_fields["role_type"]
 
     def _run(c: sqlite3.Connection) -> Dict[str, Any]:
         existing = None
@@ -516,25 +1113,84 @@ def add_person(
                 "SELECT * FROM people WHERE lead_id = ? AND lower(email) = ?",
                 (lead_id, em),
             ).fetchone()
+        if not existing and not li and not em and normalized_person_name:
+            candidates = [
+                row
+                for row in c.execute(
+                    "SELECT * FROM people WHERE lead_id = ? AND name IS NOT NULL",
+                    (lead_id,),
+                ).fetchall()
+                if normalize_name(row["name"]) == normalized_person_name
+                and not _name_title_conflict(row)
+            ]
+            existing = candidates[0] if len(candidates) == 1 else None
         if existing:
+            effective_role = role_fields
+            title_update = title
+            existing_role = derive_person_role_fields(
+                existing["title"], existing["role_type"]
+            )
+            if (
+                data.get("role_type") is None
+                and role_fields["role_type"] == "other"
+                and existing_role["role_type"] != "other"
+            ):
+                effective_role = existing_role
+                title_update = None
+
+            existing_email = normalize_email(existing["email"])
+            same_email = bool(em and (not existing_email or existing_email == em))
+            if same_email:
+                merged_email_status = _stronger_email_status(existing["email_status"])
+                merged_email_confidence = max(
+                    float(existing["email_confidence"] or 0.0),
+                    email_metadata["email_confidence"],
+                )
+                merged_last_verified_at = existing["last_verified_at"]
+                if merged_email_status == "verified":
+                    merged_last_verified_at = (
+                        email_metadata["last_verified_at"] or merged_last_verified_at
+                    )
+                else:
+                    merged_last_verified_at = None
+            else:
+                merged_email_status = (
+                    existing["email_status"]
+                    if existing["email_status"] in EMAIL_STATUSES
+                    else "unknown"
+                )
+                merged_email_confidence = float(existing["email_confidence"] or 0.0)
+                merged_last_verified_at = (
+                    existing["last_verified_at"]
+                    if merged_email_status == "verified"
+                    else None
+                )
             c.execute(
-                """UPDATE people SET name=COALESCE(?,name), title=COALESCE(?,title),
+                """UPDATE people SET title=COALESCE(?,title),
                    department=COALESCE(?,department), seniority=COALESCE(?,seniority),
-                   email=COALESCE(?,email), is_decision_maker=?, is_relevant_contact=?,
-                   relevance_reason=COALESCE(?,relevance_reason),
-                   confidence=?, raw_source_id=COALESCE(?,raw_source_id)
+                   email=COALESCE(email,?), linkedin_url=COALESCE(linkedin_url,?),
+                   is_decision_maker=?, is_relevant_contact=?, role_type=?,
+                   relevance_reason=?,
+                   confidence=?, email_status=?, email_confidence=?,
+                   last_verified_at=?,
+                   raw_source_id=COALESCE(?,raw_source_id), updated_at=?
                    WHERE id=?""",
                 (
-                    data.get("name"),
-                    data.get("title"),
+                    title_update,
                     data.get("department"),
                     data.get("seniority"),
                     em,
-                    int(data.get("is_decision_maker", 0)),
-                    int(data.get("is_relevant_contact", 0)),
-                    data.get("relevance_reason"),
+                    li,
+                    int(effective_role["is_decision_maker"]),
+                    int(effective_role["is_relevant_contact"]),
+                    effective_role["role_type"],
+                    effective_role["relevance_reason"],
                     data.get("confidence", 0.0),
+                    merged_email_status,
+                    merged_email_confidence,
+                    merged_last_verified_at,
                     raw_source_id,
+                    now,
                     existing["id"],
                 ),
             )
@@ -543,22 +1199,28 @@ def add_person(
         cur = c.execute(
             """INSERT INTO people
                (lead_id, name, title, department, seniority, email, linkedin_url,
-                is_decision_maker, is_relevant_contact, relevance_reason,
-                confidence, raw_source_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                is_decision_maker, is_relevant_contact, role_type, relevance_reason,
+                confidence, email_status, email_confidence, last_verified_at,
+                raw_source_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 lead_id,
                 data.get("name"),
-                data.get("title"),
+                title,
                 data.get("department"),
                 data.get("seniority"),
                 em,
                 li,
-                int(data.get("is_decision_maker", 0)),
-                int(data.get("is_relevant_contact", 0)),
-                data.get("relevance_reason"),
+                int(role_fields["is_decision_maker"]),
+                int(role_fields["is_relevant_contact"]),
+                role_fields["role_type"],
+                role_fields["relevance_reason"],
                 data.get("confidence", 0.0),
+                email_metadata["email_status"],
+                email_metadata["email_confidence"],
+                email_metadata["last_verified_at"],
                 raw_source_id,
+                now,
                 now,
             ),
         )
@@ -618,13 +1280,26 @@ def add_task(
     conn: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
     now = _now()
+    created_by_command_id = data.get("created_by_command_id")
+
+    def _find_existing(c: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+        if not created_by_command_id:
+            return None
+        row = c.execute(
+            "SELECT * FROM tasks WHERE created_by_command_id = ?",
+            (str(created_by_command_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
     def _run(c: sqlite3.Connection) -> Dict[str, Any]:
+        existing = _find_existing(c)
+        if existing is not None:
+            return existing
         cur = c.execute(
             """INSERT INTO tasks
                (lead_id, person_id, title, due_date, priority, status,
-                source_interaction_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_interaction_id, created_at, created_by_command_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 lead_id,
                 data.get("person_id"),
@@ -634,10 +1309,29 @@ def add_task(
                 data.get("status", "open"),
                 data.get("source_interaction_id"),
                 now,
+                str(created_by_command_id) if created_by_command_id else None,
             ),
         )
         row = c.execute("SELECT * FROM tasks WHERE id = ?", (cur.lastrowid,)).fetchone()
         return dict(row)
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def find_task_by_created_by_command_id(
+    command_id: str,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[Dict[str, Any]]:
+    def _run(c: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+        row = c.execute(
+            "SELECT * FROM tasks WHERE created_by_command_id = ?",
+            (str(command_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
     if conn is not None:
         return _run(conn)
@@ -672,8 +1366,11 @@ def _hydrate_lead_row(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
-def list_leads(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
-    sql = """
+def list_leads(
+    db_path: Path = DB_PATH,
+    research_only: bool = False,
+) -> List[Dict[str, Any]]:
+    base_sql = """
     SELECT l.*,
            (SELECT COUNT(*) FROM people p WHERE p.lead_id = l.id) AS people_count,
            (SELECT COUNT(*) FROM people p WHERE p.lead_id = l.id AND p.is_decision_maker = 1) > 0 AS has_decision_maker,
@@ -684,8 +1381,14 @@ def list_leads(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
             LEFT JOIN interactions i ON i.lead_id = l2.id AND i.status = 'open' AND i.deadline IS NOT NULL
             WHERE l2.id = l.id) AS next_deadline
     FROM leads l
-    ORDER BY l.fit_score DESC, l.updated_at DESC
     """
+    if research_only:
+        sql = f"""SELECT * FROM ({base_sql}) AS lead_stats
+        WHERE enrichment_status IN ('pending', 'in_progress', 'needs_review')
+          AND (people_count < 2 OR has_decision_maker = 0)
+        ORDER BY fit_score DESC, has_decision_maker ASC, people_count ASC, updated_at DESC"""
+    else:
+        sql = base_sql + " ORDER BY l.fit_score DESC, l.updated_at DESC, l.id ASC"
     with get_conn(db_path) as conn:
         rows = conn.execute(sql).fetchall()
     result = []
@@ -733,7 +1436,9 @@ def get_lead(
             return None
         lead = _hydrate_lead_row(dict(row))
         lead["people"] = [dict(r) for r in c.execute(
-            "SELECT * FROM people WHERE lead_id = ? ORDER BY is_decision_maker DESC, name",
+            """SELECT p.*, rs.source_type, rs.source_url
+               FROM people p LEFT JOIN raw_sources rs ON rs.id = p.raw_source_id
+               WHERE p.lead_id = ? ORDER BY p.is_decision_maker DESC, p.name""",
             (lead_id,),
         ).fetchall()]
         lead["interactions"] = [dict(r) for r in c.execute(
@@ -824,6 +1529,7 @@ def get_contact_summary(db_path: Path = DB_PATH) -> Dict[str, int]:
         "with_people": with_people,
         "with_person_email": with_person_email,
         "with_any_email": with_any_email,
+        "with_verified_email": 0,
         "without_email": companies - with_any_email,
         "email_interactions": email_interactions,
     }
@@ -879,8 +1585,12 @@ def get_leads_without_contacts(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def get_followups_due(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
-    now = _now()[:10]
+def get_followups_due(
+    db_path: Path = DB_PATH,
+    due_on_or_before: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> List[Dict[str, Any]]:
+    cutoff = str(due_on_or_before or _now()[:10])[:10]
     sql = """
     SELECT l.company_name, l.id AS lead_id, t.title, t.due_date, t.priority, 'task' AS item_type
     FROM tasks t JOIN leads l ON l.id = t.lead_id
@@ -891,8 +1601,11 @@ def get_followups_due(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
     WHERE i.status = 'open' AND i.deadline IS NOT NULL AND i.deadline <= ?
     ORDER BY due_date ASC
     """
+    if conn is not None:
+        rows = conn.execute(sql, (cutoff, cutoff)).fetchall()
+        return [dict(r) for r in rows]
     with get_conn(db_path) as conn:
-        rows = conn.execute(sql, (now, now)).fetchall()
+        rows = conn.execute(sql, (cutoff, cutoff)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1002,3 +1715,802 @@ def export_leads_csv(db_path: Path = DB_PATH) -> str:
             _csv_cell(l.get("next_deadline")),
         ])
     return output.getvalue()
+
+
+def _research_job_datetime(value: Optional[str]) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ResearchJobError("invalid_request_snapshot", "stored research-job timestamp is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ResearchJobError("invalid_request_snapshot", "stored research-job timestamp is not timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _research_job_record(row: sqlite3.Row) -> ResearchJobRecord:
+    try:
+        snapshot_json = str(row["request_snapshot_json"])
+        snapshot = DiscoveryRequest.model_validate(json.loads(snapshot_json))
+        target_roles = tuple(json.loads(row["target_roles_json"]))
+        source_types = tuple(json.loads(row["approved_source_types_json"]))
+        return ResearchJobRecord(
+            id=int(row["id"]),
+            lead_id=int(row["lead_id"]),
+            adapter_key=str(row["adapter_key"]),
+            intent_key=str(row["intent_key"]),
+            request_job_id=str(row["request_job_id"]),
+            request_snapshot=snapshot,
+            request_snapshot_json=snapshot_json,
+            target_roles=target_roles,
+            approved_source_types=source_types,
+            status=ResearchJobStatus(row["status"]),
+            priority=int(row["priority"]),
+            requested_result_limit=int(row["requested_result_limit"]),
+            max_pages=int(row["max_pages"]),
+            max_requests=int(row["max_requests"]),
+            timeout_seconds=int(row["timeout_seconds"]),
+            max_attempts=int(row["max_attempts"]),
+            attempt_count=int(row["attempt_count"]),
+            not_before=_research_job_datetime(row["not_before"]),
+            requested_by=str(row["requested_by"]),
+            correlation_id=str(row["correlation_id"]),
+            provider_config_ref=str(row["provider_config_ref"]),
+            claimed_by=row["claimed_by"],
+            lease_token=row["lease_token"],
+            claimed_at=_research_job_datetime(row["claimed_at"]),
+            lease_expires_at=_research_job_datetime(row["lease_expires_at"]),
+            started_at=_research_job_datetime(row["started_at"]),
+            completed_at=_research_job_datetime(row["completed_at"]),
+            result_summary_json=row["result_summary_json"],
+            safe_error_code=row["safe_error_code"],
+            retry_after=_research_job_datetime(row["retry_after"]),
+            version=int(row["version"]),
+            created_at=_research_job_datetime(row["created_at"]),
+            updated_at=_research_job_datetime(row["updated_at"]),
+        )
+    except ResearchJobError:
+        raise
+    except Exception as exc:
+        raise ResearchJobError("invalid_request_snapshot", "stored research-job data is invalid") from exc
+
+
+def _is_active_intent_unique_conflict(exc: sqlite3.IntegrityError) -> bool:
+    """Recognize only the research_jobs.intent_key active uniqueness boundary."""
+    if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+        return False
+    if getattr(exc, "sqlite_errorname", None) != "SQLITE_CONSTRAINT_UNIQUE":
+        return False
+    return str(exc).strip() == "UNIQUE constraint failed: research_jobs.intent_key"
+
+
+def enqueue_research_job(
+    job: ResearchJobCreate,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    if not isinstance(job, ResearchJobCreate):
+        raise ResearchJobError("invalid_request", "enqueue requires a validated ResearchJobCreate")
+    snapshot_json = canonical_request_json(job.request)
+    intent_key = research_intent_key(job)
+    roles_json = json.dumps(sorted(set(job.request.target_roles)), separators=(",", ":"))
+    source_types_json = json.dumps(sorted(set(job.request.approved_source_types)), separators=(",", ":"))
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        lead = c.execute("SELECT id FROM leads WHERE id = ?", (job.request.lead_id,)).fetchone()
+        if lead is None:
+            raise ResearchJobError("lead_not_found", "lead not found")
+        now = _now()
+        values = (
+            job.request.lead_id,
+            job.adapter_key,
+            intent_key,
+            job.request.job_id,
+            snapshot_json,
+            roles_json,
+            source_types_json,
+            ResearchJobStatus.QUEUED.value,
+            job.priority,
+            job.request.result_limit,
+            job.request.max_pages,
+            job.request.max_requests,
+            job.request.timeout_seconds,
+            job.max_attempts,
+            0,
+            job.not_before.isoformat() if job.not_before else None,
+            job.request.requester_identity,
+            job.request.correlation_id,
+            job.request.provider_config_ref,
+            1,
+            now,
+            now,
+        )
+        try:
+            cursor = c.execute(
+                """INSERT INTO research_jobs (
+                    lead_id, adapter_key, intent_key, request_job_id,
+                    request_snapshot_json, target_roles_json, approved_source_types_json,
+                    status, priority, requested_result_limit, max_pages, max_requests,
+                    timeout_seconds, max_attempts, attempt_count, not_before,
+                    requested_by, correlation_id, provider_config_ref, version,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+            row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (cursor.lastrowid,)).fetchone()
+            return _research_job_record(row)
+        except sqlite3.IntegrityError as exc:
+            if not _is_active_intent_unique_conflict(exc):
+                raise ResearchJobError("enqueue_persistence_failure", "research job could not be enqueued") from exc
+            existing = c.execute(
+                """SELECT * FROM research_jobs
+                   WHERE intent_key = ? AND status IN ('queued', 'claimed', 'running', 'retry_wait')
+                   ORDER BY id LIMIT 1""",
+                (intent_key,),
+            ).fetchone()
+            if existing is not None:
+                return _research_job_record(existing)
+            raise ResearchJobError("enqueue_persistence_failure", "research job could not be enqueued")
+
+    try:
+        if conn is not None:
+            return _run(conn)
+        with get_conn(db_path) as c:
+            return _run(c)
+    except ResearchJobError:
+        raise
+    except sqlite3.Error as exc:
+        raise ResearchJobError("enqueue_persistence_failure", "research job could not be enqueued") from exc
+
+
+def get_research_job(
+    job_id: int,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
+        raise ResearchJobError("job_not_found", "research job not found")
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise ResearchJobError("job_not_found", "research job not found")
+        return _research_job_record(row)
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def _research_job_filter(
+    *,
+    lead_id: Optional[int],
+    status: Optional[ResearchJobStatus | str],
+    adapter_key: Optional[str],
+    limit: int,
+) -> ResearchJobListFilter:
+    try:
+        return ResearchJobListFilter(lead_id=lead_id, status=status, adapter_key=adapter_key, limit=limit)
+    except Exception as exc:
+        if status is not None:
+            raise ResearchJobError("invalid_status_filter", "invalid research-job status filter") from exc
+        if adapter_key is not None and adapter_key not in ADAPTER_KEYS:
+            raise ResearchJobError("unsupported_adapter", "unsupported research adapter") from exc
+        raise ResearchJobError("invalid_request", "invalid research-job list filter") from exc
+
+
+def list_research_jobs(
+    *,
+    lead_id: Optional[int] = None,
+    status: Optional[ResearchJobStatus | str] = None,
+    adapter_key: Optional[str] = None,
+    limit: int = 50,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[ResearchJobRecord]:
+    filters = _research_job_filter(lead_id=lead_id, status=status, adapter_key=adapter_key, limit=limit)
+
+    def _run(c: sqlite3.Connection) -> list[ResearchJobRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if filters.lead_id is not None:
+            clauses.append("lead_id = ?")
+            params.append(filters.lead_id)
+        if filters.status is not None:
+            clauses.append("status = ?")
+            params.append(filters.status.value)
+        if filters.adapter_key is not None:
+            clauses.append("adapter_key = ?")
+            params.append(filters.adapter_key)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = c.execute(
+            f"SELECT * FROM research_jobs {where} ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
+            (*params, filters.limit),
+        ).fetchall()
+        return [_research_job_record(row) for row in rows]
+
+    if conn is not None:
+        return _run(conn)
+    with get_conn(db_path) as c:
+        return _run(c)
+
+
+def list_research_jobs_for_lead(
+    lead_id: int,
+    *,
+    status: Optional[ResearchJobStatus | str] = None,
+    adapter_key: Optional[str] = None,
+    limit: int = 50,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[ResearchJobRecord]:
+    return list_research_jobs(
+        lead_id=lead_id,
+        status=status,
+        adapter_key=adapter_key,
+        limit=limit,
+        db_path=db_path,
+        conn=conn,
+    )
+
+
+def _validate_worker_id(worker_id: str) -> str:
+    if not isinstance(worker_id, str):
+        raise ResearchJobError("invalid_worker_id", "worker identity is invalid")
+    normalized = worker_id.strip()
+    if not normalized or len(normalized) > MAX_WORKER_ID_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        raise ResearchJobError("invalid_worker_id", "worker identity is invalid")
+    return normalized
+
+
+def _validate_lease_seconds(lease_seconds: int) -> int:
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not MIN_LEASE_SECONDS <= lease_seconds <= MAX_LEASE_SECONDS:
+        raise ResearchJobError("invalid_lease_duration", "lease duration is invalid")
+    return lease_seconds
+
+
+def _owned_immediate_transaction(
+    db_path: Path,
+    conn: Optional[sqlite3.Connection],
+    operation,
+    failure_code: str,
+):
+    """Run one short write transaction without nesting a caller transaction."""
+    if conn is not None:
+        if conn.in_transaction:
+            raise ResearchJobError(failure_code, "research-job transaction ownership is invalid")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = operation(conn)
+            conn.commit()
+            return result
+        except ResearchJobError:
+            conn.rollback()
+            raise
+        except sqlite3.Error as exc:
+            conn.rollback()
+            raise ResearchJobError(failure_code, "research-job persistence failed") from exc
+
+    try:
+        with get_conn(db_path) as owned:
+            owned.execute("BEGIN IMMEDIATE")
+            return operation(owned)
+    except ResearchJobError:
+        raise
+    except sqlite3.Error as exc:
+        raise ResearchJobError(failure_code, "research-job persistence failed") from exc
+
+
+def claim_next_research_job(
+    *,
+    worker_id: str,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[ResearchJobRecord]:
+    normalized_worker = _validate_worker_id(worker_id)
+    duration = _validate_lease_seconds(lease_seconds)
+
+    def _run(c: sqlite3.Connection) -> Optional[ResearchJobRecord]:
+        claimed_at = datetime.now(timezone.utc)
+        claimed_at_text = claimed_at.isoformat()
+        lease_expires_text = (claimed_at + timedelta(seconds=duration)).isoformat()
+        row = c.execute(
+            """SELECT * FROM research_jobs
+               WHERE status IN ('queued', 'retry_wait')
+                 AND (not_before IS NULL OR not_before <= ?)
+                 AND attempt_count < max_attempts
+                 AND lease_token IS NULL
+                 AND claimed_by IS NULL
+                 AND lease_expires_at IS NULL
+               ORDER BY priority DESC,
+                        CASE WHEN not_before IS NULL THEN 0 ELSE 1 END ASC,
+                        not_before ASC,
+                        created_at ASC,
+                        id ASC
+               LIMIT 1""",
+            (claimed_at_text,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = c.execute(
+            """UPDATE research_jobs
+               SET status = 'claimed', claimed_by = ?, lease_token = ?,
+                   claimed_at = ?, lease_expires_at = ?, attempt_count = attempt_count + 1,
+                   version = version + 1, updated_at = ?
+               WHERE id = ?
+                 AND status IN ('queued', 'retry_wait')
+                 AND (not_before IS NULL OR not_before <= ?)
+                 AND attempt_count < max_attempts
+                 AND lease_token IS NULL
+                 AND claimed_by IS NULL
+                 AND lease_expires_at IS NULL
+                 AND version = ?""",
+            (
+                normalized_worker,
+                secrets.token_urlsafe(32),
+                claimed_at_text,
+                lease_expires_text,
+                claimed_at_text,
+                row["id"],
+                claimed_at_text,
+                row["version"],
+            ),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("claim_persistence_failure", "research job claim failed")
+        claimed = c.execute("SELECT * FROM research_jobs WHERE id = ?", (row["id"],)).fetchone()
+        return _research_job_record(claimed)
+
+    return _owned_immediate_transaction(db_path, conn, _run, "claim_persistence_failure")
+
+
+def _lease_guard(
+    row: Optional[sqlite3.Row],
+    *,
+    lease_token: str,
+    expected_version: int,
+    allowed_states: tuple[str, ...],
+    now: datetime,
+) -> None:
+    if row is None:
+        raise ResearchJobError("job_not_found", "research job not found")
+    if row["status"] not in allowed_states:
+        raise ResearchJobError("invalid_claim_state", "research job state is not eligible")
+    if row["version"] != expected_version:
+        raise ResearchJobError("stale_job_version", "research job version is stale")
+    if not isinstance(lease_token, str) or not lease_token or lease_token != row["lease_token"]:
+        raise ResearchJobError("lease_token_mismatch", "research job lease token is invalid")
+    expiry = _research_job_datetime(row["lease_expires_at"])
+    if expiry is None or expiry <= now:
+        raise ResearchJobError("lease_expired", "research job lease has expired")
+
+
+def mark_research_job_running(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("claimed",), now=now)
+        result = c.execute(
+            """UPDATE research_jobs
+               SET status = 'running', started_at = ?, version = version + 1, updated_at = ?
+               WHERE id = ? AND status = 'claimed' AND lease_token = ?
+                 AND version = ? AND lease_expires_at > ?""",
+            (now.isoformat(), now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("lease_update_persistence_failure", "research job state update failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "lease_update_persistence_failure")
+
+
+def renew_research_job_lease(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    duration = _validate_lease_seconds(lease_seconds)
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("claimed", "running"), now=now)
+        expiry = (now + timedelta(seconds=duration)).isoformat()
+        result = c.execute(
+            """UPDATE research_jobs
+               SET lease_expires_at = ?, version = version + 1, updated_at = ?
+               WHERE id = ? AND status IN ('claimed', 'running') AND lease_token = ?
+                 AND version = ? AND lease_expires_at > ?""",
+            (expiry, now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("lease_update_persistence_failure", "research job lease update failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "lease_update_persistence_failure")
+
+
+def _validate_research_job_id_and_version(job_id: int, expected_version: int) -> None:
+    if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id <= 0:
+        raise ResearchJobError("job_not_found", "research job not found")
+    if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+        raise ResearchJobError("stale_job_version", "research job version is stale")
+
+
+def finalize_research_job(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    finalization: ResearchJobFinalization,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    _validate_research_job_id_and_version(job_id, expected_version)
+    if not isinstance(finalization, ResearchJobFinalization):
+        raise ResearchJobError("invalid_finalization", "research job finalization is invalid")
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("running",), now=now)
+        if finalization.summary.candidate_count > row["requested_result_limit"] or finalization.summary.source_count > min(row["max_pages"], row["max_requests"]):
+            raise ResearchJobError("result_count_exceeds_request_bounds", "research-job result counts exceed request bounds")
+        result = c.execute(
+            """UPDATE research_jobs SET status = ?, completed_at = ?, result_summary_json = ?,
+                       safe_error_code = ?, not_before = NULL, retry_after = NULL,
+                       claimed_by = NULL, lease_token = NULL, claimed_at = NULL, lease_expires_at = NULL,
+                       version = version + 1, updated_at = ?
+               WHERE id = ? AND status = 'running' AND lease_token = ? AND version = ? AND lease_expires_at > ?""",
+            (finalization.status.value, now.isoformat(), finalization.summary.canonical_json(), finalization.safe_error_code,
+             now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("finalization_persistence_failure", "research job finalization failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "finalization_persistence_failure")
+
+
+def schedule_research_job_retry(
+    job_id: int,
+    *,
+    lease_token: str,
+    expected_version: int,
+    retry: ResearchJobRetrySchedule,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    _validate_research_job_id_and_version(job_id, expected_version)
+    if not isinstance(retry, ResearchJobRetrySchedule):
+        raise ResearchJobError("invalid_retry_schedule", "research job retry schedule is invalid")
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("running",), now=now)
+        if retry.retry_at < now or retry.retry_at > now + timedelta(seconds=MAX_RETRY_DELAY_SECONDS):
+            raise ResearchJobError("retry_time_out_of_bounds", "research-job retry time is outside bounds")
+        exhausted = row["attempt_count"] >= row["max_attempts"]
+        status = "failed" if exhausted else "retry_wait"
+        completed = now.isoformat() if exhausted else None
+        result_summary_json = (
+            ResearchJobResultSummary(
+                source_count=0,
+                candidate_count=0,
+                underlying_result_code=retry.underlying_result_code,
+            ).canonical_json()
+            if retry.underlying_result_code is not None
+            else None
+        )
+        result = c.execute(
+            """UPDATE research_jobs SET status = ?, not_before = ?, retry_after = ?,
+                       safe_error_code = ?, completed_at = ?, result_summary_json = ?,
+                       started_at = CASE WHEN ? THEN started_at ELSE NULL END,
+                       claimed_by = NULL, lease_token = NULL, claimed_at = NULL, lease_expires_at = NULL,
+                       version = version + 1, updated_at = ?
+               WHERE id = ? AND status = 'running' AND lease_token = ? AND version = ? AND lease_expires_at > ?""",
+            (status, None if exhausted else retry.retry_at.isoformat(), None if exhausted else retry.retry_at.isoformat(),
+             retry.safe_error_code, completed, result_summary_json, exhausted, now.isoformat(), job_id, lease_token, expected_version, now.isoformat()),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("retry_persistence_failure", "research job retry scheduling failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "retry_persistence_failure")
+
+
+def cancel_research_job(
+    job_id: int,
+    *,
+    expected_version: int,
+    reason_code: Optional[str] = None,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> ResearchJobRecord:
+    _validate_research_job_id_and_version(job_id, expected_version)
+    try:
+        from research_job_models import ResearchJobCancellation
+        cancellation = ResearchJobCancellation(reason_code=reason_code)
+    except Exception as exc:
+        raise ResearchJobError("invalid_cancellation_reason", "cancellation reason is invalid") from exc
+    safe_reason = cancellation.reason_code or "cancelled_by_operator"
+
+    def _run(c: sqlite3.Connection) -> ResearchJobRecord:
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise ResearchJobError("job_not_found", "research job not found")
+        if row["version"] != expected_version:
+            raise ResearchJobError("stale_job_version", "research job version is stale")
+        if row["status"] not in ("queued", "retry_wait") or any(row[key] is not None for key in ("claimed_by", "lease_token", "claimed_at", "lease_expires_at")):
+            raise ResearchJobError("invalid_cancellation_state", "research job state is not cancellable")
+        result = c.execute(
+            """UPDATE research_jobs SET status = 'cancelled', completed_at = ?, safe_error_code = ?,
+                       not_before = NULL, retry_after = NULL, claimed_by = NULL, lease_token = NULL,
+                       claimed_at = NULL, lease_expires_at = NULL, version = version + 1, updated_at = ?
+               WHERE id = ? AND status IN ('queued', 'retry_wait') AND version = ?
+                 AND claimed_by IS NULL AND lease_token IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL""",
+            (now.isoformat(), safe_reason, now.isoformat(), job_id, expected_version),
+        )
+        if result.rowcount != 1:
+            raise ResearchJobError("cancellation_persistence_failure", "research job cancellation failed")
+        return _research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone())
+
+    return _owned_immediate_transaction(db_path, conn, _run, "cancellation_persistence_failure")
+
+
+def _validate_recovery_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_RECOVERY_LIMIT:
+        raise ResearchJobError("invalid_recovery_limit", "stale-recovery limit is invalid")
+    return limit
+
+
+def recover_stale_research_jobs(
+    *,
+    limit: int = 20,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> tuple[ResearchJobRecord, ...]:
+    limit = _validate_recovery_limit(limit)
+
+    def _run(c: sqlite3.Connection) -> tuple[ResearchJobRecord, ...]:
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        rows = c.execute(
+            """SELECT * FROM research_jobs
+               WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+               ORDER BY lease_expires_at ASC, updated_at ASC, id ASC LIMIT ?""",
+            (now_text, limit),
+        ).fetchall()
+        recovered: list[int] = []
+        for row in rows:
+            exhausted = row["attempt_count"] >= row["max_attempts"]
+            status = "abandoned" if exhausted else "retry_wait"
+            result = c.execute(
+                """UPDATE research_jobs SET status = ?, not_before = ?, retry_after = ?, safe_error_code = ?,
+                           started_at = CASE WHEN ? THEN started_at ELSE NULL END,
+                           completed_at = ?, claimed_by = NULL, lease_token = NULL, claimed_at = NULL,
+                           lease_expires_at = NULL, result_summary_json = NULL, version = version + 1, updated_at = ?
+                   WHERE id = ? AND status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL
+                     AND lease_expires_at <= ? AND version = ?""",
+                (status, None if exhausted else now_text, None if exhausted else now_text,
+                 "lease_expired_max_attempts" if exhausted else "lease_expired", exhausted,
+                 now_text if exhausted else None, now_text, row["id"], now_text, row["version"]),
+            )
+            if result.rowcount == 1:
+                recovered.append(row["id"])
+        return tuple(_research_job_record(c.execute("SELECT * FROM research_jobs WHERE id = ?", (job_id,)).fetchone()) for job_id in recovered)
+
+    return _owned_immediate_transaction(db_path, conn, _run, "stale_recovery_persistence_failure")
+
+
+def materialize_discovery_outcome(
+    *,
+    research_job_id: int,
+    lease_token: str,
+    expected_version: int,
+    outcome: Any,
+    db_path: Path = DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+):
+    """Atomically persist one validated outcome without changing its job."""
+    from discovery_models import DiscoveryOutcome, DiscoveryOutcomeStatus
+    from discovery_materialization_models import DiscoveryOutcomeMaterializationResult
+
+    materializable = {
+        DiscoveryOutcomeStatus.SUCCEEDED,
+        DiscoveryOutcomeStatus.PARTIAL,
+        DiscoveryOutcomeStatus.NO_RESULT,
+        DiscoveryOutcomeStatus.NEEDS_REVIEW,
+    }
+    if not isinstance(outcome, DiscoveryOutcome):
+        raise ResearchJobError("outcome_not_materializable", "discovery outcome is not materializable")
+    try:
+        outcome = DiscoveryOutcome.model_validate(outcome.model_dump(mode="python"))
+    except Exception as exc:
+        raise ResearchJobError("outcome_not_materializable", "discovery outcome is not materializable") from exc
+    if outcome.status not in materializable:
+        raise ResearchJobError("outcome_not_materializable", "discovery outcome is not materializable")
+
+    def _run(c: sqlite3.Connection):
+        now = datetime.now(timezone.utc)
+        row = c.execute("SELECT * FROM research_jobs WHERE id = ?", (research_job_id,)).fetchone()
+        _lease_guard(row, lease_token=lease_token, expected_version=expected_version, allowed_states=("running",), now=now)
+        if row["attempt_count"] <= 0:
+            raise ResearchJobError("invalid_attempt_count", "research job attempt is invalid")
+        try:
+            job = _research_job_record(row)
+            outcome.validate_for_request(job.request_snapshot)
+        except ResearchJobError:
+            raise
+        except Exception as exc:
+            raise ResearchJobError("outcome_exceeds_request_bounds", "discovery outcome exceeds request bounds") from exc
+
+        canonical = json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        existing = c.execute(
+            "SELECT * FROM research_job_materializations WHERE research_job_id = ? AND attempt_count = ?",
+            (research_job_id, row["attempt_count"]),
+        ).fetchone()
+        if existing is not None:
+            if existing["outcome_digest"] != digest:
+                raise ResearchJobError("materialization_conflict", "research-job attempt already materialized")
+            source_ids = tuple(item["raw_source_id"] for item in c.execute(
+                "SELECT raw_source_id FROM research_job_materialization_sources WHERE materialization_id = ? ORDER BY ordinal",
+                (existing["id"],),
+            ).fetchall())
+            person_ids = tuple(item["person_candidate_id"] for item in c.execute(
+                "SELECT person_candidate_id FROM research_job_materialization_person_candidates WHERE materialization_id = ? ORDER BY ordinal",
+                (existing["id"],),
+            ).fetchall())
+            contact_ids = tuple(item["contact_candidate_id"] for item in c.execute(
+                "SELECT contact_candidate_id FROM research_job_materialization_contact_candidates WHERE materialization_id = ? ORDER BY ordinal",
+                (existing["id"],),
+            ).fetchall())
+            if (len(source_ids), len(person_ids), len(contact_ids)) != (
+                existing["source_count"], existing["person_candidate_count"], existing["contact_candidate_count"]
+            ):
+                raise ResearchJobError("invalid_receipt", "materialization receipt is incomplete")
+            return DiscoveryOutcomeMaterializationResult(
+                materialization_id=existing["id"], research_job_id=research_job_id,
+                attempt_count=row["attempt_count"], outcome_status=outcome.status,
+                outcome_digest=digest, raw_source_ids=source_ids,
+                person_candidate_ids=person_ids, contact_candidate_ids=contact_ids, replayed=True,
+            )
+
+        source_matches: dict[str, list[int]] = {}
+        source_ids: list[int] = []
+        for source in outcome.sources:
+            metadata = {
+                "canonical_url": source.canonical_url,
+                "content_hash": source.content_hash,
+                "content_type": source.content_type,
+                "http_status": source.http_status,
+                "page_title": source.page_title,
+                "provider_request_id": source.provider_request_id,
+                "warning_codes": sorted(source.warning_codes),
+            }
+            metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            found = c.execute(
+                """SELECT id FROM raw_sources WHERE lead_id = ? AND source_type = ?
+                   AND source_url = ? AND raw_text = ? AND parsed_json = ? ORDER BY id LIMIT 1""",
+                (row["lead_id"], source.source_type, source.source_url, source.extracted_text, metadata_json),
+            ).fetchone()
+            if found is None:
+                try:
+                    cursor = c.execute(
+                        """INSERT INTO raw_sources
+                           (lead_id, source_type, source_url, source_filter_tier, raw_text,
+                            parsed_json, extraction_status, confidence, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (row["lead_id"], source.source_type, source.source_url, "discovery",
+                         source.extracted_text, metadata_json, "ok", 0.0, now.isoformat()),
+                    )
+                    source_id = int(cursor.lastrowid)
+                except sqlite3.Error as exc:
+                    raise ResearchJobError("source_persistence_failure", "discovery source could not be persisted") from exc
+            else:
+                source_id = int(found["id"])
+            if source_id not in source_ids:
+                source_ids.append(source_id)
+            for reference in {source.source_url, source.canonical_url, source.provider_request_id, source.content_hash}:
+                matches = source_matches.setdefault(reference, [])
+                if source_id not in matches:
+                    matches.append(source_id)
+
+        def resolve_source(reference: str, source_type: Optional[str] = None) -> int:
+            candidates = source_matches.get(reference, [])
+            if source_type is not None:
+                candidates = [source_id for source_id in candidates if c.execute(
+                    "SELECT source_type FROM raw_sources WHERE id = ?", (source_id,)
+                ).fetchone()["source_type"] == source_type]
+            if len(candidates) != 1:
+                raise ResearchJobError("candidate_source_unresolved", "discovery evidence source could not be resolved")
+            return candidates[0]
+
+        person_ids: list[int] = []
+        contact_ids: list[int] = []
+        for candidate in outcome.candidates:
+            source_id = resolve_source(candidate.raw_evidence_reference or candidate.source_url, candidate.source_type)
+            try:
+                person = create_or_reuse_person_candidate(
+                    row["lead_id"], source_id, name=candidate.name, title=candidate.title,
+                    role_type=candidate.role_type, is_decision_maker=candidate.is_decision_maker,
+                    profile_url=candidate.profile_url, source_type=candidate.source_type,
+                    source_url=candidate.source_url, confidence=candidate.confidence,
+                    relevance_reason=candidate.relevance_reason, discovery_method=candidate.discovery_method,
+                    conn=c,
+                )
+            except ResearchJobError:
+                raise
+            except Exception as exc:
+                raise ResearchJobError("candidate_persistence_failure", "person candidate could not be persisted") from exc
+            person_id = int(person["id"])
+            if person_id not in person_ids:
+                person_ids.append(person_id)
+            for contact in candidate.explicit_contacts:
+                contact_source_id = resolve_source(contact.source_url)
+                try:
+                    contact_row = create_or_reuse_contact_candidate(
+                        row["lead_id"], contact_source_id, person_candidate_id=person_id,
+                        kind=contact.kind, value=contact.value, normalized_value=contact.normalized_value,
+                        source_url=contact.source_url, confidence=candidate.confidence,
+                        verification_status=contact.verification_status, evidence_basis=contact.evidence_basis,
+                        discovery_method=candidate.discovery_method, discovered_at=outcome.completed_at.isoformat(),
+                        conn=c,
+                    )
+                except ResearchJobError:
+                    raise
+                except Exception as exc:
+                    raise ResearchJobError("candidate_persistence_failure", "contact candidate could not be persisted") from exc
+                contact_id = int(contact_row["id"])
+                if contact_id not in contact_ids:
+                    contact_ids.append(contact_id)
+
+        try:
+            receipt = c.execute(
+                """INSERT INTO research_job_materializations
+                   (research_job_id, attempt_count, outcome_digest, outcome_status,
+                    source_count, person_candidate_count, contact_candidate_count, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (research_job_id, row["attempt_count"], digest, outcome.status.value,
+                 len(source_ids), len(person_ids), len(contact_ids), now.isoformat()),
+            )
+            materialization_id = int(receipt.lastrowid)
+            c.executemany(
+                "INSERT INTO research_job_materialization_sources(materialization_id, ordinal, raw_source_id) VALUES (?, ?, ?)",
+                [(materialization_id, ordinal, source_id) for ordinal, source_id in enumerate(source_ids)],
+            )
+            c.executemany(
+                "INSERT INTO research_job_materialization_person_candidates(materialization_id, ordinal, person_candidate_id) VALUES (?, ?, ?)",
+                [(materialization_id, ordinal, candidate_id) for ordinal, candidate_id in enumerate(person_ids)],
+            )
+            c.executemany(
+                "INSERT INTO research_job_materialization_contact_candidates(materialization_id, ordinal, contact_candidate_id) VALUES (?, ?, ?)",
+                [(materialization_id, ordinal, candidate_id) for ordinal, candidate_id in enumerate(contact_ids)],
+            )
+        except sqlite3.Error as exc:
+            raise ResearchJobError("materialization_persistence_failure", "discovery materialization could not be persisted") from exc
+        return DiscoveryOutcomeMaterializationResult(
+            materialization_id=materialization_id, research_job_id=research_job_id,
+            attempt_count=row["attempt_count"], outcome_status=outcome.status,
+            outcome_digest=digest, raw_source_ids=tuple(source_ids),
+            person_candidate_ids=tuple(person_ids), contact_candidate_ids=tuple(contact_ids), replayed=False,
+        )
+
+    return _owned_immediate_transaction(db_path, conn, _run, "materialization_persistence_failure")

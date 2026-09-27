@@ -71,6 +71,22 @@ merge from name similarity alone.
 
 Read-only. Filters by kind, source, age, relevance, and verification state.
 
+### `list_email_messages`
+
+Read-only. Filters imported Gmail messages by intent, marker, direction,
+link status, organization/person identifier, since, limit, and offset.
+Reads the local database only; does not call Gmail during `/ask`.
+On PostgreSQL runtime (G0), returns `status=error` with
+`gmail_postgresql_runtime_unsupported` rather than an empty success.
+
+### `get_email_thread`
+
+Read-only. Returns ordered imported messages and thread-level attention summary
+for an `external_thread_id` (optional `external_account` for disambiguation).
+Reads the local database only.
+On PostgreSQL runtime (G0), returns `status=error` with
+`gmail_postgresql_runtime_unsupported` rather than a false not-found.
+
 ## Planner output
 
 The planner produces one of:
@@ -102,10 +118,20 @@ All tools return:
 - `summary`
 - `records` or `proposal`
 - `record_count`
+- `total_count`, `returned_count`, `requested_count`, and `offset` for
+  unambiguous paginated read results. `record_count` remains the total matching
+  count for compatibility with existing clients.
 - `warnings`
 - `provenance`
 - `command_id`
 
 The communication layer may shorten wording but cannot change identifiers,
 counts, dates, verification states, or warnings.
+
+Ask responses for typed tools additionally include an application-validated
+`response_spec` and `result_metadata` (`total_matching`, `returned`,
+`requested`, and `offset`). Presentation columns are allowlisted by tool; an
+invalid specification falls back to the tool's deterministic default. The
+plain-text `answer` remains a deterministic compatibility projection and does
+not replace the structured records.
 

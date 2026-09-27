@@ -64,3 +64,12 @@ in a later phase and must preserve source and verification state.
 - Multi-tenant SaaS, billing, teams, and enterprise permissions.
 - A broad CRM feature set unrelated to contact intelligence.
 
+## Phase G0 — Gmail read-only intake (local)
+
+When explicitly enabled, the operator may manually synchronize messages from a
+configured Gmail label into the local database. The remote mailbox remains
+read-only (`gmail.readonly`); imported messages, metadata, intent, markers,
+and provenance are stored locally for review and `/ask` queries. Sending,
+label changes, background automation, and Calendar integration are not part of
+G0. See `docs/implementation-roadmap.md` for G1/C0/C1 future phases.
+

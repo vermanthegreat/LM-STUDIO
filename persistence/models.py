@@ -63,6 +63,7 @@ class Person(Base, TimestampMixin):
     is_decision_maker: Mapped[bool] = mapped_column(Boolean, default=False)
     relevance_score: Mapped[int] = mapped_column(Integer, default=0)
     relevance_reason: Mapped[Optional[str]] = mapped_column(Text)
+    legacy_person_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True)
     legacy_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
 
     organization: Mapped[Optional[Organization]] = relationship(back_populates="people")
@@ -194,7 +195,7 @@ class Task(Base, TimestampMixin):
     priority: Mapped[Optional[str]] = mapped_column(String(32))
     due_at: Mapped[Optional[datetime]] = mapped_column()
     completed_at: Mapped[Optional[datetime]] = mapped_column()
-    created_by_command_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    created_by_command_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), unique=True)
     legacy_task_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True)
     legacy_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
 
@@ -248,6 +249,76 @@ class CommandLog(Base, TimestampMixin):
     error_code: Mapped[Optional[str]] = mapped_column(String(64))
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+
+
+class GmailSource(Base, TimestampMixin):
+    __tablename__ = "gmail_sources"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "external_account",
+            "external_message_id",
+            name="uq_gmail_source_provider_account_message",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    provider: Mapped[str] = mapped_column(String(32), default="gmail", nullable=False)
+    external_account: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    external_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_thread_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    external_rfc_message_id: Mapped[Optional[str]] = mapped_column(String(512))
+    provider_occurred_at: Mapped[datetime] = mapped_column()
+    provider_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    messages: Mapped[list["GmailMessage"]] = relationship(back_populates="source")
+
+
+class GmailMessage(Base, TimestampMixin):
+    __tablename__ = "gmail_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    gmail_source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("gmail_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    organization_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), index=True
+    )
+    person_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("people.id", ondelete="SET NULL")
+    )
+    subject: Mapped[Optional[str]] = mapped_column(String(1024))
+    direction: Mapped[str] = mapped_column(String(32), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(index=True)
+    from_address: Mapped[Optional[str]] = mapped_column(String(320))
+    to_addresses: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSONB)
+    cc_addresses: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSONB)
+    primary_intent: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    intent_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    markers: Mapped[Optional[list[str]]] = mapped_column(JSONB)
+    temporal_signals: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSONB)
+    link_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    classification_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    classification_model: Mapped[Optional[str]] = mapped_column(String(128))
+    classification_warning: Mapped[Optional[str]] = mapped_column(String(128))
+    requires_followup: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    source: Mapped[GmailSource] = relationship(back_populates="messages")
+
+
+class GmailSyncState(Base):
+    __tablename__ = "gmail_sync_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_email: Mapped[Optional[str]] = mapped_column(String(320))
+    configured_label: Mapped[str] = mapped_column(String(128), nullable=False)
+    last_sync_at: Mapped[Optional[datetime]] = mapped_column()
+    last_success_at: Mapped[Optional[datetime]] = mapped_column()
+    last_status: Mapped[Optional[str]] = mapped_column(String(32))
+    last_result_summary: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
+    last_error_code: Mapped[Optional[str]] = mapped_column(String(64))
 
 
 Index("idx_contact_methods_org_kind", ContactMethod.organization_id, ContactMethod.kind)

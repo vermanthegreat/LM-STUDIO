@@ -128,3 +128,53 @@ External discovery must not become a generic autonomous browser. Email
 handling, sending, notifications, and workflow automation remain separate
 future decisions.
 
+## Phase G0 — Gmail read-only intake
+
+**Status:** Implemented in-tree for SQLite runtime; PostgreSQL schema migration
+added (`004_gmail_g0`); operator sync and query surfaces available on port 8025.
+PostgreSQL Gmail operations fail closed with `gmail_postgresql_runtime_unsupported`.
+
+Purpose:
+
+- import explicitly selected Gmail conversations from a configured label;
+- preserve provider provenance in local `Source`/`Interaction`-aligned tables;
+- determine direction and high-level message intent;
+- mark messages requiring operator attention with validated markers;
+- connect messages to existing contacts only when identity is deterministic;
+- keep uncertain linkage reviewable;
+- make imported communication queryable through typed read tools and `/ask`.
+
+Explicitly out of scope for G0:
+
+- Gmail sending, drafts, label changes, or any inbox mutation;
+- background polling or push notifications;
+- Google Calendar OAuth or event reads/writes;
+- automatic task or lead creation from email markers;
+- bulk historical inbox ingestion beyond `GMAIL_SYNC_LIMIT`;
+- MCP or LLM-direct Gmail access.
+
+Acceptance highlights:
+
+- OAuth requests only `https://www.googleapis.com/auth/gmail.readonly`.
+- Manual `POST /integrations/gmail/sync` with command-log audit entry.
+- Idempotent local persistence with provider/account/message uniqueness.
+- Tests use `FakeGmailProvider` only.
+
+## Phase G1 — temporal follow-up reasoning (future)
+
+- Resolve controlled date/time expressions using `APP_TIMEZONE`.
+- Create task proposals from email markers with explicit approval.
+- Maintain overdue/upcoming views.
+
+## Phase C0 — Google Calendar read-only context (future)
+
+- Separate Calendar OAuth scope and authorization.
+- Read operator availability and existing events.
+- Correlate meeting requests with availability.
+- No event writes.
+
+## Phase C1 — governed Calendar proposals (future)
+
+- Propose event title, participants, start/end, timezone, source thread.
+- Operator review and explicit approval before isolated Calendar writes.
+

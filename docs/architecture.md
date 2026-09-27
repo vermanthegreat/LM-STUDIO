@@ -59,6 +59,39 @@ construct a database session, or bypass application validation.
 - `TaskService`: manages local follow-up plans.
 - `AnalyticsService`: deterministic, read-only metrics.
 
+### Source-specific pasted-text parsing
+
+- LinkedIn input is structurally classified before generic fallback as a
+  company Home, About, or People page, a personal profile, or unsupported
+  LinkedIn content.
+- LinkedIn company People pages use deterministic header and named-card
+  boundaries. Page chrome, anonymous members, similar-company sections, and
+  workforce filters are not promoted to canonical contact facts.
+- Each paste appends a raw source, while a People-page person is upserted within
+  its lead by normalized name (case-folded with whitespace normalized). The
+  identity does not depend on the raw-source row or mutable headline.
+- A LinkedIn company URL remains source metadata and never becomes the
+  organization's canonical website. Supplied LinkedIn URL shape is validated
+  against the structural classification; personal-profile URLs are rejected
+  from company source and identity fields with a structured warning. Existing
+  explicit Shopify Partner Directory fields retain precedence during a
+  LinkedIn merge.
+- Cross-source company identity resolution evaluates exact official domain,
+  business-email domain, LinkedIn company URL, canonical name, known alias,
+  and unique source-display alias in that order. Multiple matches at the first
+  matching tier fail closed for review; substring and general fuzzy matching
+  are not used.
+- Structurally valid Shopify Partner Directory profiles may retain a
+  conservative promotional-suffix alias in parsed source metadata while the
+  original display name remains unchanged. Phase 0 does not add an alias
+  table or schema migration.
+- Raw-source type follows the resolved parser classification independently of
+  the route default and of the canonical lead's original source.
+- Extracted person titles are deterministically classified into controlled
+  role types. Decision-maker status is derived only for economic buyers and
+  senior operational owners; technical and workflow contacts remain relevant
+  without being promoted to decision makers.
+
 ### Typed tool registry
 
 Each tool has a unique name, Pydantic input/output schema, risk class,
@@ -97,8 +130,65 @@ Configuration must be environment-driven and validated at startup:
 - `LMSTUDIO_TIMEOUT`
 - `MAX_PASTE_CHARS`
 - `LOG_LEVEL`
+- `GMAIL_ENABLED` — enable Phase G0 Gmail read-only intake (default `false`)
+- `GMAIL_CLIENT_SECRET_PATH` — path to Google OAuth desktop client JSON
+- `GMAIL_TOKEN_PATH` — path to authorized-user token file (gitignored)
+- `GMAIL_SYNC_LABEL` — operator-created Gmail label to sync (default `LMStudio`)
+- `GMAIL_SYNC_LIMIT` — maximum messages per manual sync (default `100`)
+- `APP_TIMEZONE` — IANA timezone for follow-up dates and email display
 
 Secrets never belong in `.env.example`, logs, prompts, or committed fixtures.
+
+## Gmail provider boundary (G0/G1 SQLite runtime)
+
+Gmail G0 is a bounded read-only intake path:
+
+```text
+Operator UI  POST /integrations/gmail/sync
+       |
+       v
+GmailProviderAdapter  (gmail.readonly OAuth only)
+       |
+       v
+normalize + classify + link  (application services)
+       |
+       v
+SQLite gmail_* tables  (supported runtime)
+```
+
+- **OAuth:** `scripts/gmail_authorize.py` bootstraps desktop OAuth with exactly
+  `https://www.googleapis.com/auth/gmail.readonly`. Token files are gitignored
+  and never passed to the LLM.
+- **Manual sync:** Operator triggers bounded label sync from
+  `/integrations/gmail`. Each sync writes a `gmail_sync` command-log entry with
+  counts only (no tokens or full message bodies).
+- **Fake provider:** Automated tests use `FakeGmailProvider` only; it is not
+  reachable from production routes.
+- **Classifier trust boundary:** Email bodies are untrusted. The local LLM
+  classifier returns schema-validated intent/markers only; it cannot invoke
+  tools, Gmail, or database writes. `requires_followup` is derived from
+  validated markers.
+- **Shopify Partner Directory confirmations:** Anchored provider confirmation
+  subjects are classified deterministically as
+  `message_role=shopify_partner_inquiry_confirmation` with business intent
+  `outreach`; target-company linkage uses exact existing company-name matches
+  or existing deterministic thread linkage only.
+- **PostgreSQL capability:** Alembic migration `004_gmail_g0` defines PostgreSQL
+  schema, but Gmail sync and query operations are **SQLite-only** in G0.
+  PostgreSQL runtime requests fail closed with
+  `gmail_postgresql_runtime_unsupported` rather than returning empty results.
+- **Full mailbox intake (G1):** `POST /integrations/gmail/full-sync` imports a
+  bounded page (10–500, default 100) at a time, excluding Spam and Trash.
+  Its account-scoped cursor is persisted only after a page completes; provider
+  page errors retain the prior cursor. Gmail remains read-only.
+- **Conversation projections (G1):** SQLite rebuilds thread and agency
+  communication projections solely from locally persisted Gmail evidence.
+  Links use ranked deterministic evidence: exact person email, exact company
+  email, inherited exact thread evidence, then a unique non-public company
+  domain. Ambiguous evidence is never guessed. PostgreSQL full-mailbox Gmail
+  runtime remains unsupported and fail-closed.
+- **`/ask` reads:** `list_email_messages` and `get_email_thread` read the local
+  database only; they do not call Gmail during ordinary `/ask` queries.
 
 ## Trust boundaries
 

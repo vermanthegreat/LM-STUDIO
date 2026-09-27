@@ -12,6 +12,8 @@
     <nav>
       <a href="/">Paste</a>
       <a href="/leads">Leads</a>
+      <a href="/integrations/gmail">Gmail</a>
+      <a href="/emails">Imported Emails</a>
       <a href="/ask">Ask Database</a>
       <a href="/export/csv">CSV Export</a>
     </nav>
@@ -41,7 +43,41 @@
     {% if result %}
     <div class="card">
       <h2>Answer <span class="badge">{{ result.intent }}</span></h2>
-      <pre class="answer">{{ result.answer }}</pre>
+      {% if result.data and result.data.leads is defined %}
+        {% if result.data.leads %}
+        <section class="ask-lead-results" aria-label="Agency results">
+          {% for lead in result.data.leads %}
+          <details class="lead-result">
+            <summary>
+              <span class="lead-result-position">{{ loop.index }}.</span>
+              <a href="/leads/{{ lead.id }}">{{ lead.company_name or 'Unnamed agency' }}</a>
+              <span class="badge">Fit: {{ lead.fit_score if lead.fit_score is not none else 'n/a' }}</span>
+              <span class="badge">Status: {{ lead.status or 'n/a' }}</span>
+              <span class="badge {% if lead.contact_evidence_status in ['Contacted', 'Replied'] %}good{% elif lead.contact_evidence_status == 'Contact state unavailable' %}warn{% endif %}">{{ lead.contact_evidence_status or 'Contact state unavailable' }}</span>
+            </summary>
+            <div class="lead-result-body">
+              <dl class="lead-result-fields">
+                <div><dt>Description</dt><dd>{{ lead.description or 'n/a' }}</dd></div>
+                <div><dt>Services</dt><dd>{{ lead.services|join(', ') if lead.services else 'n/a' }}</dd></div>
+                <div><dt>Industries</dt><dd>{{ lead.industries|join(', ') if lead.industries else 'n/a' }}</dd></div>
+                <div><dt>Primary location</dt><dd>{{ lead.primary_location or 'n/a' }}</dd></div>
+                <div><dt>Website</dt><dd>{% if lead.valid_website %}<a href="{{ lead.valid_website }}" target="_blank" rel="noopener noreferrer">{{ lead.valid_website }}</a>{% else %}n/a{% endif %}</dd></div>
+                <div><dt>Email addresses</dt><dd>{{ lead.emails|join(', ') if lead.emails else 'n/a' }}</dd></div>
+                {% if lead.people_count is not none %}<div><dt>People/contact count</dt><dd>{{ lead.people_count }}</dd></div>{% endif %}
+                {% if lead.last_interaction %}<div><dt>Last interaction</dt><dd>{{ lead.last_interaction }}</dd></div>{% endif %}
+                <div><dt>Contact evidence</dt><dd>{{ lead.contact_evidence_status or 'Contact state unavailable' }}</dd></div>
+              </dl>
+              <a class="btn lead-profile-link" href="/leads/{{ lead.id }}">Open agency profile</a>
+            </div>
+          </details>
+          {% endfor %}
+        </section>
+        {% else %}
+        <p class="empty-state">No matching agencies found.</p>
+        {% endif %}
+      {% else %}
+        <pre class="answer">{{ result.answer }}</pre>
+      {% endif %}
     </div>
     {% endif %}
   </main>

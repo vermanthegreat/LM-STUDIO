@@ -6,6 +6,12 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
+from research_job_models import (
+    ResearchJobCreate, ResearchJobFinalization, ResearchJobRecord, ResearchJobRetrySchedule, ResearchJobStatus,
+)
+from discovery_models import DiscoveryOutcome
+from discovery_materialization_models import DiscoveryOutcomeMaterializationResult
+
 
 @runtime_checkable
 class ContactStore(Protocol):
@@ -19,7 +25,7 @@ class ContactStore(Protocol):
 
     def get_all_leads_simple(self) -> List[Dict[str, Any]]: ...
 
-    def list_leads(self) -> List[Dict[str, Any]]: ...
+    def list_leads(self, research_only: bool = False) -> List[Dict[str, Any]]: ...
 
     def get_lead(self, lead_id: int) -> Optional[Dict[str, Any]]: ...
 
@@ -37,7 +43,9 @@ class ContactStore(Protocol):
 
     def list_contact_emails(self, limit: int = 50) -> List[Dict[str, Any]]: ...
 
-    def get_followups_due(self) -> List[Dict[str, Any]]: ...
+    def list_contact_method_records(self) -> List[Dict[str, Any]]: ...
+
+    def get_followups_due(self, due_on_or_before: Optional[str] = None) -> List[Dict[str, Any]]: ...
 
     def search_lead_by_name(self, name: str) -> List[Dict[str, Any]]: ...
 
@@ -46,6 +54,12 @@ class ContactStore(Protocol):
         company_name: Optional[str] = None,
         website: Optional[str] = None,
         linkedin_url: Optional[str] = None,
+    ) -> List[Dict[str, Any]]: ...
+
+    def find_company_identity_candidates(
+        self,
+        evidence_kind: str,
+        value: str,
     ) -> List[Dict[str, Any]]: ...
 
     def find_leads_by_email(self, email: str) -> List[Dict[str, Any]]: ...
@@ -69,6 +83,15 @@ class ContactStore(Protocol):
     ) -> Dict[str, Any]: ...
 
     def link_raw_source_to_lead(self, raw_source_id: int, lead_id: int) -> None: ...
+
+    def create_or_reuse_person_candidate(self, lead_id: int, raw_source_id: int, **fields: Any) -> Dict[str, Any]: ...
+    def get_person_candidate(self, candidate_id: int) -> Optional[Dict[str, Any]]: ...
+    def list_person_candidates_for_lead(self, lead_id: int) -> List[Dict[str, Any]]: ...
+    def update_person_candidate_status(self, candidate_id: int, expected_version: int, target_status: str, applied_person_id: Optional[int] = None) -> Dict[str, Any]: ...
+    def create_or_reuse_contact_candidate(self, lead_id: int, raw_source_id: int, **fields: Any) -> Dict[str, Any]: ...
+    def get_contact_candidate(self, candidate_id: int) -> Optional[Dict[str, Any]]: ...
+    def list_contact_candidates_for_lead(self, lead_id: int) -> List[Dict[str, Any]]: ...
+    def update_contact_candidate_status(self, candidate_id: int, expected_version: int, target_status: str, applied_contact_method_id: Optional[int] = None) -> Dict[str, Any]: ...
 
     def add_person(
         self,
@@ -98,3 +121,89 @@ class ContactStore(Protocol):
     def sanitize_company_name(self, name: Optional[str]) -> Optional[str]: ...
 
     def extract_domain(self, website: Optional[str]) -> Optional[str]: ...
+
+    def list_imported_email_messages(
+        self,
+        *,
+        intent: Optional[str] = None,
+        marker: Optional[str] = None,
+        direction: Optional[str] = None,
+        link_status: Optional[str] = None,
+        lead_id: Optional[int] = None,
+        person_id: Optional[int] = None,
+        since: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        app_timezone: str = "UTC",
+    ) -> tuple[List[Dict[str, Any]], int]: ...
+
+    def get_imported_email_thread(
+        self,
+        external_thread_id: str,
+        *,
+        external_account: Optional[str] = None,
+        app_timezone: str = "UTC",
+    ) -> List[Dict[str, Any]]: ...
+
+    def enqueue_research_job(self, job: ResearchJobCreate) -> ResearchJobRecord: ...
+
+    def get_research_job(self, job_id: int) -> ResearchJobRecord: ...
+
+    def list_research_jobs(
+        self,
+        *,
+        lead_id: Optional[int] = None,
+        status: Optional[ResearchJobStatus | str] = None,
+        adapter_key: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[ResearchJobRecord]: ...
+
+    def list_research_jobs_for_lead(
+        self,
+        lead_id: int,
+        *,
+        status: Optional[ResearchJobStatus | str] = None,
+        adapter_key: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[ResearchJobRecord]: ...
+
+    def claim_next_research_job(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int = 120,
+    ) -> Optional[ResearchJobRecord]: ...
+
+    def mark_research_job_running(
+        self,
+        job_id: int,
+        *,
+        lease_token: str,
+        expected_version: int,
+    ) -> ResearchJobRecord: ...
+
+    def renew_research_job_lease(
+        self,
+        job_id: int,
+        *,
+        lease_token: str,
+        expected_version: int,
+        lease_seconds: int = 120,
+    ) -> ResearchJobRecord: ...
+
+    def finalize_research_job(self, job_id: int, *, lease_token: str, expected_version: int, finalization: ResearchJobFinalization) -> ResearchJobRecord: ...
+
+    def schedule_research_job_retry(self, job_id: int, *, lease_token: str, expected_version: int, retry: ResearchJobRetrySchedule) -> ResearchJobRecord: ...
+
+    def cancel_research_job(self, job_id: int, *, expected_version: int, reason_code: Optional[str] = None) -> ResearchJobRecord: ...
+
+    def recover_stale_research_jobs(self, *, limit: int = 20) -> tuple[ResearchJobRecord, ...]: ...
+
+    def materialize_discovery_outcome(
+        self,
+        *,
+        research_job_id: int,
+        lease_token: str,
+        expected_version: int,
+        outcome: DiscoveryOutcome,
+    ) -> DiscoveryOutcomeMaterializationResult: ...

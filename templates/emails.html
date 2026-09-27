@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Imported Emails</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Imported Gmail Messages</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/integrations/gmail">Gmail</a>
+      <a href="/emails">Imported Emails</a>
+      <a href="/ask">Ask Database</a>
+    </nav>
+  </header>
+  <main>
+    {% if runtime_error %}<div class="msg">{{ runtime_error }}</div>{% endif %}
+    <nav class="email-buckets"><a href="/emails?bucket=agencies">Agencies</a><a href="/emails?bucket=ambiguous">Ambiguous</a><a href="/emails?bucket=unmatched">Unmatched / Other</a><a href="/emails?bucket=all">All Mail</a></nav>
+    <div class="card">
+      <form method="get" action="/emails">
+        <label>Intent <input name="intent" value="{{ filters.intent }}"></label>
+        <label>Marker <input name="marker" value="{{ filters.marker }}"></label>
+        <label>Direction <input name="direction" value="{{ filters.direction }}"></label>
+        <label>Link status <input name="link_status" value="{{ filters.link_status }}"></label>
+        <label>Since (ISO) <input name="since" value="{{ filters.since }}"></label>
+        <label>Limit <input name="limit" type="number" value="{{ filters.limit }}"></label>
+        <button type="submit">Filter</button>
+      </form>
+      <p>Showing {{ emails|length }} of {{ total }} imported message(s).</p>
+      <table>
+        <thead>
+          <tr>
+            <th>When (local)</th>
+            <th>Account</th>
+            <th>Transport direction</th>
+            <th>From / To</th>
+            <th>Subject</th>
+            <th>Role / Target</th>
+            <th>Linked</th>
+            <th>Intent</th>
+            <th>Markers</th>
+            <th>Link status</th>
+            <th>Thread</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in emails %}
+          <tr>
+            {% if conversation_mode %}
+            <td>{{ row.last_message_at or row.occurred_at_local }}</td><td>{{ row.external_account or "n/a" }}</td><td>{{ row.last_message_direction or row.direction }}</td><td>{{ row.company_name or "Unmatched / Other" }}</td><td>{{ row.last_subject or row.subject or "(no subject)" }}</td><td>{{ row.message_count or "" }}</td><td>{{ row.person_name or "n/a" }}</td><td>{{ row.requires_reply and "Requires reply" or "" }}</td><td>{{ row.link_status }}{% if row.link_status == "ambiguous" %}<br><small>Reason: {{ row.ambiguity_reason }}</small>{% for agency in row.candidate_agencies %}<br><a href="/leads/{{ agency.id }}">{{ agency.company_name }} (Lead {{ agency.id }})</a>{% endfor %}{% for person in row.candidate_people %}<br><small>{{ person.name or "Person" }} (Person {{ person.id }})</small>{% endfor %}{% endif %}</td><td><a href="/emails/thread/{{ row.external_thread_id }}">{{ row.external_thread_id[:12] }}</a></td>
+            {% else %}
+            <td>{{ row.occurred_at_local }}</td>
+            <td>{{ row.external_account or "n/a" }}</td>
+            <td>{{ row.direction }}</td>
+            <td>
+              <strong>From:</strong> {{ row.from_address or "n/a" }}<br>
+              <strong>To:</strong> {{ row.to_address_text or "n/a" }}
+              {% if row.cc_address_text %}<br><strong>Cc:</strong> {{ row.cc_address_text }}{% endif %}
+            </td>
+            <td>
+              {{ row.subject or "(no subject)" }}
+              {% if row.body_preview %}
+              <details>
+                <summary>Body preview</summary>
+                <pre class="email-preview">{{ row.body_preview }}{% if row.body_length > 500 %}...{% endif %}</pre>
+              </details>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.message_role == "shopify_partner_inquiry_confirmation" %}
+                Shopify inquiry confirmation<br>
+                <strong>Target:</strong> {{ row.target_company_name or "n/a" }}
+              {% else %}
+                {{ row.message_role or "conversation_message" }}
+              {% endif %}
+            </td>
+            <td>
+              {% if row.company_name %}{{ row.company_name }}{% if row.person_name %} / {{ row.person_name }}{% endif %}{% else %}n/a{% endif %}
+            </td>
+            <td>{{ row.primary_intent }} ({{ row.intent_confidence }})<br><small>{{ row.classification_source }}</small></td>
+            <td>{% if row.requires_followup %}<span class="badge warn">follow-up</span>{% endif %} {{ row.markers|join(", ") }}</td>
+            <td>{{ row.link_status }}</td>
+            <td><a href="/emails/thread/{{ row.external_thread_id }}">{{ row.thread_short }}</a><br><small>ID: {{ row.message_short }}</small></td>
+            {% endif %}
+          </tr>
+          {% if row.classification_warning %}
+          <tr><td colspan="11">Warning: {{ row.classification_warning }}</td></tr>
+          {% endif %}
+          {% else %}
+          <tr><td colspan="11">No imported Gmail messages yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if offset > 0 %}<a href="/emails?bucket={{ bucket }}&offset={{ [offset - filters.limit, 0]|max }}&limit={{ filters.limit }}">Previous</a>{% endif %}
+      {% if offset + emails|length < total %}<a href="/emails?bucket={{ bucket }}&offset={{ offset + filters.limit }}&limit={{ filters.limit }}">Next</a>{% endif %}
+    </div>
+  </main>
+</body>
+</html>

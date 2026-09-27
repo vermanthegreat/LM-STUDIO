@@ -50,7 +50,7 @@ def test_x_mozo_fallback_extracts_contact_and_profile_fields():
     assert "English" in parsed["languages"]
     assert "Hebrew" in parsed["languages"]
     assert parsed["description"].startswith("X-Mozo is a boutique e-commerce company")
-    assert "Service partner" in parsed["partner_tier"]
+    assert parsed["partner_tier"] == "Plus Partner"
     assert parsed["plus_partner_signal"] is True
     assert parsed["rating"] == 5.0
     assert parsed["review_count"] == 4

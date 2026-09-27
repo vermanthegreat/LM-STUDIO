@@ -52,7 +52,7 @@ def normalize_ask_question(question: str) -> str:
     return _normalize_q(question)
 
 
-def clamp_ask_limit(value: Any, *, default: int = 10, maximum: int = 25) -> int:
+def clamp_ask_limit(value: Any, *, default: int = 10, maximum: int = 250) -> int:
     """Clamp limit value to valid range."""
     try:
         parsed = int(value)
@@ -350,7 +350,7 @@ def _format_leads_list(leads: List[Dict[str, Any]], header: str) -> str:
     if not leads:
         return f"{header}\n(none)"
     lines = [header]
-    for l in leads[:20]:
+    for l in leads:
         name = l.get("company_name") or "?"
         score = l.get("fit_score", 0)
         status = l.get("status", "")

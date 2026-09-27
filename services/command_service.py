@@ -15,7 +15,7 @@ from services.command_log import (
     transition,
 )
 from services.write_proposal_authority import load_stored_write_proposal
-from services.write_proposals import apply_write_proposal
+from services.write_proposals import apply_write_proposal, finalize_recovered_apply
 from tools.envelope import ToolResult
 from tools.planner import PlannerClarify, PlannerToolCall
 from tools.registry import ToolRegistry, ToolRegistryError, UnknownToolError, build_default_registry
@@ -114,6 +114,13 @@ class CommandService:
             raise CommandLogError("Command is in failed state and cannot be applied")
         if entry.status == CommandStatus.REJECTED:
             raise CommandLogError("Command was rejected and cannot be applied")
+
+        if entry.status == CommandStatus.EXECUTING:
+            recovered = finalize_recovered_apply(self.store, self.command_log, entry)
+            if recovered is not None:
+                return recovered
+            raise CommandLogError("Command is still executing and no applied result was found")
+
         if entry.status != CommandStatus.AWAITING_APPROVAL:
             raise CommandLogError("Command is not awaiting approval")
         if not entry.requires_approval:
@@ -121,24 +128,30 @@ class CommandService:
         if entry.approved_at is None:
             raise CommandLogError("Command has not been approved")
 
-        transition(entry, CommandStatus.EXECUTING)
-        self.command_log.update(entry)
-        try:
-            result = apply_write_proposal(self.store, entry)
-        except WriteProposalError as exc:
-            transition(entry, CommandStatus.FAILED)
-            entry.error_code = type(exc).__name__
-            entry.error_message = str(exc)
+        def _apply_body() -> ToolResult:
+            transition(entry, CommandStatus.EXECUTING)
             self.command_log.update(entry)
-            raise CommandLogError(str(exc)) from exc
+            try:
+                result = apply_write_proposal(self.store, entry)
+            except WriteProposalError as exc:
+                transition(entry, CommandStatus.FAILED)
+                entry.error_code = type(exc).__name__
+                entry.error_message = str(exc)
+                self.command_log.update(entry)
+                raise CommandLogError(str(exc)) from exc
 
-        transition(entry, CommandStatus.SUCCEEDED)
-        summary = dict(entry.result_summary or {})
-        summary["applied_result"] = result.model_dump(mode="json")
-        entry.result_summary = summary
-        self.command_log.update(entry)
-        result.command_id = entry.id
-        return result
+            transition(entry, CommandStatus.SUCCEEDED)
+            summary = dict(entry.result_summary or {})
+            summary["applied_result"] = result.model_dump(mode="json")
+            entry.result_summary = summary
+            self.command_log.update(entry)
+            result.command_id = entry.id
+            return result
+
+        if hasattr(self.store, "transaction"):
+            with self.store.transaction():
+                return _apply_body()
+        return _apply_body()
 
     def _reload_command_entry(self, command_id: UUID) -> CommandLogEntry:
         entry = self.command_log.get(command_id)

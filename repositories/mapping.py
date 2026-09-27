@@ -39,6 +39,7 @@ def organization_to_lead_row(org: Organization) -> Dict[str, Any]:
         "status": org.status,
         "confidence": meta.get("confidence", 0.0),
         "extraction_status": meta.get("extraction_status", "ok"),
+        "enrichment_status": meta.get("enrichment_status", "pending"),
         "possible_duplicate": bool(meta.get("possible_duplicate")),
         "created_at": org.created_at.isoformat() if org.created_at else None,
         "updated_at": org.updated_at.isoformat() if org.updated_at else None,
@@ -60,6 +61,36 @@ def _primary_contact_value(
     return None
 
 
+def _org_has_verified_email(org: Organization) -> bool:
+    for method in org.contact_methods:
+        if method.kind == "email" and method.verification_status == "verified":
+            return True
+    for person in org.people:
+        for method in person.contact_methods:
+            if method.kind == "email" and method.verification_status == "verified":
+                return True
+    return False
+
+
+def _org_has_non_rejected_email(org: Organization) -> bool:
+    for method in org.contact_methods:
+        if (
+            method.kind == "email"
+            and method.verification_status != "rejected"
+            and (method.value or "").strip()
+        ):
+            return True
+    for person in org.people:
+        for method in person.contact_methods:
+            if (
+                method.kind == "email"
+                and method.verification_status != "rejected"
+                and (method.value or "").strip()
+            ):
+                return True
+    return False
+
+
 def person_to_dict(person: Person) -> Dict[str, Any]:
     meta = dict(person.legacy_metadata or {})
     email = _person_contact(person, "email")
@@ -75,10 +106,15 @@ def person_to_dict(person: Person) -> Dict[str, Any]:
         "linkedin_url": linkedin,
         "is_decision_maker": int(person.is_decision_maker),
         "is_relevant_contact": int(meta.get("is_relevant_contact", 0)),
+        "role_type": meta.get("role_type") or "other",
         "relevance_reason": person.relevance_reason,
         "confidence": meta.get("confidence", 0.0),
+        "email_status": meta.get("email_status") or "unknown",
+        "email_confidence": meta.get("email_confidence", 0.0),
+        "last_verified_at": meta.get("last_verified_at"),
         "raw_source_id": meta.get("raw_source_id"),
         "created_at": person.created_at.isoformat() if person.created_at else None,
+        "updated_at": person.updated_at.isoformat() if person.updated_at else None,
     }
 
 
@@ -141,12 +177,34 @@ def source_to_dict(source: Source) -> Dict[str, Any]:
     }
 
 
+def _parsed_contact_from_sources(
+    raw_sources: List[Dict[str, Any]],
+    field: str,
+) -> Optional[str]:
+    for source in raw_sources:
+        parsed = source.get("parsed_json")
+        if not isinstance(parsed, dict):
+            continue
+        value = (parsed.get(field) or "").strip()
+        if value:
+            return value
+    return None
+
+
 def organization_to_lead_detail(org: Organization) -> Dict[str, Any]:
     lead = organization_to_lead_row(org)
     people = [person_to_dict(p) for p in org.people]
     interactions = [interaction_to_dict(i, org) for i in org.interactions]
     tasks = [task_to_dict(t, org) for t in org.tasks]
     raw_sources = [source_to_dict(s) for s in _org_sources(org)]
+    if not (lead.get("company_email") or "").strip():
+        projected_email = _parsed_contact_from_sources(raw_sources, "company_email")
+        if projected_email:
+            lead["company_email"] = projected_email
+    if not (lead.get("company_phone") or "").strip():
+        projected_phone = _parsed_contact_from_sources(raw_sources, "company_phone")
+        if projected_phone:
+            lead["company_phone"] = projected_phone
     lead["people"] = people
     lead["interactions"] = interactions
     lead["tasks"] = tasks
@@ -159,6 +217,8 @@ def organization_to_lead_detail(org: Organization) -> Dict[str, Any]:
     )
     lead["people_count"] = len(people)
     lead["has_decision_maker"] = any(p.get("is_decision_maker") for p in people)
+    lead["has_verified_email"] = _org_has_verified_email(org)
+    lead["has_non_rejected_email"] = _org_has_non_rejected_email(org)
     return lead
 
 

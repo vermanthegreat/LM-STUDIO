@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import Enum
 from typing import Literal, Optional
 
@@ -39,6 +40,30 @@ class ListDueFollowupsInput(BaseModel):
 
     status: Optional[str] = None
     priority: Optional[str] = None
+    item_type: Optional[Literal["task", "interaction"]] = None
+    due_on_or_before: Optional[date] = None
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class ContactMethodKind(str, Enum):
+    EMAIL = "email"
+    PHONE = "phone"
+    LINKEDIN = "linkedin"
+
+
+class NonVerifiedContactStatus(str, Enum):
+    UNVERIFIED = "unverified"
+    SYNTAX_VALID = "syntax_valid"
+    SOURCE_CONFIRMED = "source_confirmed"
+
+
+class ListUnverifiedContactMethodsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Optional[ContactMethodKind] = None
+    verification_status: Optional[NonVerifiedContactStatus] = None
+    organization_status: Optional[str] = None
+    minimum_relevance: Optional[int] = Field(default=None, ge=0, le=100)
     limit: int = Field(default=50, ge=1, le=200)
 
 
@@ -53,3 +78,24 @@ class CalculatePipelineAnalyticsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     metric: PipelineMetric
+
+
+class ListEmailMessagesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intent: Optional[str] = None
+    marker: Optional[str] = None
+    direction: Optional[str] = None
+    link_status: Optional[str] = None
+    lead_id: Optional[int] = Field(default=None, ge=1)
+    person_id: Optional[int] = Field(default=None, ge=1)
+    since: Optional[str] = None
+    limit: int = Field(default=25, ge=1, le=100)
+    offset: int = Field(default=0, ge=0, le=10_000)
+
+
+class GetEmailThreadInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    external_thread_id: str = Field(min_length=1, max_length=256)
+    external_account: Optional[str] = None
