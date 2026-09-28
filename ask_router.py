@@ -145,6 +145,11 @@ def answer_question(
     if intent.name == "unknown":
         intent = _fallback_search_intent(q)
 
+    if intent.name == "knowledge_search":
+        return _answer_knowledge_question(
+            q, intent, use_llm=use_llm, store=store, command_service=command_service
+        )
+
     if intent.name in _TOOL_ROUTED_INTENTS:
         tool_name, args_builder = _TOOL_ROUTED_INTENTS[intent.name]
         tool_response = execute_tool_route(
@@ -181,7 +186,43 @@ def answer_question(
     }
 
 
+_KNOWLEDGE_PREFIXES = (
+    "knowledge:", "kb:", "search knowledge", "search my knowledge", "ask knowledge", "znanje:",
+)
+_KNOWLEDGE_PHRASES = (
+    "in my knowledge", "in my documents", "in my files", "in my notes", "in stored knowledge",
+    "from my documents", "from my files", "from my notes", "in the knowledge base",
+    "do my notes", "do my documents", "do my files", "my notes say", "my documents say",
+    "u mojim dokumentima", "u mojim beleskama", "u mojim fajlovima",
+)
+
+
+def _knowledge_intent(question: str) -> Optional[AskIntent]:
+    q = _norm(question)
+    if not (q.startswith(_KNOWLEDGE_PREFIXES) or any(p in q for p in _KNOWLEDGE_PHRASES)):
+        return None
+    from knowledge.retrieval import parse_question
+
+    text = question.strip()
+    for prefix in _KNOWLEDGE_PREFIXES:
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):]
+            break
+    query, date_filters = parse_question(text)
+    return AskIntent(
+        "knowledge_search",
+        query=query,
+        filters=date_filters,
+        limit=8,
+        confidence=1.0,
+    )
+
+
 def _deterministic_intent(question: str) -> AskIntent:
+    knowledge = _knowledge_intent(question)
+    if knowledge is not None:
+        return knowledge
+
     q = _norm(question)
 
     if any(term in q for term in ("need a reply", "need reply", "reply needed", "trebaju odgovor")):
@@ -817,6 +858,17 @@ def _tool_result_to_ask_response(
             "answer": "\n".join(lines),
             "data": data,
         }
+    if tool_name == "search_knowledge":
+        from knowledge.retrieval import format_hits
+
+        data["knowledge"] = result.records
+        data["warnings"] = result.warnings
+        return {
+            "question": question,
+            "intent": "knowledge_search",
+            "answer": format_hits({"count": result.record_count, "hits": result.records}),
+            "data": data,
+        }
     if tool_name == "get_email_thread":
         data["thread"] = result.records
         return {
@@ -832,6 +884,52 @@ def _tool_result_to_ask_response(
         "answer": result.summary,
         "data": data,
     }
+
+
+def _answer_knowledge_question(
+    question: str,
+    intent: AskIntent,
+    *,
+    use_llm: bool,
+    store,
+    command_service: Optional[CommandService] = None,
+    chat_fn=None,
+) -> Dict[str, Any]:
+    """Retrieve stored knowledge, then optionally answer strictly from that evidence."""
+    arguments: Dict[str, Any] = {"query": intent.query, "limit": intent.limit}
+    arguments.update(intent.filters or {})
+    response = execute_tool_route(
+        question,
+        "search_knowledge",
+        arguments,
+        store=store,
+        command_service=command_service,
+    )
+    if response.get("intent") == "tool_error":
+        return response
+    data = response.get("data") or {}
+    data["knowledge_query"] = intent.query
+    data["knowledge_filters"] = intent.filters or {}
+    data["grounded_answer"] = False
+    records = data.get("knowledge") or []
+    if use_llm and records and getattr(store, "backend", "sqlite") == "sqlite":
+        from knowledge.repository import query_tokens
+        from knowledge.retrieval import answer_from_evidence
+
+        model_answer = answer_from_evidence(
+            store.database_path,
+            question,
+            {"hits": records, "tokens": query_tokens(intent.query)},
+            chat_fn=chat_fn,
+        )
+        if model_answer:
+            data["grounded_answer"] = True
+            response["answer"] = (
+                "Answer (local model, restricted to the retrieved evidence below):\n"
+                f"{model_answer}\n\nEvidence:\n{response['answer']}"
+            )
+    response["data"] = data
+    return response
 
 
 def _search_leads(leads: List[Dict[str, Any]], intent: AskIntent) -> List[Dict[str, Any]]:

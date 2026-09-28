@@ -27,6 +27,8 @@ from tools.read_inputs import (
     ListUnverifiedContactMethodsInput,
     SearchContactsInput,
 )
+from knowledge.schemas import SearchKnowledgeInput
+from knowledge.tool import handle_search_knowledge
 from tools.risk import RiskClass
 from tools.write_handlers import handle_propose_contact_update, handle_propose_create_followup
 from tools.write_inputs import ProposeContactUpdateInput, ProposeCreateFollowupInput
@@ -155,6 +157,18 @@ def build_default_registry() -> ToolRegistry:
             input_model=GetEmailThreadInput,
             handler=handle_get_email_thread,
             description="Read an imported Gmail thread from the local database.",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="search_knowledge",
+            risk_class=RiskClass.READ,
+            input_model=SearchKnowledgeInput,
+            handler=handle_search_knowledge,
+            description=(
+                "Read-only full-text search over locally ingested knowledge files "
+                "(query, project, category, topic, entity, person_id, content_kind, event/captured date range)."
+            ),
         )
     )
     registry.register(

@@ -160,6 +160,29 @@ Acceptance highlights:
 - Idempotent local persistence with provider/account/message uniqueness.
 - Tests use `FakeGmailProvider` only.
 
+## Phase K0 — local knowledge ingestion and retrieval
+
+**Status:** Implemented in-tree for the SQLite runtime. See `docs/knowledge.md`.
+
+Scope: drag-and-drop file ingestion on `/knowledge`, content-addressed
+original preservation, deterministic type routing and extraction (text, PDF,
+DOCX), optional vision provider for images, schema-validated advisory LLM
+classification, relational topics/entities with exact-only contact linking,
+FTS5 search with metadata filters, `search_knowledge` read tool, and an
+evidence-cited `/ask` path.
+
+Out of scope for K0: embeddings/vector search, PostgreSQL knowledge
+persistence, scanned-PDF OCR, editing or deleting items, and automatic
+consolidation or contradiction resolution.
+
+Acceptance highlights:
+
+- Exact duplicate files are detected by SHA-256 and never stored twice.
+- Per-file failure isolation; model failure keeps the original and extracted text.
+- Model output cannot corrupt storage (Pydantic validation; invalid output is recorded, not persisted as metadata).
+- No fabricated vision output; unavailable vision is explicit.
+- Tests use `tmp_path` databases and storage only.
+
 ## Phase G1 — temporal follow-up reasoning (future)
 
 - Resolve controlled date/time expressions using `APP_TIMEZONE`.

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ item.original_filename }} — Knowledge</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Knowledge item K{{ item.id }}</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/ask">Ask Database</a>
+      <a href="/knowledge">Knowledge</a>
+      <a href="/export/csv">CSV Export</a>
+    </nav>
+  </header>
+  <main>
+    <div class="card">
+      <h2>{{ item.original_filename }} <span class="badge {% if item.status != 'ready' %}warn{% endif %}">{{ item.status }}</span></h2>
+      <table>
+        <tr><th>Original</th><td><a href="/knowledge/items/{{ item.id }}/original">download</a> ({{ item.mime_type }}, {{ item.size_bytes }} bytes)</td></tr>
+        <tr><th>SHA-256</th><td><code>{{ item.content_hash }}</code></td></tr>
+        <tr><th>Captured at</th><td>{{ item.captured_at }}</td></tr>
+        <tr><th>Event date</th><td>{% if item.event_date %}{{ item.event_date }} <span class="badge warn">{{ item.event_date_source }}</span>{% else %}unknown{% endif %}</td></tr>
+        <tr><th>Project</th><td>{{ item.project or "—" }}{% if item.project_source %} <span class="badge">{{ item.project_source }}</span>{% endif %}</td></tr>
+        <tr><th>Category</th><td>{{ item.category or "—" }}{% if item.sub_category %} / {{ item.sub_category }}{% endif %}</td></tr>
+        <tr><th>Importance</th><td>{{ item.importance if item.importance is not none else "—" }}</td></tr>
+        <tr><th>Extraction</th><td>{{ item.extraction_status }} ({{ item.extraction_method }})</td></tr>
+        <tr><th>Vision</th><td>{{ item.vision_status }}</td></tr>
+        <tr><th>Classification</th><td>{{ item.classification_status }}{% if item.classification_model %} — {{ item.classification_model }}{% endif %}{% if item.classification_warning %} <span class="badge warn">{{ item.classification_warning }}</span>{% endif %}</td></tr>
+        <tr><th>Ingest command</th><td><code>{{ item.ingest_command_id or "—" }}</code></td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Summary <span class="badge">model-proposed</span></h2>
+      <p>{{ item.summary or "No validated summary (classification " ~ item.classification_status ~ ")." }}</p>
+      <h3>Topics</h3>
+      <p>{% for t in item.topics %}<span class="badge">{{ t }}</span> {% else %}—{% endfor %}</p>
+      <h3>Entities</h3>
+      {% if item.entities %}
+      <table>
+        <thead><tr><th>Name</th><th>Type</th><th>Link</th></tr></thead>
+        <tbody>
+        {% for e in item.entities %}
+          <tr>
+            <td>{{ e.name }}</td>
+            <td>{{ e.entity_type }}</td>
+            <td>
+              {% if e.person_id %}person <a href="/leads">#{{ e.person_id }} {{ e.person_name }}</a>
+              {% elif e.lead_id %}company <a href="/leads/{{ e.lead_id }}">{{ e.lead_name }}</a>
+              {% else %}{{ e.link_status }}{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p>—</p>{% endif %}
+    </div>
+
+    {% if item.visual_description %}
+    <div class="card">
+      <h2>Visual description <span class="badge">vision model</span></h2>
+      <p>{{ item.visual_description }}</p>
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <h2>Extracted text <span class="badge">{{ item.text_chars }} chars</span></h2>
+      {% if item.normalized_text %}
+      <pre class="answer">{{ item.normalized_text }}</pre>
+      {% else %}
+      <p>No extracted text is stored for this item ({{ item.extraction_status }}, vision {{ item.vision_status }}).</p>
+      {% endif %}
+    </div>
+
+    {% if related %}
+    <div class="card">
+      <h2>Related (shared topics/entities)</h2>
+      <ul>
+        {% for r in related %}
+        <li><a href="/knowledge/items/{{ r.id }}">K{{ r.id }} {{ r.original_filename }}</a> — overlap {{ r.overlap }}{% if r.summary %}: {{ r.summary[:140] }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </main>
+</body>
+</html>

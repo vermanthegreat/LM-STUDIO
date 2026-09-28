@@ -39,6 +39,9 @@ Optional: run [LM Studio](https://lmstudio.ai/) with a model loaded at `http://l
 | `/export/csv` | CSV download |
 | `/integrations/gmail` | Gmail G0 status and manual sync |
 | `/emails` | Imported Gmail messages (filtered) |
+| `/knowledge` | Drag-and-drop file ingestion, knowledge inbox, search |
+| `/knowledge/items/{id}` | Knowledge item detail (extracted text, metadata, original) |
+| `/api/knowledge/search` | JSON full-text + metadata search over ingested files |
 
 Gmail G0 is disabled unless `GMAIL_ENABLED=true`. Gmail sync and email queries
 require the **SQLite** runtime; PostgreSQL returns a controlled unsupported-runtime
@@ -50,6 +53,14 @@ python scripts/gmail_authorize.py
 
 Create the configured Gmail label (default `LMStudio`) manually before the first sync.
 
+## Knowledge ingestion
+
+Drop text, Markdown, JSON, code, PDF, DOCX, PNG, JPEG, or WEBP files on
+`/knowledge`. Originals are kept in `KNOWLEDGE_STORAGE_DIR` (default
+`./knowledge_store`), text is extracted deterministically, LM Studio proposes
+a validated summary/topics/entities, and everything is searchable (SQLite
+FTS5). Ask with `knowledge: <terms>` on `/ask`. See `docs/knowledge.md`.
+
 ## Ask database examples
 
 - `koliko imamo potencijalnih klijenata?`
@@ -60,6 +71,7 @@ Create the configured Gmail label (default `LMStudio`) manually before the first
 - `show leads without contacts`
 - `show follow-ups due`
 - `summarize company Acme Agency`
+- `knowledge: OAuth CommerceGov` / `what do my notes say about benchmark 5000 products?`
 
 ## Tests
 
@@ -101,6 +113,12 @@ GMAIL_TOKEN_PATH=
 GMAIL_SYNC_LABEL=LMStudio
 GMAIL_SYNC_LIMIT=100
 APP_TIMEZONE=Asia/Jerusalem
+
+# Knowledge ingestion (SQLite runtime only)
+KNOWLEDGE_STORAGE_DIR=./knowledge_store
+KNOWLEDGE_MAX_UPLOAD_MB=25
+KNOWLEDGE_VISION_MODEL=
+KNOWLEDGE_CLASSIFY=true
 ```
 
 Copy `.env.example` to `.env` and adjust paths for your machine. Never commit real credentials.

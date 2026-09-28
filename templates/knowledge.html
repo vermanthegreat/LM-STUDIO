@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Knowledge — LM Studio</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>Knowledge</h1>
+    <nav>
+      <a href="/">Paste</a>
+      <a href="/leads">Leads</a>
+      <a href="/ask">Ask Database</a>
+      <a href="/knowledge">Knowledge</a>
+      <a href="/export/csv">CSV Export</a>
+    </nav>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Add files</h2>
+      <p>Text, Markdown, JSON, source code, PDF, DOCX, PNG, JPEG, WEBP — up to {{ max_upload_mb }} MB each.
+        Originals are kept locally; the model only proposes summary and metadata.
+        {% if not vision_enabled %}<br><span class="badge warn">Image vision disabled</span>
+        Images are stored but not transcribed until <code>KNOWLEDGE_VISION_MODEL</code> names a vision-capable LM Studio model.{% endif %}
+      </p>
+      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Drop files here or choose files">
+        <strong>Drop files here</strong>
+        <span>or</span>
+        <label class="btn" for="file-input">Choose files</label>
+        <input type="file" id="file-input" multiple hidden>
+      </div>
+      <label for="project">Project (optional, applied to this upload)</label>
+      <input type="text" id="project" maxlength="120" placeholder="e.g. CommerceGov">
+      <table id="upload-table" class="upload-table" hidden>
+        <thead><tr><th>File</th><th>Status</th><th>Details</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Search knowledge</h2>
+      <form id="search-form" class="search-form">
+        <input type="text" name="q" id="search-q" placeholder="e.g. OAuth CommerceGov">
+        <div class="filters">
+          <input type="text" name="project" placeholder="project">
+          <input type="text" name="category" placeholder="category">
+          <input type="text" name="topic" placeholder="topic">
+          <input type="text" name="entity" placeholder="entity / person">
+          <select name="content_kind">
+            <option value="">any type</option>
+            <option value="text">text</option>
+            <option value="document">document</option>
+            <option value="image">image</option>
+          </select>
+          <label>event from <input type="date" name="event_from"></label>
+          <label>event to <input type="date" name="event_to"></label>
+        </div>
+        <button type="submit">Search</button>
+      </form>
+      <div id="search-results"></div>
+    </div>
+
+    {% if facets.projects or facets.categories or facets.topics %}
+    <div class="card">
+      <h2>Browse</h2>
+      <p class="facets">
+        {% for f in facets.projects %}<a href="#" data-filter="project" data-value="{{ f.value }}" class="badge">project: {{ f.value }} ({{ f.count }})</a> {% endfor %}
+        {% for f in facets.categories %}<a href="#" data-filter="category" data-value="{{ f.value }}" class="badge">{{ f.value }} ({{ f.count }})</a> {% endfor %}
+        {% for f in facets.topics %}<a href="#" data-filter="topic" data-value="{{ f.value }}" class="badge">#{{ f.value }} ({{ f.count }})</a> {% endfor %}
+      </p>
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <h2>Inbox <span class="badge">{{ total }} item(s)</span></h2>
+      {% if items %}
+      <table>
+        <thead><tr><th>Captured</th><th>Source</th><th>Type</th><th>Project</th><th>Category</th><th>Summary</th><th>Status</th></tr></thead>
+        <tbody>
+        {% for it in items %}
+          <tr>
+            <td>{{ it.captured_at[:16] | replace("T", " ") }}</td>
+            <td><a href="/knowledge/items/{{ it.id }}">{{ it.original_filename }}</a></td>
+            <td>{{ it.content_kind }}</td>
+            <td>{{ it.project or "" }}</td>
+            <td>{{ it.category or "" }}</td>
+            <td>{{ (it.summary or "")[:160] }}</td>
+            <td><span class="badge {% if it.status != 'ready' %}warn{% endif %}">{{ it.status }}</span></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p>No knowledge items yet.</p>
+      {% endif %}
+    </div>
+  </main>
+  <script src="/static/knowledge.js"></script>
+</body>
+</html>

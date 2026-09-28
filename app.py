@@ -8,10 +8,24 @@ from pathlib import Path
 from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError as PydanticValidationError
+
+import db
+from knowledge import repository as knowledge_repo
+from knowledge.ingestion import (
+    KnowledgeRuntimeUnsupportedError,
+    UploadedFile,
+    build_ingestor,
+    require_knowledge_sqlite_runtime,
+)
+from knowledge.retrieval import search_knowledge
+from knowledge.schemas import SearchKnowledgeInput
+from knowledge.storage import OriginalFileStore
 
 from ask_router import (
     answer_question,
@@ -321,6 +335,143 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "messages": messages,
                 "runtime_error": runtime_error,
             },
+        )
+
+    # ------------------------------------------------------------ knowledge
+
+    def _knowledge_db_path(request: Request) -> Path:
+        try:
+            return require_knowledge_sqlite_runtime(request.app.state.store)
+        except KnowledgeRuntimeUnsupportedError as exc:
+            raise ValidationError(error_code=exc.error_code, message=exc.message, status_code=501) from None
+
+    def _knowledge_search_params(request: Request) -> SearchKnowledgeInput:
+        raw = {k: v for k, v in request.query_params.items() if str(v).strip() != ""}
+        if "q" in raw:
+            raw["query"] = raw.pop("q")
+        try:
+            return SearchKnowledgeInput.model_validate(raw)
+        except PydanticValidationError as exc:
+            fields = sorted({".".join(str(p) for p in err["loc"]) for err in exc.errors()})
+            raise ValidationError(
+                error_code="invalid_knowledge_search",
+                message="Invalid search parameters: " + ", ".join(fields),
+                status_code=422,
+            ) from None
+
+    @application.get("/knowledge", response_class=HTMLResponse)
+    def knowledge_page(request: Request):
+        db_path = _knowledge_db_path(request)
+        with db.get_conn(db_path) as conn:
+            items, total = knowledge_repo.list_recent(conn, limit=50)
+            facets = knowledge_repo.facet_counts(conn)
+        return templates.TemplateResponse(
+            request,
+            "knowledge.html",
+            {
+                "request": request,
+                "items": items,
+                "total": total,
+                "facets": facets,
+                "vision_enabled": bool(cfg.knowledge_vision_model),
+                "max_upload_mb": cfg.knowledge_max_upload_bytes // (1024 * 1024),
+            },
+        )
+
+    @application.post("/knowledge/ingest")
+    async def knowledge_ingest(
+        request: Request,
+        files: list[UploadFile] = File(...),
+        project: str = Form(""),
+    ):
+        assert_safe_mutation_request(request, port=cfg.port)
+        _knowledge_db_path(request)
+        uploads: list[UploadedFile] = []
+        limit = cfg.knowledge_max_upload_bytes
+        for upload in files:
+            # Read at most limit+1 bytes so oversize files are rejected without full buffering.
+            data = await upload.read(limit + 1)
+            uploads.append(UploadedFile(filename=upload.filename or "upload", data=data))
+            await upload.close()
+        ingestor = build_ingestor(request.app.state.store, cfg)
+        result = await run_in_threadpool(ingestor.ingest_batch, uploads, project=project or None)
+        status_code = 200 if result.status != "error" else 422
+        return JSONResponse(status_code=status_code, content=result.model_dump(mode="json"))
+
+    @application.get("/api/knowledge/items")
+    def knowledge_items_api(request: Request, limit: int = 50, offset: int = 0):
+        db_path = _knowledge_db_path(request)
+        with db.get_conn(db_path) as conn:
+            items, total = knowledge_repo.list_recent(
+                conn, limit=min(max(limit, 1), 200), offset=max(offset, 0)
+            )
+        return JSONResponse(content={"total": total, "items": items})
+
+    @application.get("/api/knowledge/items/{item_id}")
+    def knowledge_item_api(request: Request, item_id: int):
+        db_path = _knowledge_db_path(request)
+        with db.get_conn(db_path) as conn:
+            item = knowledge_repo.get_item(conn, item_id, include_text=True)
+            related = knowledge_repo.related_items(conn, item_id) if item else []
+        if item is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error_code": "knowledge_item_not_found", "message": f"Knowledge item {item_id} was not found."},
+            )
+        return JSONResponse(content={**item, "related": related})
+
+    @application.get("/api/knowledge/search")
+    def knowledge_search_api(request: Request):
+        db_path = _knowledge_db_path(request)
+        params = _knowledge_search_params(request)
+        return JSONResponse(content=search_knowledge(db_path, params))
+
+    @application.get("/knowledge/items/{item_id}", response_class=HTMLResponse)
+    def knowledge_item_page(request: Request, item_id: int):
+        db_path = _knowledge_db_path(request)
+        with db.get_conn(db_path) as conn:
+            item = knowledge_repo.get_item(conn, item_id, include_text=True)
+            related = knowledge_repo.related_items(conn, item_id) if item else []
+        if item is None:
+            raise ValidationError(
+                error_code="knowledge_item_not_found",
+                message=f"Knowledge item {item_id} was not found.",
+                status_code=404,
+            )
+        return templates.TemplateResponse(
+            request,
+            "knowledge_item.html",
+            {"request": request, "item": item, "related": related},
+        )
+
+    @application.get("/knowledge/items/{item_id}/original")
+    def knowledge_item_original(request: Request, item_id: int):
+        db_path = _knowledge_db_path(request)
+        with db.get_conn(db_path) as conn:
+            item = knowledge_repo.get_item(conn, item_id, include_text=False)
+        if item is None:
+            raise ValidationError(
+                error_code="knowledge_item_not_found",
+                message=f"Knowledge item {item_id} was not found.",
+                status_code=404,
+            )
+        file_store = OriginalFileStore(cfg.knowledge_storage_dir)
+        try:
+            path = file_store.resolve(item["source_path"])
+        except ValueError:
+            raise ValidationError(error_code="knowledge_original_invalid_path", message="Invalid stored path.", status_code=500) from None
+        if not path.is_file():
+            raise ValidationError(
+                error_code="knowledge_original_missing",
+                message=f"Original file for knowledge item {item_id} is missing from storage.",
+                status_code=404,
+            )
+        # Always download; never render uploaded HTML/SVG inline in the app origin.
+        return FileResponse(
+            path,
+            media_type="application/octet-stream",
+            filename=item["original_filename"],
+            headers={"X-Content-Type-Options": "nosniff"},
         )
 
     return application

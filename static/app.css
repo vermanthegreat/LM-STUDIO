@@ -81,3 +81,27 @@ pre.answer {
 }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 @media (max-width: 700px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* Knowledge ingestion */
+.dropzone {
+  border: 2px dashed #8aa4c2;
+  border-radius: 8px;
+  padding: 2.5rem 1rem;
+  text-align: center;
+  background: #f8fbff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+}
+.dropzone.dragover { background: #e3eefb; border-color: #1e3a5f; }
+.dropzone .btn { margin-top: 0.25rem; }
+.upload-table { margin-top: 1rem; }
+.upload-table progress { margin-left: 0.5rem; width: 80px; vertical-align: middle; }
+.search-form .filters { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+.search-form .filters input, .search-form .filters select { width: auto; flex: 1 1 140px; }
+.search-form .filters label { font-weight: normal; margin: 0; }
+.hit { border-top: 1px solid #e0e0e0; padding: 0.6rem 0; }
+.hit .snippet { font-family: ui-monospace, monospace; font-size: 0.85rem; background: #f8f9fa; padding: 0.25rem 0.5rem; }
+.muted { color: #666; font-size: 0.85rem; }
+.facets .badge { margin: 0.15rem; text-decoration: none; color: inherit; }

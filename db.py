@@ -286,6 +286,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     ensure_gmail_tables(conn)
 
+    from knowledge.repository import ensure_knowledge_tables
+
+    ensure_knowledge_tables(conn)
+
 
 def _json_dumps(obj: Any) -> Optional[str]:
     if obj is None:

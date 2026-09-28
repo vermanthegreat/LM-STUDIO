@@ -40,6 +40,10 @@ class AppConfig:
     gmail_sync_label: str = "LMStudio"
     gmail_sync_limit: int = 100
     app_timezone: str = "Asia/Jerusalem"
+    knowledge_storage_dir: Path = BASE_DIR / "knowledge_store"
+    knowledge_max_upload_bytes: int = 25 * 1024 * 1024
+    knowledge_vision_model: str | None = None
+    knowledge_classify: bool = True
 
     @classmethod
     def from_env(cls) -> AppConfig:
@@ -47,6 +51,7 @@ class AppConfig:
         database_url = os.getenv("DATABASE_URL", "").strip() or None
         secret_path = os.getenv("GMAIL_CLIENT_SECRET_PATH", "").strip()
         token_path = os.getenv("GMAIL_TOKEN_PATH", "").strip()
+        knowledge_dir = os.getenv("KNOWLEDGE_STORAGE_DIR", "").strip()
         return cls(
             app_host=os.getenv("APP_HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=_env_int("PORT", 8025),
@@ -64,4 +69,8 @@ class AppConfig:
             gmail_sync_label=os.getenv("GMAIL_SYNC_LABEL", "LMStudio").strip() or "LMStudio",
             gmail_sync_limit=_env_int("GMAIL_SYNC_LIMIT", 100),
             app_timezone=os.getenv("APP_TIMEZONE", "Asia/Jerusalem").strip() or "Asia/Jerusalem",
+            knowledge_storage_dir=Path(knowledge_dir) if knowledge_dir else BASE_DIR / "knowledge_store",
+            knowledge_max_upload_bytes=_env_int("KNOWLEDGE_MAX_UPLOAD_MB", 25) * 1024 * 1024,
+            knowledge_vision_model=os.getenv("KNOWLEDGE_VISION_MODEL", "").strip() or None,
+            knowledge_classify=_env_bool("KNOWLEDGE_CLASSIFY", True),
         )
