@@ -156,26 +156,32 @@ def test_parse_llm_intent_null_fields() -> None:
     assert intent.company == ""
 
 
-def test_route_llm_fallback_unknown_question() -> None:
+def test_route_llm_fallback_unknown_question(tmp_path) -> None:
+    db_path = tmp_path / "test.db"
+    _seed(db_path)
     mock_payload = json.dumps({"intent": "top_leads", "confidence": 0.9, "limit": 10})
 
     with patch("ask_router.call_lmstudio_for_text", return_value=mock_payload):
-        result = route_question("I have a random question")
+        result = route_question("I have a random question", db_path=db_path)
         assert result["intent"] == "top_leads"
         assert "leads" in result["data"]
 
 
-def test_route_llm_fallback_invalid_json() -> None:
+def test_route_llm_fallback_invalid_json(tmp_path) -> None:
+    db_path = tmp_path / "test.db"
+    _seed(db_path)
     with patch("ask_router.call_lmstudio_for_text", return_value="not json {{{{"):
-        result = route_question("unknown question")
+        result = route_question("unknown question", db_path=db_path)
         assert result is not None
 
 
-def test_route_llm_fallback_unknown_intent() -> None:
+def test_route_llm_fallback_unknown_intent(tmp_path) -> None:
+    db_path = tmp_path / "test.db"
+    _seed(db_path)
     mock_payload = json.dumps({"intent": "count_leads", "confidence": 0.9, "limit": 10})
 
     with patch("ask_router.call_lmstudio_for_text", return_value=mock_payload):
-        result = route_question("unknown question")
+        result = route_question("unknown question", db_path=db_path)
         assert result["intent"] == "count_leads"
 
 
