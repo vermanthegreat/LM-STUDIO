@@ -160,7 +160,10 @@
           return;
         }
         var b = res.body;
-        results.appendChild(el("p", b.count + " result(s) — " + b.engine + ", " + b.match_mode));
+        var summary = b.count + " result(s) — " + b.engine + ", " + b.match_mode;
+        if (b.mode_used) summary += " · mode " + b.mode_used;
+        if (b.semantic && b.semantic.status === "error") summary += " (semantic unavailable: " + b.semantic.error_code + ", lexical fallback)";
+        results.appendChild(el("p", summary));
         b.hits.forEach(function (hit) {
           var div = el("div", null, "hit");
           var a = el("a", "K" + hit.id + " " + hit.original_filename);
@@ -171,6 +174,7 @@
           if (hit.project) meta.push(hit.project);
           if (hit.category) meta.push(hit.category);
           if (hit.ranking && hit.ranking.score !== null) meta.push("score " + hit.ranking.score);
+          if (hit.retrieval && hit.retrieval.evidence) meta.push("evidence " + hit.retrieval.evidence.join("+"));
           div.appendChild(el("div", meta.join(" · "), "muted"));
           if (hit.summary) div.appendChild(el("div", hit.summary));
           if (hit.snippet) div.appendChild(el("div", hit.snippet, "snippet"));

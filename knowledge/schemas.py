@@ -210,6 +210,8 @@ class FileIngestResult(BaseModel):
     message: Optional[str] = None
     warnings: list[str] = Field(default_factory=list)
     preview: Optional[dict[str, Any]] = None
+    # Phase K1: per-file embedding outcome (None when embeddings are disabled).
+    embedding: Optional[dict[str, Any]] = None
 
 
 class BatchIngestResult(BaseModel):
@@ -242,3 +244,15 @@ class KnowledgeSearchFilters(BaseModel):
 class SearchKnowledgeInput(KnowledgeSearchFilters):
     query: str = Field(default="", max_length=500)
     limit: int = Field(default=10, ge=1, le=50)
+    # auto = hybrid when embeddings are enabled, otherwise lexical (K0 behavior).
+    mode: Literal["auto", "lexical", "semantic", "hybrid"] = "auto"
+
+
+class ReindexRequest(BaseModel):
+    """Bounded re-index request (Phase K1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(default=200, ge=1, le=2000)
+    retry_failed: bool = False
+    item_id: Optional[int] = Field(default=None, ge=1)

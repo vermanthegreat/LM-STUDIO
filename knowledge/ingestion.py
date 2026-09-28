@@ -30,6 +30,7 @@ from knowledge.schemas import (
     VisionStatus,
 )
 from knowledge.storage import OriginalFileStore, sanitize_filename, sha256_hex
+from knowledge.embeddings import EmbeddingRuntime
 from knowledge.vision import UnavailableVisionProvider, VisionProvider, vision_result_to_text
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class KnowledgeIngestor:
     classify: bool = True
     model_name: str = "local-model"
     command_log_store: Any = None
+    embeddings: Optional[EmbeddingRuntime] = None
 
     # ------------------------------------------------------------------ batch
 
@@ -294,9 +296,13 @@ class KnowledgeIngestor:
             self.file_store.discard_if_created(stored)
             raise
 
+        # 5. Phase K1: embed the new item's chunks after commit. Never fails ingestion.
+        embedding = self._embed_new_item(item_id, warnings)
+
         return FileIngestResult(
             filename=filename,
             status=IngestStatus.INGESTED,
+            embedding=embedding,
             item_id=item_id,
             content_kind=route.kind,
             mime_type=route.mime_type,
@@ -307,6 +313,29 @@ class KnowledgeIngestor:
             warnings=warnings,
             preview=_preview(item, normalized),
         )
+
+    def _embed_new_item(self, item_id: int, warnings: list[str]) -> Optional[dict[str, Any]]:
+        runtime = self.embeddings
+        if runtime is None or not runtime.enabled or not runtime.settings.embed_on_ingest:
+            return None
+        from knowledge.embedding_index import index_knowledge
+
+        try:
+            report = index_knowledge(self.database_path, runtime, item_ids=[item_id])
+        except Exception:
+            logger.exception("embedding after ingest failed")
+            warnings.append("embedding_index_error")
+            return {"status": "failed", "error_codes": {"embedding_index_error": 1}}
+        if report.failed:
+            warnings.append("embedding_failed:" + ",".join(sorted(report.error_codes)))
+        return {
+            "status": report.status,
+            "model": report.model,
+            "chunks": report.chunks_total,
+            "indexed": report.indexed,
+            "failed": report.failed,
+            "error_codes": report.error_codes,
+        }
 
     @staticmethod
     def _duplicate_result(filename: str, content_hash: str, existing: dict[str, Any]) -> FileIngestResult:
@@ -342,6 +371,7 @@ def _preview(item: Optional[dict[str, Any]], normalized: str) -> dict[str, Any]:
 
 def build_ingestor(store: Any, cfg: Any, **overrides: Any) -> KnowledgeIngestor:
     from llm import LM_ENDPOINT
+    from knowledge.embeddings import get_embedding_runtime
     from knowledge.vision import build_vision_provider
 
     database_path = require_knowledge_sqlite_runtime(store)
@@ -356,6 +386,7 @@ def build_ingestor(store: Any, cfg: Any, **overrides: Any) -> KnowledgeIngestor:
         ),
         "classify": cfg.knowledge_classify,
         "model_name": cfg.lmstudio_model,
+        "embeddings": get_embedding_runtime(store),
     }
     kwargs.update(overrides)
     return KnowledgeIngestor(**kwargs)

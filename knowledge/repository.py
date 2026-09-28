@@ -146,6 +146,10 @@ def ensure_knowledge_tables(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         # SQLite built without FTS5: search degrades to LIKE matching.
         pass
+    # Phase K1 (additive): chunk and embedding tables.
+    from knowledge.embedding_index import ensure_embedding_tables
+
+    ensure_embedding_tables(conn)
 
 
 def fts_available(conn: sqlite3.Connection) -> bool:

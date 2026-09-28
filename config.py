@@ -44,6 +44,15 @@ class AppConfig:
     knowledge_max_upload_bytes: int = 25 * 1024 * 1024
     knowledge_vision_model: str | None = None
     knowledge_classify: bool = True
+    knowledge_embeddings_enabled: bool = False
+    knowledge_embedding_base_url: str | None = None
+    knowledge_embedding_model: str | None = None
+    knowledge_embedding_timeout: float = 30.0
+    knowledge_embedding_batch_size: int = 16
+    knowledge_embedding_allow_remote: bool = False
+    knowledge_embed_on_ingest: bool = True
+    knowledge_semantic_min_score: float = 0.25
+    knowledge_semantic_max_candidates: int = 5000
 
     @classmethod
     def from_env(cls) -> AppConfig:
@@ -73,4 +82,13 @@ class AppConfig:
             knowledge_max_upload_bytes=_env_int("KNOWLEDGE_MAX_UPLOAD_MB", 25) * 1024 * 1024,
             knowledge_vision_model=os.getenv("KNOWLEDGE_VISION_MODEL", "").strip() or None,
             knowledge_classify=_env_bool("KNOWLEDGE_CLASSIFY", True),
+            knowledge_embeddings_enabled=_env_bool("KNOWLEDGE_EMBEDDINGS_ENABLED", False),
+            knowledge_embedding_base_url=os.getenv("KNOWLEDGE_EMBEDDING_BASE_URL", "").strip() or None,
+            knowledge_embedding_model=os.getenv("KNOWLEDGE_EMBEDDING_MODEL", "").strip() or None,
+            knowledge_embedding_timeout=float(os.getenv("KNOWLEDGE_EMBEDDING_TIMEOUT", "30") or "30"),
+            knowledge_embedding_batch_size=_env_int("KNOWLEDGE_EMBEDDING_BATCH_SIZE", 16),
+            knowledge_embedding_allow_remote=_env_bool("KNOWLEDGE_EMBEDDING_ALLOW_REMOTE", False),
+            knowledge_embed_on_ingest=_env_bool("KNOWLEDGE_EMBED_ON_INGEST", True),
+            knowledge_semantic_min_score=float(os.getenv("KNOWLEDGE_SEMANTIC_MIN_SCORE", "0.25") or "0.25"),
+            knowledge_semantic_max_candidates=_env_int("KNOWLEDGE_SEMANTIC_MAX_CANDIDATES", 5000),
         )

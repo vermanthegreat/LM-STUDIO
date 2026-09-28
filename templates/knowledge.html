@@ -41,6 +41,14 @@
 
     <div class="card">
       <h2>Search knowledge</h2>
+      <p class="muted">
+        {% if embedding.runtime.enabled %}Semantic search: <code>{{ embedding.model }}</code> —
+          {{ embedding.embedded }} / {{ embedding.chunks_total }} chunks embedded{% if embedding.failed %},
+          <span class="badge warn">{{ embedding.failed }} failed</span>{% endif %}{% if embedding.stale or embedding.missing %},
+          {{ embedding.stale + embedding.missing }} awaiting re-index{% endif %}.
+        {% else %}<span class="badge">Embeddings disabled</span> Lexical search only
+          ({{ embedding.runtime.disabled_reason }}).{% endif %}
+      </p>
       <form id="search-form" class="search-form">
         <input type="text" name="q" id="search-q" placeholder="e.g. OAuth CommerceGov">
         <div class="filters">
@@ -48,6 +56,12 @@
           <input type="text" name="category" placeholder="category">
           <input type="text" name="topic" placeholder="topic">
           <input type="text" name="entity" placeholder="entity / person">
+          <select name="mode" aria-label="search mode">
+            <option value="auto">auto</option>
+            <option value="lexical">lexical</option>
+            <option value="semantic">semantic</option>
+            <option value="hybrid">hybrid</option>
+          </select>
           <select name="content_kind">
             <option value="">any type</option>
             <option value="text">text</option>

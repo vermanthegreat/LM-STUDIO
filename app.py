@@ -23,7 +23,15 @@ from knowledge.ingestion import (
     build_ingestor,
     require_knowledge_sqlite_runtime,
 )
+from knowledge.embedding_index import embedding_status, reindex_with_audit
+from knowledge.embeddings import (
+    attach_embedding_runtime,
+    build_embedding_runtime,
+    get_embedding_runtime,
+)
+from knowledge.embeddings import settings_from_config as embedding_settings_from_config
 from knowledge.retrieval import search_knowledge
+from knowledge.schemas import ReindexRequest
 from knowledge.schemas import SearchKnowledgeInput
 from knowledge.storage import OriginalFileStore
 
@@ -54,6 +62,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     cfg = config or AppConfig.from_env()
     logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO))
     store = get_contact_store(cfg)
+    attach_embedding_runtime(store, build_embedding_runtime(embedding_settings_from_config(cfg)))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -362,9 +371,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @application.get("/knowledge", response_class=HTMLResponse)
     def knowledge_page(request: Request):
         db_path = _knowledge_db_path(request)
+        runtime = get_embedding_runtime(request.app.state.store)
         with db.get_conn(db_path) as conn:
             items, total = knowledge_repo.list_recent(conn, limit=50)
             facets = knowledge_repo.facet_counts(conn)
+            embedding = embedding_status(conn, runtime)
         return templates.TemplateResponse(
             request,
             "knowledge.html",
@@ -373,6 +384,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "items": items,
                 "total": total,
                 "facets": facets,
+                "embedding": embedding,
                 "vision_enabled": bool(cfg.knowledge_vision_model),
                 "max_upload_mb": cfg.knowledge_max_upload_bytes // (1024 * 1024),
             },
@@ -424,7 +436,53 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     def knowledge_search_api(request: Request):
         db_path = _knowledge_db_path(request)
         params = _knowledge_search_params(request)
-        return JSONResponse(content=search_knowledge(db_path, params))
+        runtime = get_embedding_runtime(request.app.state.store)
+        return JSONResponse(content=search_knowledge(db_path, params, runtime))
+
+    @application.get("/api/knowledge/embeddings/status")
+    def knowledge_embedding_status_api(request: Request, item_id: int | None = None):
+        db_path = _knowledge_db_path(request)
+        runtime = get_embedding_runtime(request.app.state.store)
+        with db.get_conn(db_path) as conn:
+            return JSONResponse(content=embedding_status(conn, runtime, item_id=item_id))
+
+    @application.post("/knowledge/embeddings/reindex")
+    async def knowledge_reindex(request: Request):
+        assert_safe_mutation_request(request, port=cfg.port)
+        db_path = _knowledge_db_path(request)
+        runtime = get_embedding_runtime(request.app.state.store)
+        body: dict = {}
+        if (request.headers.get("content-type") or "").startswith("application/json"):
+            try:
+                body = await request.json()
+            except ValueError:
+                body = None
+        try:
+            params = ReindexRequest.model_validate(body)
+        except PydanticValidationError as exc:
+            fields = sorted({".".join(str(p) for p in err["loc"]) for err in exc.errors()}) or ["body"]
+            raise ValidationError(
+                error_code="invalid_reindex_request",
+                message="Invalid re-index parameters: " + ", ".join(fields),
+                status_code=422,
+            ) from None
+        if not runtime.enabled:
+            raise ValidationError(
+                error_code=runtime.disabled_reason or "embeddings_disabled",
+                message="Embeddings are disabled; lexical search remains available. See docs/knowledge.md.",
+                status_code=409,
+            )
+        report, command_id = await run_in_threadpool(
+            reindex_with_audit,
+            db_path,
+            runtime,
+            item_ids=[params.item_id] if params.item_id else None,
+            limit=params.limit,
+            retry_failed=params.retry_failed,
+        )
+        with db.get_conn(db_path) as conn:
+            status = embedding_status(conn, runtime)
+        return JSONResponse(content={"command_id": command_id, "report": report.to_dict(), "status": status})
 
     @application.get("/knowledge/items/{item_id}", response_class=HTMLResponse)
     def knowledge_item_page(request: Request, item_id: int):
