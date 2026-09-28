@@ -183,6 +183,69 @@ Acceptance highlights:
 - No fabricated vision output; unavailable vision is explicit.
 - Tests use `tmp_path` databases and storage only.
 
+## Phase K1 — local embeddings and hybrid knowledge retrieval
+
+**Status:** Canonical specification. Implemented on branch
+`claude/phase-k1-hybrid-retrieval`; not merged until reviewed.
+
+Objective:
+
+Add locally generated embeddings and hybrid lexical/semantic retrieval to the
+K0 knowledge subsystem so the application can find relevant business context
+even when the query and source use different wording, while preserving
+deterministic lexical retrieval, source attribution, local-first operation,
+and safe fallback behavior.
+
+Baseline note: K0 indexes whole knowledge items and has no chunk table. K1
+introduces deterministic, fingerprinted chunks of each item's extracted text
+as the unit of embedding. Citations remain item-level (`[K<id>]`) and carry
+the matching chunk identity.
+
+In scope:
+
+- configurable local embedding provider (OpenAI-compatible `/v1/embeddings`,
+  as served by LM Studio), disabled by default;
+- endpoint, model, timeout, batch size, and enabled/disabled configuration;
+- embedding generation for chunks of supported K0 items;
+- persistent embedding storage in the existing SQLite knowledge database via
+  an additive schema migration;
+- embedding model identity and vector-dimension tracking;
+- semantic (cosine) similarity search over compatible embeddings;
+- hybrid ranking combining K0 lexical results with semantic results using
+  Reciprocal Rank Fusion;
+- deterministic ranking and tie-breaking;
+- stable source citations;
+- indexing status and failure visibility;
+- bounded re-indexing of existing K0 items, including retry of failures;
+- lexical-only fallback when embeddings are disabled, unavailable, or invalid;
+- tests, configuration documentation, and operating instructions.
+
+Explicitly out of scope:
+
+- PostgreSQL persistence;
+- editing or deleting knowledge items;
+- manual or automatic re-classification;
+- OCR for scanned PDFs;
+- automatic consolidation;
+- contradiction resolution;
+- cloud-hosted vector databases;
+- autonomous external data collection;
+- email sending, receiving, synchronization, or account management;
+- K2 or later phases.
+
+Acceptance:
+
+- K0 lexical retrieval and existing K0 data keep working before and after
+  migration; basic K0 operation never requires embeddings.
+- Semantic retrieval returns relevant results without exact keyword overlap.
+- Hybrid results are deterministic, deduplicated per item, and cite only
+  retrieved items and chunks.
+- Provider failure, disabled configuration, model change, or dimension
+  mismatch is explicit and falls back to lexical retrieval.
+- Unchanged chunks are never re-embedded; changed chunks are.
+- The default test suite uses deterministic fake embeddings and needs no live
+  service, network, model download, or real data.
+
 ## Phase G1 — temporal follow-up reasoning (future)
 
 - Resolve controlled date/time expressions using `APP_TIMEZONE`.
