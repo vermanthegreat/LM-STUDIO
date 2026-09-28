@@ -125,7 +125,163 @@ databases and storage. The model is replaced with scripted `chat_fn`s.
 ## Limitations
 
 - SQLite only; PostgreSQL returns `knowledge_postgresql_runtime_unsupported`.
-- No embeddings or hybrid retrieval yet; ranking is FTS5 bm25 only.
+- Semantic retrieval (Phase K1) is opt-in; see below for its own limitations.
 - Scanned PDFs are stored and flagged `needs_vision`, but not OCRed.
 - No re-classification or deletion UI yet; items are immutable after ingest.
 - Consolidation and contradiction detection are not implemented.
+
+## Phase K1: local embeddings and hybrid retrieval
+
+K1 adds optional semantic search over K0 items. It finds a document about an
+"automobile fleet" for the query "car" even though no word overlaps.
+Embeddings are **disabled by default**, and everything above keeps working
+without them.
+
+### Search modes
+
+`GET /api/knowledge/search?...&mode=auto|lexical|semantic|hybrid`, the
+`search_knowledge` tool, and the mode selector on `/knowledge` all accept a
+mode.
+
+| Mode | Behavior |
+|---|---|
+| `lexical` | K0 FTS5 bm25 (all terms, then any term). Unchanged. |
+| `semantic` | Cosine similarity between the query embedding and chunk embeddings; one result per item (its best chunk); scores below `KNOWLEDGE_SEMANTIC_MIN_SCORE` are dropped. |
+| `hybrid` | Reciprocal Rank Fusion of lexical and semantic rankings: `rrf = Σ 1/(60 + rank)`, one result per item. |
+| `auto` (default) | `hybrid` when embeddings are enabled, otherwise `lexical`. |
+
+The ordering is deterministic. Semantic results sort by score descending,
+then item id, then chunk index. Hybrid results sort by RRF score descending,
+then best single-list rank, then item id.
+
+Every response reports `mode_requested`, `mode_used` and a `semantic` block
+(`status`: `not_requested`, `disabled`, `no_query`, `no_index`, `ok` or
+`error`, plus `error_code`). Each hit carries `retrieval.evidence`
+(`lexical`, `semantic` or both), its per-list ranks, and, when semantic
+evidence exists, `retrieval.chunk` (`chunk_id`, `chunk_index`, character
+offsets, text) and `source.chunk_id`. Citations stay item-level (`[K<id>]`).
+
+### Fallback
+
+If embeddings are disabled, nothing is indexed for the configured model, the
+provider errors or times out, or the query vector's dimension does not match
+the index, the request returns lexical results with
+`mode_used = "lexical"` and the reason in `semantic`. This happens after one
+provider attempt per request, with no retry within the request, and it is
+logged as a warning. Semantic results are never invented, and `/ask`
+evidence only ever contains the retrieved chunks.
+
+### Configuration
+
+```
+KNOWLEDGE_EMBEDDINGS_ENABLED=false     # opt in
+KNOWLEDGE_EMBEDDING_MODEL=             # required when enabled, e.g. an embedding model loaded in LM Studio
+KNOWLEDGE_EMBEDDING_BASE_URL=          # default: LMSTUDIO_BASE_URL (POST <base>/embeddings)
+KNOWLEDGE_EMBEDDING_TIMEOUT=30
+KNOWLEDGE_EMBEDDING_BATCH_SIZE=16
+KNOWLEDGE_EMBEDDING_ALLOW_REMOTE=false # non-loopback endpoints are refused unless true
+KNOWLEDGE_EMBED_ON_INGEST=true         # embed new uploads right after they are stored
+KNOWLEDGE_SEMANTIC_MIN_SCORE=0.25      # cosine threshold; model-dependent
+KNOWLEDGE_SEMANTIC_MAX_CANDIDATES=5000 # max chunk vectors scored per query
+```
+
+**Choosing a model.** Load an embedding model in LM Studio (one that
+appears as an embedding model and is served at `/v1/embeddings`), then set
+`KNOWLEDGE_EMBEDDING_MODEL` to its identifier as shown by
+`curl http://localhost:1234/v1/models`. Nothing is downloaded by this app.
+Tune `KNOWLEDGE_SEMANTIC_MIN_SCORE` for your model: too low adds weak
+matches, too high hides real ones.
+
+**Privacy.** Chunk text and queries go only to the configured endpoint, which
+must be loopback (`localhost`, `127.0.0.1`, `::1`) unless
+`KNOWLEDGE_EMBEDDING_ALLOW_REMOTE=true`. Otherwise the runtime reports
+`embedding_remote_endpoint_not_allowed` and stays lexical. Tool results
+written to the command log contain chunk references, not chunk text.
+
+### Storage
+
+Two tables are added by `db.init_db`. The migration is additive; existing K0
+rows are untouched.
+
+- `knowledge_chunks`: deterministic paragraph chunks of an item's extracted
+  text (about 1000 characters, at most 1500), with `(item_id, chunk_index)`
+  unique and a SHA-256 `fingerprint` of the chunker version plus the text.
+- `knowledge_chunk_embeddings`: one row per `(chunk_id, model)` holding the
+  `dimension`, the L2-normalized float32 `vector`, the `fingerprint` it was
+  computed from, `status` (`ok`/`failed`), `error_code`, `attempts` and
+  `indexed_at`.
+
+A vector is used only when its status is `ok`, its model is the configured
+model, its fingerprint equals the chunk's current fingerprint, and its
+dimension equals the model's established dimension (set by the first stored
+vector). So:
+
+- **Unchanged chunks** are skipped on re-index.
+- **Changed text** makes the old vector stale; it is re-embedded in place,
+  keeping the same chunk id.
+- **Changing the model** leaves old vectors ignored (counted as
+  `other_model_embeddings`) until you re-index. Until then searches fall back
+  to lexical with `semantic.status = "no_index"`.
+- **A vector of a different dimension** for the same model is stored as
+  failed with `embedding_dimension_mismatch`, and a mismatched query vector
+  falls back to lexical.
+
+### Indexing existing K0 knowledge
+
+New uploads are embedded after they are committed (if
+`KNOWLEDGE_EMBED_ON_INGEST=true`). An embedding failure never fails or
+removes the upload. Existing items are indexed on demand, never at startup:
+
+```bash
+# status (optionally ?item_id=N)
+curl http://127.0.0.1:8025/api/knowledge/embeddings/status
+# one bounded pass (limit 1-2000, default 200); repeat until eligible == 0
+curl -X POST http://127.0.0.1:8025/knowledge/embeddings/reindex \
+     -H 'content-type: application/json' -d '{"limit": 500}'
+# retry chunks that already failed 3 times
+curl -X POST http://127.0.0.1:8025/knowledge/embeddings/reindex \
+     -H 'content-type: application/json' -d '{"retry_failed": true}'
+```
+
+Each pass reports `eligible`, `indexed`, `skipped_unchanged`, `failed`,
+`skipped_max_attempts`, `deferred` and `error_codes`, and is recorded in the
+command log as `knowledge_reindex`. Failure handling:
+
+- A bad input fails only its own chunk; the batch is retried one chunk at a
+  time.
+- A provider outage (timeout, unreachable, HTTP error) stops the pass after
+  one batch.
+- Failed chunks are retried on later passes up to 3 attempts, then only with
+  `retry_failed`.
+
+With embeddings disabled the endpoint returns 409 and changes nothing.
+
+The `/knowledge` page shows the embedded/total chunk counts, failures, and
+chunks awaiting re-index.
+
+### Tests and local verification
+
+```bash
+python -m pytest tests/test_knowledge_k1_embeddings.py -q
+python -m pytest tests/test_knowledge_ingestion.py tests/test_knowledge_search_and_routes.py -q
+python -m pytest tests/test_query_counts.py -q
+python -m pytest tests/ -q
+```
+
+The tests use a deterministic concept-bucket fake embedder and `httpx`
+mock transports. They need no LM Studio, network, model download or real
+data, and they assert that the default `leads.db` is not modified.
+
+For a live check, start LM Studio with an embedding model loaded, set the
+variables above, run `python app.py`, POST a re-index, then search with
+`mode=semantic` for a paraphrase of a stored document.
+
+### K1 limitations
+
+- Similarity is computed in Python over at most
+  `KNOWLEDGE_SEMANTIC_MAX_CANDIDATES` vectors per query (response flag
+  `semantic.truncated`). This fits local scale, not large corpora.
+- Only extracted text is chunked; items without text (images without vision,
+  scanned PDFs) have no embeddings.
+- The minimum score is a single global threshold and must be tuned per model.
+- SQLite only; no approximate-nearest-neighbour index.

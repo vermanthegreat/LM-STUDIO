@@ -92,8 +92,12 @@ On PostgreSQL runtime (G0), returns `status=error` with
 Read-only. Full-text (FTS5 bm25) and metadata search over locally ingested
 knowledge files: `query`, `project`, `category`, `topic`, `entity`,
 `person_id`, `content_kind`, `event_from/event_to`, `captured_from/captured_to`,
-`date_from/date_to` (effective date), `limit` (1–50). Unknown fields are
-rejected. Records carry the knowledge item ID, original filename, snippet,
+`date_from/date_to` (effective date), `limit` (1–50), and `mode`
+(`auto|lexical|semantic|hybrid`, default `auto`, which is lexical unless local
+embeddings are enabled; Phase K1). Unknown fields are rejected. Semantic or
+hybrid failures fall back to lexical and add the warning
+`semantic_fallback:<error_code>`; records carry `retrieval` evidence and chunk
+references, never chunk text. Records carry the knowledge item ID, original filename, snippet,
 ranking, and captured/event dates; provenance lists `knowledge_item:<id>`.
 Zero matches add the warning `no_matches_absence_is_not_evidence`.
 On PostgreSQL runtime, returns `status=error` with

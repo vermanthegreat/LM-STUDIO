@@ -59,7 +59,9 @@ Drop text, Markdown, JSON, code, PDF, DOCX, PNG, JPEG, or WEBP files on
 `/knowledge`. Originals are kept in `KNOWLEDGE_STORAGE_DIR` (default
 `./knowledge_store`), text is extracted deterministically, LM Studio proposes
 a validated summary/topics/entities, and everything is searchable (SQLite
-FTS5). Ask with `knowledge: <terms>` on `/ask`. See `docs/knowledge.md`.
+FTS5). Optional local embeddings add semantic and hybrid search (Phase K1,
+disabled by default). Ask with `knowledge: <terms>` on `/ask`. See
+`docs/knowledge.md`.
 
 ## Ask database examples
 
@@ -119,6 +121,9 @@ KNOWLEDGE_STORAGE_DIR=./knowledge_store
 KNOWLEDGE_MAX_UPLOAD_MB=25
 KNOWLEDGE_VISION_MODEL=
 KNOWLEDGE_CLASSIFY=true
+# Optional local embeddings + hybrid search (Phase K1), see docs/knowledge.md
+KNOWLEDGE_EMBEDDINGS_ENABLED=false
+KNOWLEDGE_EMBEDDING_MODEL=
 ```
 
 Copy `.env.example` to `.env` and adjust paths for your machine. Never commit real credentials.
