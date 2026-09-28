@@ -252,6 +252,255 @@ Acceptance:
 - Create task proposals from email markers with explicit approval.
 - Maintain overdue/upcoming views.
 
+## Phase G2 — Gmail production readiness and multi-account
+
+**Status:** Canonical specification; not implemented. Branch naming:
+`claude/phase-g2-*`. G2 does not depend on G1; G1 remains future.
+
+Objective:
+
+Make the Gmail subsystem a correct, restart-safe email transport and state
+foundation for daily business use across **four Gmail accounts**:
+reliable sync and reading, correct thread reconstruction, durable drafts,
+replies and forwards, and **explicit operator-initiated send** with send
+results reconciled from Gmail. G2 is transport and state only; AI drafting and
+K1-powered contextual writing are a later, separate phase.
+
+Policy authorization: `AGENTS.md` forbids email sending "unless a later
+specification explicitly authorizes it". This section is that specification,
+and it authorizes **only** operator-initiated sends of an operator-reviewed
+draft through the typed application path. The LLM never receives send,
+draft-write, or Gmail capabilities. When G2 ships, `docs/product.md`
+("Excluded scope"), `docs/safety-and-communication.md` ("Email sending is not
+supported"), and `docs/architecture.md` (Gmail provider boundary, read-only
+scope) must be updated in the same change to match.
+
+Current baseline (audited on `main` @ `354b279`):
+
+- Exists (G0): a single account through one `GMAIL_TOKEN_PATH`;
+  `gmail.readonly` scope only; manual label-scoped sync
+  (`GMAIL_SYNC_LABEL`, first page only, `GMAIL_SYNC_LIMIT`, no page loop);
+  `gmail_sources` unique on `(provider, external_account,
+  external_message_id)`; per-message classification and exact-email contact
+  linking; RFC `Message-ID` persisted; `/emails`, `/emails/thread/{id}`,
+  `/integrations/gmail`; read tools `list_email_messages` and
+  `get_email_thread`; `FakeGmailProvider` tests in `tests/test_gmail_g0.py`;
+  SQLite only (PostgreSQL fails closed).
+- Partial: `In-Reply-To`, `References` and `labelIds` are parsed in
+  normalization but not persisted as queryable state. Bodies are decoded as
+  UTF-8 regardless of the declared charset. HTML is flattened to text only
+  when no text/plain part exists. Attachments are recorded as metadata only.
+  Token refresh happens at load, with a non-atomic token-file write.
+  `gmail_sync_state` is a single global row (`CHECK (id = 1)`), not
+  per-account.
+- Missing: multiple accounts; full-mailbox sync on `main`;
+  `historyId`-based incremental sync; resume cursors; deletion, archive, spam
+  and trash convergence; per-account health; retry, backoff and rate-limit
+  handling; revoked-token handling; drafts; reply, reply-all and forward; any
+  send path; attachment download or upload; live Gmail certification
+  evidence (none exists in the repository).
+- Unmerged prior work: branch `origin/agent/contact-intelligence-hardening`
+  (diverged at `8528eec`, before K0) contains related Gmail commits (for
+  example `ecd9a29`, `816bbb0`, `3f1c4fd`, `06e04c0`):
+  - per-account `gmail_mailbox_sync_state` with page-token resume and a
+    `latest_history_id` column;
+  - `includeSpamTrash` paging;
+  - atomic token writes;
+  - `gmail_conversations` and `lead_communication_state` projections;
+  - related tests.
+
+  It remains read-only and single-token. **Gate G2-0:** before G2
+  implementation starts, the operator decides whether those commits are
+  integrated into `main` (reviewed, conflict-resolved against K0/K1) or
+  superseded. G2 must not silently duplicate or discard them.
+
+In scope:
+
+1. **Multi-account**
+   - Up to four independently configured Gmail accounts, each with its own
+     OAuth token file and enabled flag.
+   - Account identity (normalized account email) is a required, immutable
+     key on every persisted mailbox object: sources, messages, threads,
+     labels/state, sync cursors, drafts, send attempts, and command-log
+     arguments.
+   - Every mailbox query, tool, and route is account-scoped or explicitly
+     multi-account with account shown.
+   - No cross-account message, thread, draft, or send leakage.
+2. **Mailbox sync**
+   - Per account: full sync via `messages.list` paging to exhaustion, with a
+     persisted page cursor.
+   - Incremental sync via `users.history.list` from the stored `historyId`.
+   - When the stored `historyId` is too old or invalid (HTTP 404), a
+     recorded fallback to a bounded full re-sync.
+   - Restart/resume from the last committed cursor.
+   - Deduplication and idempotent replay of the same page or history data.
+   - Convergence of label, archive, trash, spam, and deletion state from
+     Gmail.
+3. **Thread correctness**
+   - Gmail `threadId` is authoritative for thread membership.
+   - `Message-ID`, `In-Reply-To` and `References` are persisted per
+     message.
+   - Reply, reply-all and forward drafts set `threadId`, `In-Reply-To`,
+     `References`, and the subject prefix correctly.
+   - Reply-all derives recipients from the parent's
+     From/Reply-To/To/Cc, removes the sending account's own addresses, and
+     deduplicates case-insensitively.
+   - `Bcc` is never exposed from received mail and never propagated.
+4. **MIME and content**
+   - text/plain and text/html (sanitized for display; raw HTML is never
+     rendered unsanitized).
+   - Declared charsets, with a recorded replacement on invalid bytes.
+   - multipart/alternative, multipart/mixed and multipart/related.
+   - Quoted-text and signature detection, used for display only; the stored
+     original body is unchanged.
+   - Attachments and inline (`Content-ID`) images, fetched on demand with
+     size limits.
+   - Common malformed Gmail messages (missing charset, bad part headers,
+     empty bodies) degrade without failing the sync.
+5. **Drafts and send**
+   - Create, edit, save and reload drafts, including reply, reply-all and
+     forward drafts and drafts with attachments.
+   - Drafts are persisted locally, bound to one account, and mirrored to
+     Gmail Drafts (`drafts.create` / `drafts.update`).
+   - Send happens only through an explicit operator action on a specific
+     draft version (a typed route with loopback/Origin protection and a
+     command-log entry). The planner, `/ask`, and LLM paths cannot send.
+   - Each send carries an idempotency key, so a retried send never sends
+     twice.
+   - Send results are reconciled from Gmail (message id, `threadId`, `SENT`
+     label via fetch/sync) before being shown as sent. A send is never
+     assumed.
+6. **Auth and reliability**
+   - OAuth scopes limited to `gmail.readonly` plus `gmail.compose`
+     (drafts and send). No `gmail.modify` and no full-mailbox scope unless a
+     later specification requires it.
+   - Per-account re-authorization; atomic token refresh and write.
+   - Expired, revoked (`invalid_grant`) and insufficient-scope credentials
+     are detected and shown per account, and never corrupt mailbox state.
+   - Gmail API errors are classified. Rate limits (429 and 403
+     `rateLimitExceeded`/`userRateLimitExceeded`) and 5xx responses get
+     bounded exponential backoff with a retry cap.
+   - One account's failure never blocks the other accounts.
+   - Safe restart at any point.
+7. **Observability**
+   - Per-account status: enabled, auth state, last successful sync, last
+     attempt, last error code, current sync mode and cursor/`historyId`,
+     counts, failed operations, pending/failed drafts and sends.
+   - An operator-visible recovery action per state (re-authorize, resume,
+     full re-sync, retry failed item).
+   - The command log records counts and identifiers, never bodies or
+     tokens.
+
+Out of scope:
+
+- autonomous email sending, or any automatic approval to send;
+- AI-generated or K1-contextual drafting (later separate phase);
+- autonomous follow-up actions;
+- Calendar integration (C0/C1);
+- scraping, browser automation, new external data collection;
+- advanced semantic email retrieval;
+- K1 redesign;
+- CRM redesign; contact-intelligence expansion unrelated to email
+  transport/state;
+- agent orchestration;
+- any cloud LLM dependency;
+- PostgreSQL Gmail persistence (SQLite stays the supported runtime; the
+  PostgreSQL runtime keeps failing closed);
+- UI redesign beyond what multi-account and health visibility require.
+
+Invariants:
+
+- `(account, external_message_id)` and `(account, external_thread_id)` are
+  unique. The same Gmail ids in two accounts are distinct records.
+- A sync cursor advances only after the data it covers is committed.
+- Replaying any committed page or history batch changes nothing.
+- Local sent state exists only after Gmail reconciliation.
+- A draft or send belongs to exactly one account and can only reference
+  that account's threads.
+- Tokens and message bodies never appear in logs, the command log, prompts,
+  or the repository.
+- Tests never contact Gmail and never read real credentials or mailboxes.
+
+Acceptance criteria:
+
+- A. Four accounts can be configured, authorized, enabled and disabled
+  independently.
+- B. Identical Gmail message/thread ids in different accounts cannot
+  collide in storage, queries, UI or tools.
+- C. A full sync followed by an incremental sync creates no duplicates.
+- D. A sync interrupted mid-page or mid-history resumes from the last
+  committed cursor without gaps or duplicates.
+- E. Re-running the same page or history data is idempotent.
+- F. Replies and forwards preserve the intended Gmail thread membership and
+  headers.
+- G. Reply-all produces the correct recipients, never includes the sending
+  account itself, and never duplicates an address.
+- H. Draft create/edit/reload survives a process restart.
+- I. Sending requires an explicit operator action on a specific draft
+  version; no other path can send.
+- J. A successful send is reconciled from Gmail (message id, thread,
+  `SENT`) rather than assumed; an ambiguous outcome is surfaced, not retried
+  blindly.
+- K. Attachments and common multipart MIME cases round-trip correctly
+  (receive, display, draft, send).
+- L. OAuth expiration or revocation is visible per account and does not
+  corrupt mailbox state.
+- M. One account's failure does not block sync of the others.
+- N. Automated tests prove account isolation, pagination invariants,
+  restart/resume, history replay idempotency, and send idempotency.
+- O. A controlled live Gmail certification procedure is documented and
+  executed only by the operator, outside automated tests.
+
+Test requirements:
+
+- A deterministic fake Gmail provider extending `FakeGmailProvider`, with
+  multiple accounts, paging, history records (including expired
+  `historyId`), label changes and deletions, drafts, send, injected errors
+  (401, 403 scope, `invalid_grant`, 404 history, 429, 5xx, timeouts), and
+  crash injection between fetch and commit.
+- MIME fixtures built in-test (plain, HTML-only, alternative, mixed with
+  attachments, related with inline images, non-UTF-8 charsets, malformed
+  parts).
+- Isolation tests run the same ids in two accounts through every route and
+  tool.
+- The existing G0, K0 and K1 suites stay green; temporary databases only;
+  the default `leads.db` is untouched; no network.
+
+Live certification (operator-run, not automated):
+
+1. Use disposable or test Gmail accounts first, then the four business
+   accounts.
+2. Authorize each account with the documented scopes.
+3. Run a full sync, then incremental sync after new mail arrives; check the
+   counts and that there are no duplicates.
+4. Kill the process mid-sync and restart; confirm resume.
+5. Revoke one account's token; confirm the others keep syncing and the
+   revoked account shows re-authorize.
+6. Create a reply draft, restart, reload, edit, then explicitly send to an
+   operator-controlled address.
+7. Confirm in Gmail and in local state that the message is in the correct
+   thread with correct headers and recipients, and that there is no
+   duplicate or cross-account state.
+8. Record dates, accounts (redacted), counts and results in a certification
+   note. No credentials, bodies or personal data are committed.
+
+Completion definition (end-to-end target):
+
+Mail arrives on one of four Gmail accounts
+→ incremental sync ingests it
+→ it is associated with the correct account, thread, person and company
+→ the message is readable
+→ the operator creates a reply draft
+→ the draft survives reload and restart
+→ the operator explicitly sends
+→ Gmail confirms the sent message in the correct thread
+→ local state re-syncs from Gmail
+→ no duplicate or cross-account state exists.
+
+G2 is complete only when criteria A–N pass in automated tests, gate G2-0 has
+been resolved, the policy documents above are updated, and the live
+certification (O) has been executed and recorded by the operator.
+
 ## Phase C0 — Google Calendar read-only context (future)
 
 - Separate Calendar OAuth scope and authorization.
