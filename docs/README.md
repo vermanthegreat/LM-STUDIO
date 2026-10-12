@@ -11,6 +11,7 @@ assistant.
 | `tool-contracts.md` | Allowed agent tools, risk classes, and result envelopes |
 | `safety-and-communication.md` | Approval, privacy, injection, failure, and response rules |
 | `implementation-roadmap.md` | Phase order, acceptance criteria, and stop conditions |
+| `community.md` | Community Intelligence: operator-provided captures, discovery, boundaries |
 | `agent-system-prompt.md` | ChatGPT/local-model runtime behavior prompt |
 | `first-patch-prompt.md` | Executable prompt for the immediate hardening patch |
 

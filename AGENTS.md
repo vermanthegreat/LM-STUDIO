@@ -33,6 +33,9 @@ roadmap phase.
   exists in the database.
 - Do not add generic web scraping, autonomous browsing, email sending, n8n, or
   SaaS multi-tenancy unless a later specification explicitly authorizes it.
+  The Community Intelligence workflow (`docs/community.md`) is authorized only for
+  operator-provided captures; automated Community fetching remains prohibited until
+  the authorization gate in that document is recorded.
 - Tests must never use or mutate the real `leads.db` or production PostgreSQL.
 
 ## Engineering workflow

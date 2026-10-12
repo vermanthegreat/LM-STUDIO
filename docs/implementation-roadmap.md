@@ -246,6 +246,27 @@ Acceptance:
 - The default test suite uses deterministic fake embeddings and needs no live
   service, network, model download, or real data.
 
+## Phase CI — Community Intelligence (SQLite, operator-provided captures)
+
+Authoritative detail: `community.md`. Milestones:
+
+- **M0** — specification and boundaries (this document set). Done.
+- **M1** — validate the Community parser against one genuine Shopify Community
+  topic capture saved by the operator. **BLOCKED until a genuine capture exists**;
+  the parser is tested on synthetic fixtures only. Correct only demonstrated
+  incompatibilities.
+- **M2** — incremental discovery from operator-provided listing/search captures:
+  topic discovery, new/known detection, provenance, checkpoints, duplicate
+  prevention, resumable work queue.
+- **M3+** (future, each needs its own specification): read-only search tools,
+  own-activity and reply tracking, LLM classification with provenance, daily run
+  command, reply drafts. **Automated fetching and any MCP exposure stay
+  prohibited** until the authorization gate in `community.md` is recorded.
+
+Acceptance (M2): discovery identifies new vs known topics; repeated identical
+captures write nothing; checkpoints and the work queue survive restarts; a failed
+run commits nothing; CRM, Gmail and knowledge behavior is unchanged.
+
 ## Phase G1 — temporal follow-up reasoning (future)
 
 - Resolve controlled date/time expressions using `APP_TIMEZONE`.

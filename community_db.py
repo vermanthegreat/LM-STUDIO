@@ -88,6 +88,57 @@ CREATE TABLE IF NOT EXISTS community_post_revisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_community_revisions_post ON community_post_revisions(post_row_id);
+
+CREATE TABLE IF NOT EXISTS community_discovery_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    forum_host TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    raw_payload TEXT NOT NULL,
+    topics_in_capture INTEGER NOT NULL DEFAULT 0,
+    new_topics INTEGER NOT NULL DEFAULT 0,
+    captured_at TEXT NOT NULL,
+    UNIQUE(forum_host, source_key, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS community_discovered_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    forum_host TEXT NOT NULL,
+    topic_id INTEGER NOT NULL,
+    slug TEXT,
+    title TEXT,
+    url TEXT NOT NULL,
+    category TEXT,
+    posts_count_seen INTEGER,
+    last_posted_at_seen TEXT,
+    first_run_id INTEGER NOT NULL REFERENCES community_discovery_runs(id),
+    last_run_id INTEGER NOT NULL REFERENCES community_discovery_runs(id),
+    times_seen INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(forum_host, topic_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_discovery_sightings (
+    run_id INTEGER NOT NULL REFERENCES community_discovery_runs(id),
+    discovered_topic_id INTEGER NOT NULL REFERENCES community_discovered_topics(id),
+    posts_count INTEGER,
+    last_posted_at TEXT,
+    classification TEXT NOT NULL,
+    PRIMARY KEY (run_id, discovered_topic_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_discovery_checkpoints (
+    forum_host TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    high_water_last_posted_at TEXT,
+    last_run_id INTEGER NOT NULL REFERENCES community_discovery_runs(id),
+    runs_count INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (forum_host, source_key)
+);
 """
 
 

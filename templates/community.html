@@ -52,6 +52,68 @@
     </div>
     {% endif %}
 
+    {% if discovery_result %}
+    <div class="card" id="discovery-result">
+      <h2>Discovery result</h2>
+      {% if discovery_result.duplicate_capture %}
+      <p class="msg">Identical capture already recorded; nothing was written.</p>
+      {% endif %}
+      <p>
+        {{ discovery_result.kind }} on <strong>{{ discovery_result.forum_host }}</strong> —
+        {{ discovery_result.topics_in_capture }} topics:
+        new {{ discovery_result.new_topics|length }},
+        awaiting ingest {{ discovery_result.pending_topics|length }},
+        already ingested {{ discovery_result.ingested_topics|length }},
+        update available {{ discovery_result.update_available_topics|length }}
+      </p>
+      <p>
+        Checkpoint: {{ discovery_result.high_water or '—' }}
+        (previous {{ discovery_result.previous_high_water or 'none' }}).
+        {% if discovery_result.reached_checkpoint %}This page reached previously seen topics; older pages are not needed.
+        {% elif discovery_result.previous_high_water %}No previously seen topic on this page; older pages may hold unseen topics.{% endif %}
+      </p>
+      {% for w in discovery_result.warnings %}<p class="msg">{{ w }}</p>{% endfor %}
+      {% for e in discovery_result.parse_errors %}<p class="msg">{{ e.code }}: {{ e.message }}</p>{% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <h2>Record a topic listing / search capture</h2>
+      <p><small>Paste Discourse listing JSON (<code>topic_list.topics</code>) or search JSON you saved yourself, with the page URL it came from. This only records which topics exist; ingest each topic below. Nothing is fetched from the web.</small></p>
+      <form method="post" action="/community/discover">
+        <p><label>Listing or search page URL (required)<br>
+          <input type="text" name="source_url" size="80" placeholder="https://community.example/latest"></label></p>
+        <p><label>Capture<br>
+          <textarea name="raw_text" rows="8" style="width:100%;" required></textarea></label></p>
+        <button type="submit">Record discovery</button>
+      </form>
+    </div>
+
+    <div class="card" id="community-queue">
+      <h2>Waiting to ingest ({{ queue|length }})</h2>
+      <table>
+        <thead><tr><th>Title</th><th>Topic</th><th>State</th><th>Posts seen</th><th>Last post</th></tr></thead>
+        <tbody>
+          {% for q in queue %}
+          <tr>
+            <td>{{ q.title or '(title unknown)' }}</td>
+            <td><a href="{{ q.url }}" rel="noopener noreferrer">{{ q.forum_host }} / {{ q.topic_id }}</a></td>
+            <td>{{ 'new' if q.state == 'new_topic' else 'update available (' ~ q.posts_stored ~ ' stored)' }}</td>
+            <td>{{ q.posts_count_seen if q.posts_count_seen is not none else '—' }}</td>
+            <td>{{ q.last_posted_at_seen or '—' }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5">Nothing waiting.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if checkpoints %}
+      <p><small>Checkpoints:
+        {% for c in checkpoints %}{{ c.source_key }} @ {{ c.high_water_last_posted_at or '—' }} ({{ c.runs_count }} runs){% if not loop.last %}; {% endif %}{% endfor %}
+      </small></p>
+      {% endif %}
+    </div>
+
     <div class="card">
       <h2>Import a capture</h2>
       <p><small>Paste a Discourse topic JSON or a rendered-text capture you saved yourself. Nothing is fetched from the web. Format: docs/community.md.</small></p>

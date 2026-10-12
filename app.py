@@ -51,6 +51,7 @@ from intake import validate_parse_intake
 from repositories.factory import get_contact_store
 from security import assert_safe_mutation_request
 from providers.gmail_normalize import html_to_text
+from services import community_discovery_service as community_discovery
 from services.community_ingest_service import ingest_capture, validate_ingest_request
 from services.gmail_sync_service import gmail_integration_status, sync_gmail_label
 
@@ -362,13 +363,65 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             community_db.ensure_community_tables(conn)
             return community_db.list_topics(conn)
 
+    def _community_discovery_context(request: Request) -> dict:
+        store = request.app.state.store
+        return {
+            "queue": community_discovery.work_queue(store),
+            "checkpoints": community_discovery.list_checkpoints(store),
+        }
+
     @application.get("/community", response_class=HTMLResponse)
     def community_page(request: Request):
         topics = _community_topics(_community_db_path(request))
         return templates.TemplateResponse(
             request,
             "community.html",
-            {"request": request, "topics": topics, "result": None, "form": {}, "message": None},
+            {
+                "request": request,
+                "topics": topics,
+                "result": None,
+                "form": {},
+                "message": None,
+                **_community_discovery_context(request),
+            },
+        )
+
+    @application.post("/community/discover", response_class=HTMLResponse)
+    def community_discover(
+        request: Request,
+        raw_text: str = Form(...),
+        source_url: str = Form(""),
+    ):
+        assert_safe_mutation_request(request, port=cfg.port)
+        db_path = _community_db_path(request)
+        text, url = community_discovery.validate_discovery_request(
+            raw_text=raw_text, source_url=source_url, max_chars=cfg.max_paste_chars
+        )
+        try:
+            result = community_discovery.record_discovery(
+                request.app.state.store, content=text, source_url=url
+            )
+        except AppError:
+            raise
+        except Exception:
+            logger.exception("community discovery failed")
+            raise ValidationError(
+                error_code="community_discovery_failed",
+                message="Failed to record discovery capture. No changes were committed.",
+                status_code=500,
+            ) from None
+        return templates.TemplateResponse(
+            request,
+            "community.html",
+            {
+                "request": request,
+                "topics": _community_topics(db_path),
+                "result": None,
+                "form": {},
+                "message": None,
+                "discovery_result": result,
+                **_community_discovery_context(request),
+            },
         )
 
     @application.post("/community/ingest", response_class=HTMLResponse)
@@ -402,6 +455,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "result": result,
                 "form": {"source_url": url},
                 "message": None,
+                **_community_discovery_context(request),
             },
         )
 

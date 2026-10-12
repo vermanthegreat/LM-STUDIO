@@ -8,3 +8,7 @@ operator capture is added and tested.
 - `synthetic_topic_v1.json` - Discourse-shaped topic JSON, 4 posts (topic 90001).
 - `synthetic_topic_v2.json` - same topic later: post #3 edited, post #5 added.
 - `synthetic_topic.txt` - rendered-text capture format (see docs/community.md).
+- `synthetic_listing_p1.json`, `synthetic_listing_p2.json` - two pages of one Discourse topic listing
+  (page 1 has a pinned topic and topic 90001, which matches the topic fixtures above).
+- `synthetic_listing_later.json` - the same listing at a later time (one new topic, one topic grown).
+- `synthetic_search.json` - Discourse search-result shape (`topics` + `posts`).

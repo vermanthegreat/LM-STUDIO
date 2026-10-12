@@ -57,7 +57,8 @@ in a later phase and must preserve source and verification state.
 
 ## Out of scope
 
-- Generic autonomous browsing or scraping.
+- Generic autonomous browsing or scraping. (Operator-provided Community captures are
+  in scope; see `community.md`. Automated Community fetching is not.)
 - Arbitrary SQL agents.
 - Email sending, inbox synchronization, or campaign automation.
 - Generic workflow engines such as n8n.

@@ -1,0 +1,32 @@
+{
+  "_fixture": "SYNTHETIC - hand-written; NOT a real Shopify Community capture",
+  "posts": [
+    {
+      "id": 1,
+      "topic_id": 90010
+    }
+  ],
+  "topics": [
+    {
+      "id": 90010,
+      "title": "SYNTHETIC topic 90010",
+      "slug": "synthetic-second",
+      "posts_count": 2,
+      "last_posted_at": "2025-01-30T10:00:00.000Z",
+      "category_id": 7,
+      "pinned": false
+    },
+    {
+      "id": 90030,
+      "title": "SYNTHETIC topic 90030",
+      "slug": "synthetic-search-hit",
+      "posts_count": 2,
+      "last_posted_at": "2025-01-15T10:00:00.000Z",
+      "category_id": 7,
+      "pinned": false
+    }
+  ],
+  "grouped_search_result": {
+    "term": "checkout"
+  }
+}

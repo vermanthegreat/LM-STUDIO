@@ -75,3 +75,56 @@ class IngestResult(BaseModel):
     incomplete_capture: bool = False
     capture_id: Optional[int] = None
     command_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------- discovery
+
+DiscoveryKind = Literal["listing", "search"]
+Sighting = Literal["new", "pending", "ingested", "update_available"]
+
+
+class DiscoveredTopic(BaseModel):
+    """One topic row as it appeared in an operator-provided listing/search capture."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    topic_id: int = Field(gt=0)
+    slug: Optional[str] = None
+    title: Optional[str] = None
+    category: Optional[str] = None
+    posts_count: Optional[int] = None
+    last_posted_at: Optional[str] = None  # UTC ISO-8601
+    pinned: bool = False
+    url: str
+
+
+class ParsedDiscovery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: DiscoveryKind
+    forum_host: str
+    source_key: str
+    topics: list[DiscoveredTopic] = Field(default_factory=list)
+    errors: list[PostError] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DiscoveryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: Optional[int] = None
+    kind: DiscoveryKind
+    forum_host: str
+    source_key: str
+    topics_in_capture: int = 0
+    new_topics: list[int] = Field(default_factory=list)
+    pending_topics: list[int] = Field(default_factory=list)
+    ingested_topics: list[int] = Field(default_factory=list)
+    update_available_topics: list[int] = Field(default_factory=list)
+    previous_high_water: Optional[str] = None
+    high_water: Optional[str] = None
+    reached_checkpoint: bool = False
+    duplicate_capture: bool = False
+    parse_errors: list[PostError] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    command_id: Optional[str] = None

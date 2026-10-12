@@ -1,10 +1,10 @@
-# Community conversation capture (Shopify Community / Discourse)
+# Community Intelligence (Shopify Community / Discourse)
 
 Operator-provided captures of Discourse topics are parsed deterministically and
 stored in SQLite. **Nothing is fetched from the network**, no LLM is involved,
 and no lead, person, interaction or task is created or linked.
 
-**Compatibility status:** implemented and tested only against SYNTHETIC fixtures
+**Compatibility status (M1 BLOCKED):** implemented and tested only against SYNTHETIC fixtures
 (`tests/fixtures/community/README.md`). Compatibility with live Shopify
 Community output is UNVERIFIED until a genuine capture is added and tested.
 
@@ -53,3 +53,63 @@ topic URL (Discourse convention). Author profile URLs are not stored (not in the
 `community_captures` (original payload + provenance), `community_topics`,
 `community_authors`, `community_posts`, `community_post_revisions`.
 Created idempotently by `db.init_db` (same pattern as Gmail/knowledge tables).
+
+## Community Intelligence workflow and boundaries (M0)
+
+Goal: help the operator keep track of Shopify Community conversations that matter
+to them, using only material the operator saved themselves.
+
+**In scope now:** parsing operator-provided topic captures (above) and
+operator-provided listing/search captures (below); local SQLite storage with
+provenance; a persistent work queue of topics to ingest.
+
+**Not authorized (prohibited by `AGENTS.md` and `product.md`):** any automated
+fetching of Community pages or APIs, browser automation or driving the operator's
+logged-in browser, scraping, posting or replying, MCP exposure, and LLM-driven
+navigation. Shopify's terms for automated access to the Community have **not**
+been verified. Automated discovery may be added only after a later specification
+records (a) the evidence that the access is permitted and (b) a fixed, typed
+fetcher design; the discovery data model below is source-agnostic so a future
+authorized fetcher can feed `record_discovery` unchanged.
+
+The workflow is operator-in-the-loop: the operator opens a listing/search/topic
+page, saves the JSON, and pastes it. Discovery never writes conversation content;
+topics are ingested one at a time by the existing ingest path.
+
+## Discovery (M2)
+
+Entry points: `/community` (form + "Waiting to ingest" queue) and
+`POST /community/discover` (`raw_text`, `source_url` = the listing/search page URL).
+
+Supported JSON shapes (Discourse API shapes; **live Shopify output unverified**):
+
+- listing: `topic_list.topics[]` (`/latest.json`, category listings)
+- search: top-level `topics[]` together with `posts[]` or `grouped_search_result`
+
+Read per topic: `id` (required), `slug`, `title`, `category_id`, `posts_count`,
+`last_posted_at`, `pinned`. Bad rows are reported, never repaired.
+
+Tables (created idempotently with the other Community tables):
+`community_discovery_runs` (original payload + provenance, unique per
+source/content hash), `community_discovered_topics` (unique `(forum_host,
+topic_id)`), `community_discovery_sightings` (per-run provenance and
+classification), `community_discovery_checkpoints` (per host + source key).
+
+Behavior:
+
+- Each sighting is classified `new`, `pending` (seen before, not ingested),
+  `ingested`, or `update_available` (stored post count < `posts_count` seen).
+  `posts_count` may include posts the capture never shows (hidden/whispers), so a
+  topic can stay `update_available`; the operator decides, nothing loops.
+- Source key = kind + path + sorted query, ignoring `page` and `.json`, so all pages
+  of one listing share one checkpoint.
+- Checkpoint = highest `last_posted_at` seen for the source. A capture reports
+  `reached_checkpoint` when a non-pinned topic is at or below the previous mark,
+  meaning older pages need not be pasted. Pinned topics are ignored for this.
+- Post counts and dates seen only move forward.
+- Identical capture (same source, same hash) is a no-op. One capture = one
+  transaction; failure commits nothing.
+- The work queue is derived from stored state, so it survives restarts and shrinks
+  as topics are ingested; there is no separate job state to corrupt.
+- Each recorded capture writes a counts-only command-log entry.
+- The ingest and discovery paths share the SQLite-only runtime restriction.

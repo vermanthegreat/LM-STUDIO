@@ -1,0 +1,34 @@
+{
+  "_fixture": "SYNTHETIC - hand-written; NOT a real Shopify Community capture",
+  "topic_list": {
+    "topics": [
+      {
+        "id": 90020,
+        "title": "SYNTHETIC topic 90020",
+        "slug": "synthetic-newer",
+        "posts_count": 1,
+        "last_posted_at": "2025-03-01T10:00:00.000Z",
+        "category_id": 7,
+        "pinned": false
+      },
+      {
+        "id": 90010,
+        "title": "SYNTHETIC topic 90010",
+        "slug": "synthetic-second",
+        "posts_count": 6,
+        "last_posted_at": "2025-02-20T10:00:00.000Z",
+        "category_id": 7,
+        "pinned": false
+      },
+      {
+        "id": 90011,
+        "title": "SYNTHETIC topic 90011",
+        "slug": "synthetic-third",
+        "posts_count": 1,
+        "last_posted_at": "2025-01-28T10:00:00.000Z",
+        "category_id": 7,
+        "pinned": false
+      }
+    ]
+  }
+}
