@@ -51,6 +51,20 @@ When it is unset, or the model fails, the original is stored with
 `vision_status = unavailable|failed` and no text. No OCR or description is
 ever fabricated. Rendering scanned PDF pages for vision is not implemented.
 
+### Reanalyzing stored images
+
+Image items with `vision_status != ok` show a **Reanalyze** button on
+`/knowledge/items/{id}`; the same action is `POST /knowledge/items/{id}/reanalyze`
+(same-origin only, one item per call, never bulk). It reads the stored original
+(verifying its SHA-256), runs the configured vision provider, classifies the
+extracted text, and in one transaction updates text, description, vision
+model/status, classification, topics/entities and the FTS row. Item id,
+SHA-256, original file, `captured_at` and an operator-set project are
+preserved. If vision fails nothing is written (`502`, `status: failed`);
+repeating the call after success is a no-op (`status: unchanged`,
+`already_analyzed`). Each attempt writes one `knowledge_reanalyze` command-log
+entry. Non-images: `409 reanalysis_not_supported`.
+
 ## Storage
 
 - Originals: `KNOWLEDGE_STORAGE_DIR` (default `./knowledge_store`, gitignored),

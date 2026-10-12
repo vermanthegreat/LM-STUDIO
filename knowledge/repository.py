@@ -186,6 +186,32 @@ def insert_item(conn: sqlite3.Connection, values: dict[str, Any]) -> int:
     return int(cursor.lastrowid)
 
 
+def apply_reanalysis(conn: sqlite3.Connection, item_id: int, values: dict[str, Any]) -> bool:
+    """Update analysis columns of an existing image item that is not yet vision-analyzed.
+
+    Identity columns (id, content_hash, source_path, captured_at, created_at) are
+    never written. The ``vision_status != 'ok'`` guard makes concurrent or repeated
+    reanalysis a no-op (returns False) instead of overwriting a finished result.
+    """
+    allowed = {
+        "raw_text", "normalized_text", "vision_status", "vision_model", "visual_description",
+        "summary", "project", "project_source", "category", "sub_category", "event_date",
+        "event_date_source", "importance", "classification_status", "classification_model",
+        "classification_warning", "metadata_json",
+    }
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError(f"unsupported reanalysis columns: {sorted(unknown)}")
+    record = {**values, "metadata_json": _json_dumps(values.get("metadata_json")), "updated_at": _now()}
+    assignments = ", ".join(f"{c} = ?" for c in record)
+    cursor = conn.execute(
+        f"UPDATE knowledge_items SET {assignments} "
+        "WHERE id = ? AND content_kind = 'image' AND vision_status != 'ok'",
+        [*record.values(), item_id],
+    )
+    return cursor.rowcount == 1
+
+
 def _upsert_topic(conn: sqlite3.Connection, name: str) -> int:
     norm = normalize_label(name)
     conn.execute(
@@ -374,6 +400,7 @@ def to_public_item(conn: sqlite3.Connection, row: dict[str, Any], *, include_tex
         "extraction_status": row["extraction_status"],
         "extraction_method": row["extraction_method"],
         "vision_status": row["vision_status"],
+        "vision_model": row["vision_model"],
         "classification_status": row["classification_status"],
         "classification_model": row["classification_model"],
         "classification_warning": row["classification_warning"],

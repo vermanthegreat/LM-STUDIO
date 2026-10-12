@@ -56,6 +56,34 @@ def require_knowledge_sqlite_runtime(store: Any) -> Path:
 
 
 @dataclass
+class ReanalysisResult:
+    item_id: int
+    status: str  # reanalyzed | unchanged | failed | error
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    command_id: Optional[str] = None
+    vision_status: Optional[VisionStatus] = None
+    classification_status: Optional[ClassificationStatus] = None
+    warnings: list[str] = field(default_factory=list)
+    preview: Optional[dict[str, Any]] = None
+    embedding: Optional[dict[str, Any]] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "item_id": self.item_id,
+            "status": self.status,
+            "error_code": self.error_code,
+            "message": self.message,
+            "command_id": self.command_id,
+            "vision_status": self.vision_status.value if self.vision_status else None,
+            "classification_status": self.classification_status.value if self.classification_status else None,
+            "warnings": self.warnings,
+            "preview": self.preview,
+            "embedding": self.embedding,
+        }
+
+
+@dataclass
 class UploadedFile:
     filename: str
     data: bytes
@@ -313,6 +341,153 @@ class KnowledgeIngestor:
             warnings=warnings,
             preview=_preview(item, normalized),
         )
+
+    # --------------------------------------------------------------- reanalyze
+
+    def reanalyze_item(self, item_id: int) -> ReanalysisResult:
+        """Re-run vision + classification for a stored image that lacks vision output.
+
+        Model calls happen before the transaction. Nothing is written unless vision
+        succeeds, so a failed attempt leaves the item exactly as it was. Identity
+        (id, SHA-256, original file, captured_at) is never modified.
+        """
+        from services.command_log import CommandStatus, transition
+        from repositories.command_log_store import SqliteCommandLogStore
+
+        with db.get_conn(self.database_path) as conn:
+            row = conn.execute("SELECT * FROM knowledge_items WHERE id = ?", (item_id,)).fetchone()
+        if row is None:
+            return ReanalysisResult(item_id=item_id, status="error", error_code="knowledge_item_not_found",
+                                    message=f"Knowledge item {item_id} was not found.")
+        item = dict(row)
+        if item["content_kind"] != ContentKind.IMAGE.value:
+            return ReanalysisResult(item_id=item_id, status="error", error_code="reanalysis_not_supported",
+                                    message="Only image items can be reanalyzed.")
+        if item["vision_status"] == VisionStatus.OK.value:
+            return ReanalysisResult(item_id=item_id, status="unchanged", error_code="already_analyzed",
+                                    message="This image already has vision results; nothing was changed.",
+                                    vision_status=VisionStatus.OK)
+
+        try:
+            path = self.file_store.resolve(item["source_path"])
+            data = path.read_bytes() if path.is_file() else None
+        except (ValueError, OSError):
+            data = None
+        if data is None:
+            return ReanalysisResult(item_id=item_id, status="error", error_code="knowledge_original_missing",
+                                    message="The stored original file is missing; nothing was changed.")
+        if sha256_hex(data) != item["content_hash"]:
+            return ReanalysisResult(item_id=item_id, status="error", error_code="knowledge_original_hash_mismatch",
+                                    message="The stored original does not match its SHA-256; nothing was changed.")
+
+        command_log = self.command_log_store or SqliteCommandLogStore(self.database_path)
+        entry = command_log.create(f"Knowledge reanalyze item {item_id}")
+        entry.intent = "knowledge_reanalyze"
+        entry.tool_name = "knowledge_reanalyze"
+        entry.risk_class = "write"
+        entry.tool_arguments = {"item_id": item_id}
+        transition(entry, CommandStatus.PLANNED)
+        command_log.update(entry)
+        transition(entry, CommandStatus.EXECUTING)
+        command_log.update(entry)
+
+        def finish(result: ReanalysisResult, ok: bool) -> ReanalysisResult:
+            result.command_id = str(entry.id)
+            transition(entry, CommandStatus.SUCCEEDED if ok else CommandStatus.FAILED)
+            entry.result_summary = {
+                "item_id": item_id,
+                "status": result.status,
+                "vision_status": result.vision_status.value if result.vision_status else None,
+            }
+            if not ok:
+                entry.error_code = result.error_code
+                entry.error_message = result.message
+            command_log.update(entry)
+            return result
+
+        try:
+            outcome = self.vision.describe_image(data, item["mime_type"])
+        except Exception:
+            logger.exception("knowledge reanalysis vision call raised")
+            return finish(ReanalysisResult(
+                item_id=item_id, status="failed", error_code="vision_request_failed",
+                message="Vision analysis failed; existing data was preserved.",
+                vision_status=VisionStatus.FAILED), False)
+        if outcome.status != VisionStatus.OK or outcome.result is None:
+            return finish(ReanalysisResult(
+                item_id=item_id, status="failed",
+                error_code=outcome.warning or f"vision_{outcome.status.value}",
+                message="Vision analysis did not produce a result; existing data was preserved.",
+                vision_status=outcome.status, warnings=[outcome.warning] if outcome.warning else []), False)
+
+        warnings: list[str] = []
+        normalized = normalize_text(vision_result_to_text(outcome.result))
+        if not self.classify:
+            classification = ClassificationOutcome(status=ClassificationStatus.DISABLED)
+        else:
+            classification = classify_text(
+                normalized, filename=item["original_filename"], chat_fn=self.chat_fn, model_name=self.model_name
+            )
+        if classification.warning:
+            warnings.append(classification.warning)
+        cls = classification.classification
+
+        metadata = repo._json_loads(item.get("metadata_json"), {}) or {}
+        metadata["image_type"] = outcome.result.image_type
+        metadata["reanalyzed_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["reanalysis_command_id"] = str(entry.id)
+        metadata["warnings"] = [
+            w for w in metadata.get("warnings", []) if w != "vision_model_not_configured"
+        ] + warnings
+
+        # Keep an operator-chosen project; only fill an empty one from the model.
+        project_value, project_source = item["project"], item["project_source"]
+        if not project_value and cls and cls.project:
+            project_value, project_source = cls.project, "llm"
+
+        values = {
+            "raw_text": outcome.result.visible_text or None,
+            "normalized_text": normalized or None,
+            "vision_status": VisionStatus.OK.value,
+            "vision_model": outcome.model,
+            "visual_description": outcome.result.description or None,
+            "summary": cls.summary if cls else None,
+            "project": project_value,
+            "project_source": project_source,
+            "category": cls.category if cls else None,
+            "sub_category": cls.sub_category if cls else None,
+            "event_date": cls.event_date.isoformat() if cls and cls.event_date else None,
+            "event_date_source": "llm_inferred" if cls and cls.event_date else None,
+            "importance": cls.importance if cls else None,
+            "classification_status": classification.status.value,
+            "classification_model": classification.model,
+            "classification_warning": classification.warning,
+            "metadata_json": metadata,
+        }
+        try:
+            with db.get_conn(self.database_path) as conn:
+                applied = repo.apply_reanalysis(conn, item_id, values)
+                if applied and cls is not None:
+                    repo.attach_classification(conn, item_id, cls)
+                if applied:
+                    repo.refresh_fts(conn, item_id)
+                public = repo.get_item(conn, item_id, include_text=False) if applied else None
+        except Exception:
+            logger.exception("knowledge reanalysis write failed")
+            return finish(ReanalysisResult(
+                item_id=item_id, status="failed", error_code="reanalysis_write_failed",
+                message="Could not save reanalysis results; existing data was preserved."), False)
+        if not applied:
+            return finish(ReanalysisResult(
+                item_id=item_id, status="unchanged", error_code="already_analyzed",
+                message="Another request already analyzed this image; nothing was changed.",
+                vision_status=VisionStatus.OK), True)
+
+        embedding = self._embed_new_item(item_id, warnings)
+        return finish(ReanalysisResult(
+            item_id=item_id, status="reanalyzed", vision_status=VisionStatus.OK,
+            classification_status=classification.status, warnings=warnings,
+            preview=_preview(public, normalized), embedding=embedding), True)
 
     def _embed_new_item(self, item_id: int, warnings: list[str]) -> Optional[dict[str, Any]]:
         runtime = self.embeddings

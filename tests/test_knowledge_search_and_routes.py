@@ -385,3 +385,31 @@ def test_ask_json_route_knowledge(client):
     body = response.json()
     assert body["intent"] == "knowledge_search"
     assert "[K1] notes.md" in body["answer"]
+
+
+def test_reanalyze_route_and_ui(client, monkeypatch):
+    from knowledge.schemas import VisionResult, VisionStatus
+    from knowledge.vision import VisionOutcome
+
+    class Fake:
+        def describe_image(self, data, mime_type):
+            return VisionOutcome(
+                status=VisionStatus.OK,
+                model="qwen/qwen3.5-9b",
+                result=VisionResult(visible_text="Reanalyzed zebra text", description="d", image_type="text_screenshot"),
+            )
+
+    _upload(client, ("shot.png", PNG_1X1, "image/png"))
+    page = client.get("/knowledge/items/1")
+    assert 'id="reanalyze-btn"' in page.text
+    assert client.post("/knowledge/items/1/reanalyze", headers={"Origin": "https://evil.example"}).status_code == 403
+
+    monkeypatch.setattr("knowledge.vision.build_vision_provider", lambda **_k: Fake())
+    response = client.post("/knowledge/items/1/reanalyze")
+    assert response.status_code == 200 and response.json()["status"] == "reanalyzed"
+    item = client.get("/api/knowledge/items/1").json()
+    assert item["vision_status"] == "ok" and "zebra" in item["normalized_text"]
+    assert 'id="reanalyze-btn"' not in client.get("/knowledge/items/1").text
+    assert client.get("/api/knowledge/search?q=zebra").json()["hits"][0]["id"] == 1
+    assert client.post("/knowledge/items/1/reanalyze").json()["status"] == "unchanged"
+    assert client.post("/knowledge/items/99/reanalyze").status_code == 404

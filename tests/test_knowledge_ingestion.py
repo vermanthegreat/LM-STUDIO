@@ -527,3 +527,126 @@ def test_person_entity_links_only_on_unique_exact_match(tmp_path):
     with db.get_conn(ingestor.database_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM people").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0] == 1
+
+
+# ------------------------------------------------------------------ reanalysis
+
+
+def _vision_ok(text="Quarterly OAuth rollout plan for CommerceGov"):
+    return _FakeVision(
+        VisionOutcome(
+            status=VisionStatus.OK,
+            model="qwen/qwen3.5-9b",
+            result=VisionResult(visible_text=text, description="Screenshot of a plan.", image_type="text_screenshot"),
+        )
+    )
+
+
+def _raw_row(ingestor, item_id):
+    with db.get_conn(ingestor.database_path) as conn:
+        return dict(conn.execute("SELECT * FROM knowledge_items WHERE id = ?", (item_id,)).fetchone())
+
+
+def _needs_vision_item(tmp_path, **overrides):
+    ingestor = make_ingestor(tmp_path)
+    result = ingestor.ingest_batch([UploadedFile("shot.png", PNG_1X1)]).results[0]
+    assert _item(ingestor, result.item_id)["status"] == "needs_vision"
+    ingestor.vision = overrides.pop("vision", _vision_ok())
+    for key, value in overrides.items():
+        setattr(ingestor, key, value)
+    return ingestor, result.item_id
+
+
+def test_reanalyze_needs_vision_image_end_to_end(tmp_path):
+    chat = scripted_chat(
+        lambda _u: classification_json(
+            summary="OAuth rollout plan.",
+            topics=["OAuth"],
+            entities=[{"name": "CommerceGov", "type": "organization"}],
+        )
+    )
+    ingestor, item_id = _needs_vision_item(tmp_path, chat_fn=chat)
+    before = _raw_row(ingestor, item_id)
+    seen = []
+    real = ingestor.vision
+    ingestor.vision = type("V", (), {"describe_image": lambda self, d, m: (seen.append((d, m)), real.describe_image(d, m))[1]})()
+
+    result = ingestor.reanalyze_item(item_id)
+
+    assert result.status == "reanalyzed" and result.command_id
+    assert seen == [(PNG_1X1, "image/png")]  # vision received the stored original
+    after = _raw_row(ingestor, item_id)
+    for column in ("id", "content_hash", "source_path", "captured_at", "created_at", "original_filename"):
+        assert after[column] == before[column]
+    assert (ingestor.file_store.resolve(after["source_path"])).read_bytes() == PNG_1X1
+    assert after["vision_status"] == "ok" and after["vision_model"] == "qwen/qwen3.5-9b"
+    assert after["normalized_text"].startswith("Quarterly OAuth rollout plan")
+    assert after["visual_description"] == "Screenshot of a plan."
+    assert after["classification_status"] == "ok" and after["summary"] == "OAuth rollout plan."
+    assert chat.calls and "Quarterly OAuth rollout plan" in chat.calls[0]
+    item = _item(ingestor, item_id)
+    assert item["status"] == "ready" and item["topics"] == ["OAuth"]
+    assert [e["name"] for e in item["entities"]] == ["CommerceGov"]
+    with db.get_conn(ingestor.database_path) as conn:
+        hits = repo.search_items(conn, query="rollout CommerceGov", filters=repo.KnowledgeSearchFilters(), limit=5)
+        assert conn.execute("SELECT COUNT(*) FROM knowledge_items").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM knowledge_fts").fetchone()[0] == 1
+    assert [h["id"] for h in hits["hits"]] == [item_id]
+
+
+def test_reanalyze_is_retry_safe(tmp_path):
+    ingestor, item_id = _needs_vision_item(tmp_path)
+    assert ingestor.reanalyze_item(item_id).status == "reanalyzed"
+    first = _raw_row(ingestor, item_id)
+    ingestor.vision = _FakeVision(VisionOutcome(status=VisionStatus.FAILED, warning="vision_request_failed"))
+    again = ingestor.reanalyze_item(item_id)
+    assert again.status == "unchanged" and again.error_code == "already_analyzed"
+    assert _raw_row(ingestor, item_id) == first
+
+
+def test_failed_reanalysis_preserves_existing_data(tmp_path):
+    ingestor, item_id = _needs_vision_item(
+        tmp_path, vision=_FakeVision(VisionOutcome(status=VisionStatus.FAILED, warning="vision_invalid_output"))
+    )
+    before = _raw_row(ingestor, item_id)
+    result = ingestor.reanalyze_item(item_id)
+    assert result.status == "failed" and result.error_code == "vision_invalid_output"
+    assert _raw_row(ingestor, item_id) == before
+
+    class Boom:
+        def describe_image(self, data, mime_type):
+            raise RuntimeError("down")
+
+    ingestor.vision = Boom()
+    assert ingestor.reanalyze_item(item_id).status == "failed"
+    assert _raw_row(ingestor, item_id) == before
+
+
+def test_reanalysis_classification_failure_still_keeps_vision_text(tmp_path):
+    ingestor, item_id = _needs_vision_item(tmp_path, chat_fn=scripted_chat(lambda _u: None))
+    result = ingestor.reanalyze_item(item_id)
+    assert result.status == "reanalyzed"
+    row = _raw_row(ingestor, item_id)
+    assert row["vision_status"] == "ok" and row["normalized_text"]
+    assert row["classification_status"] == ClassificationStatus.UNAVAILABLE.value
+
+
+def test_reanalyze_rejects_missing_unsupported_and_missing_original(tmp_path):
+    ingestor, item_id = _needs_vision_item(tmp_path)
+    assert ingestor.reanalyze_item(999).error_code == "knowledge_item_not_found"
+    text_id = ingestor.ingest_batch([UploadedFile("n.txt", b"hello")]).results[0].item_id
+    assert ingestor.reanalyze_item(text_id).error_code == "reanalysis_not_supported"
+    before = _raw_row(ingestor, item_id)
+    ingestor.file_store.resolve(before["source_path"]).unlink()
+    assert ingestor.reanalyze_item(item_id).error_code == "knowledge_original_missing"
+    assert _raw_row(ingestor, item_id) == before
+
+
+def test_reanalysis_keeps_operator_project(tmp_path):
+    ingestor = make_ingestor(tmp_path)
+    item_id = ingestor.ingest_batch([UploadedFile("shot.png", PNG_1X1)], project="Operator").results[0].item_id
+    ingestor.vision = _vision_ok()
+    ingestor.chat_fn = scripted_chat(lambda _u: classification_json(project="ModelGuess"))
+    ingestor.reanalyze_item(item_id)
+    row = _raw_row(ingestor, item_id)
+    assert (row["project"], row["project_source"]) == ("Operator", "operator")

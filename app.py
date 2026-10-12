@@ -502,6 +502,22 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             {"request": request, "item": item, "related": related},
         )
 
+    @application.post("/knowledge/items/{item_id}/reanalyze")
+    async def knowledge_item_reanalyze(request: Request, item_id: int):
+        assert_safe_mutation_request(request, port=cfg.port)
+        _knowledge_db_path(request)
+        ingestor = build_ingestor(request.app.state.store, cfg)
+        result = await run_in_threadpool(ingestor.reanalyze_item, item_id)
+        status_code = {
+            "reanalyzed": 200,
+            "unchanged": 200,
+            "failed": 502,
+            "error": 404 if result.error_code == "knowledge_item_not_found" else 409,
+        }[result.status]
+        if result.error_code == "knowledge_original_hash_mismatch":
+            status_code = 500
+        return JSONResponse(status_code=status_code, content=result.to_dict())
+
     @application.get("/knowledge/items/{item_id}/original")
     def knowledge_item_original(request: Request, item_id: int):
         db_path = _knowledge_db_path(request)

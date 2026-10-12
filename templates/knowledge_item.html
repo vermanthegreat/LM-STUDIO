@@ -29,7 +29,11 @@
         <tr><th>Category</th><td>{{ item.category or "—" }}{% if item.sub_category %} / {{ item.sub_category }}{% endif %}</td></tr>
         <tr><th>Importance</th><td>{{ item.importance if item.importance is not none else "—" }}</td></tr>
         <tr><th>Extraction</th><td>{{ item.extraction_status }} ({{ item.extraction_method }})</td></tr>
-        <tr><th>Vision</th><td>{{ item.vision_status }}</td></tr>
+        <tr><th>Vision</th><td>{{ item.vision_status }}{% if item.vision_model %} — {{ item.vision_model }}{% endif %}
+          {% if item.content_kind == 'image' and item.vision_status != 'ok' %}
+          <button type="button" id="reanalyze-btn" data-item="{{ item.id }}">Reanalyze</button>
+          <span id="reanalyze-msg" class="muted" role="status"></span>
+          {% endif %}</td></tr>
         <tr><th>Classification</th><td>{{ item.classification_status }}{% if item.classification_model %} — {{ item.classification_model }}{% endif %}{% if item.classification_warning %} <span class="badge warn">{{ item.classification_warning }}</span>{% endif %}</td></tr>
         <tr><th>Ingest command</th><td><code>{{ item.ingest_command_id or "—" }}</code></td></tr>
       </table>
@@ -88,5 +92,25 @@
     </div>
     {% endif %}
   </main>
+  {% if item.content_kind == 'image' and item.vision_status != 'ok' %}
+  <script>
+    (function () {
+      var btn = document.getElementById("reanalyze-btn");
+      var msg = document.getElementById("reanalyze-msg");
+      btn.addEventListener("click", function () {
+        btn.disabled = true;
+        msg.textContent = "Analyzing…";
+        fetch("/knowledge/items/" + btn.dataset.item + "/reanalyze", { method: "POST" })
+          .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+          .then(function (res) {
+            if (res.ok) { window.location.reload(); return; }
+            msg.textContent = (res.body.error_code || "error") + ": " + (res.body.message || "Reanalysis failed.");
+            btn.disabled = false;
+          })
+          .catch(function () { msg.textContent = "Request failed."; btn.disabled = false; });
+      });
+    })();
+  </script>
+  {% endif %}
 </body>
 </html>
