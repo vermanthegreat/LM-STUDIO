@@ -79,7 +79,7 @@ class IngestResult(BaseModel):
 
 # ---------------------------------------------------------------- discovery
 
-DiscoveryKind = Literal["listing", "search"]
+DiscoveryKind = Literal["listing", "search", "user_summary"]
 Sighting = Literal["new", "pending", "ingested", "update_available"]
 
 
@@ -98,12 +98,26 @@ class DiscoveredTopic(BaseModel):
     url: str
 
 
+class UserReplyRef(BaseModel):
+    """A post the summarised user wrote, as referenced by ``user_summary.replies``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    topic_id: int = Field(gt=0)
+    post_number: int = Field(gt=0)
+    created_at: Optional[str] = None
+    like_count: Optional[int] = None
+
+
 class ParsedDiscovery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: DiscoveryKind
     forum_host: str
     source_key: str
+    username: Optional[str] = None  # user_summary only
+    replies: list[UserReplyRef] = Field(default_factory=list)
+    stats: dict[str, int] = Field(default_factory=dict)
     topics: list[DiscoveredTopic] = Field(default_factory=list)
     errors: list[PostError] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -116,6 +130,9 @@ class DiscoveryResult(BaseModel):
     kind: DiscoveryKind
     forum_host: str
     source_key: str
+    username: Optional[str] = None
+    replies_in_capture: int = 0
+    new_replies: int = 0
     topics_in_capture: int = 0
     new_topics: list[int] = Field(default_factory=list)
     pending_topics: list[int] = Field(default_factory=list)

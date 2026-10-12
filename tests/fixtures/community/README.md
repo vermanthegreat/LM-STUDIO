@@ -12,3 +12,6 @@ operator capture is added and tested.
   (page 1 has a pinned topic and topic 90001, which matches the topic fixtures above).
 - `synthetic_listing_later.json` - the same listing at a later time (one new topic, one topic grown).
 - `synthetic_search.json` - Discourse search-result shape (`topics` + `posts`).
+- `synthetic_user_summary.json` - hand-written from the documented Discourse `user_summary`
+  shape (13 topics, 4 reply references). **Not** the operator's real CommerceGov summary,
+  which was not available when this was implemented; real-summary validation is PENDING.

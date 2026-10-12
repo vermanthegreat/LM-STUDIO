@@ -139,6 +139,28 @@ CREATE TABLE IF NOT EXISTS community_discovery_checkpoints (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (forum_host, source_key)
 );
+
+CREATE TABLE IF NOT EXISTS community_user_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    forum_host TEXT NOT NULL,
+    username_norm TEXT NOT NULL,
+    topic_id INTEGER NOT NULL,
+    post_number INTEGER NOT NULL,
+    created_at_src TEXT,
+    like_count INTEGER,
+    first_run_id INTEGER NOT NULL REFERENCES community_discovery_runs(id),
+    UNIQUE(forum_host, username_norm, topic_id, post_number)
+);
+
+CREATE TABLE IF NOT EXISTS community_user_activity (
+    forum_host TEXT NOT NULL,
+    username_norm TEXT NOT NULL,
+    username TEXT NOT NULL,
+    stats_json TEXT NOT NULL,
+    last_run_id INTEGER NOT NULL REFERENCES community_discovery_runs(id),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (forum_host, username_norm)
+);
 """
 
 

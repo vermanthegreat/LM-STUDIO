@@ -12,6 +12,7 @@ interrupted session resumes by simply reading the queue again.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from typing import Any, Optional
 
@@ -62,6 +63,8 @@ def record_discovery(
         kind=parsed.kind,
         forum_host=parsed.forum_host,
         source_key=parsed.source_key,
+        username=parsed.username,
+        replies_in_capture=len(parsed.replies),
         topics_in_capture=len(parsed.topics),
         parse_errors=list(parsed.errors),
         warnings=list(parsed.warnings),
@@ -139,6 +142,9 @@ def record_discovery(
                 "update_available": result.update_available_topics,
             }[kind].append(t.topic_id)
 
+        if parsed.kind == "user_summary":
+            _persist_user_summary(conn, parsed, run_id, now, result)
+
         dates = [t.last_posted_at for t in parsed.topics if t.last_posted_at]
         high = max(dates + ([result.previous_high_water] if result.previous_high_water else []), default=None)
         prev = result.previous_high_water
@@ -167,8 +173,35 @@ def record_discovery(
     return result
 
 
-def work_queue(store: Any, *, limit: int = 200) -> list[dict]:
-    """Discovered topics still needing ingestion, newest activity first."""
+def _persist_user_summary(conn: Any, parsed: Any, run_id: int, now: str, result: DiscoveryResult) -> None:
+    norm = parsed.username.strip().lower()
+    for r in parsed.replies:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO community_user_replies
+               (forum_host, username_norm, topic_id, post_number, created_at_src, like_count, first_run_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (parsed.forum_host, norm, r.topic_id, r.post_number, r.created_at, r.like_count, run_id),
+        )
+        result.new_replies += cur.rowcount
+    conn.execute(
+        """INSERT INTO community_user_activity
+           (forum_host, username_norm, username, stats_json, last_run_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(forum_host, username_norm) DO UPDATE SET
+               username = excluded.username, stats_json = excluded.stats_json,
+               last_run_id = excluded.last_run_id, updated_at = excluded.updated_at""",
+        (parsed.forum_host, norm, parsed.username, json.dumps(parsed.stats, sort_keys=True), run_id, now),
+    )
+
+
+def topic_statuses(store: Any) -> list[dict]:
+    """Every discovered topic with a deterministic coverage status.
+
+    ``pending``: nothing ingested yet. ``partial``: ingested, but fewer posts are
+    stored than the listing/summary reports, or a referenced reply post is not
+    stored. ``complete``: no known gap. ``coverage_unknown``: ingested and no gap
+    is *known*, but the source gave no post count (absence is not proof).
+    """
     db_path = community_db.require_community_sqlite_runtime(store)
     with db.get_conn(db_path) as conn:
         community_db.ensure_community_tables(conn)
@@ -177,16 +210,42 @@ def work_queue(store: Any, *, limit: int = 200) -> list[dict]:
                 FROM community_discovered_topics d
                 LEFT JOIN community_topics ct
                   ON ct.forum_host = d.forum_host AND ct.topic_id = d.topic_id
-                WHERE ct.id IS NULL
-                   OR (d.posts_count_seen IS NOT NULL AND {_STORED} < d.posts_count_seen)
-                ORDER BY d.last_posted_at_seen IS NULL, d.last_posted_at_seen DESC, d.id
-                LIMIT ?""",
-            (limit,),
+                ORDER BY d.last_posted_at_seen IS NULL, d.last_posted_at_seen DESC, d.id"""
         ).fetchall()
-    return [
-        {**dict(r), "state": "new_topic" if r["topic_row_id"] is None else "update_available"}
-        for r in rows
-    ]
+        out = []
+        for r in rows:
+            item = dict(r)
+            refs = [x["post_number"] for x in conn.execute(
+                "SELECT DISTINCT post_number FROM community_user_replies WHERE forum_host = ? AND topic_id = ? "
+                "ORDER BY post_number", (r["forum_host"], r["topic_id"])).fetchall()]
+            stored_numbers = set()
+            if r["topic_row_id"] is not None:
+                stored_numbers = {x[0] for x in conn.execute(
+                    "SELECT post_number FROM community_posts WHERE topic_row_id = ?", (r["topic_row_id"],))}
+            item["referenced_reply_posts"] = refs
+            item["missing_reply_posts"] = [n for n in refs if n not in stored_numbers]
+            seen = r["posts_count_seen"]
+            if r["topic_row_id"] is None:
+                item["status"] = "pending"
+            elif item["missing_reply_posts"] or (seen is not None and r["posts_stored"] < seen):
+                item["status"] = "partial"
+            elif seen is None:
+                item["status"] = "coverage_unknown"
+            else:
+                item["status"] = "complete"
+            out.append(item)
+    return out
+
+
+def work_queue(store: Any, *, limit: int = 200) -> list[dict]:
+    """Topics still needing ingestion (``pending`` or ``partial``), deterministic order."""
+    return [t for t in topic_statuses(store) if t["status"] in ("pending", "partial")][:limit]
+
+
+def next_topic(store: Any) -> Optional[dict]:
+    """The single next item the operator should capture, or ``None`` when done."""
+    queue = work_queue(store, limit=1)
+    return queue[0] if queue else None
 
 
 def list_checkpoints(store: Any) -> list[dict]:
@@ -240,6 +299,8 @@ def _log_command(store: Any, command_log_store: Any, result: DiscoveryResult) ->
             "topics_in_capture": result.topics_in_capture,
             "new_topics": len(result.new_topics),
             "update_available": len(result.update_available_topics),
+            "replies_in_capture": result.replies_in_capture,
+            "new_replies": result.new_replies,
             "parse_errors": len(result.parse_errors),
         }
         log.update(entry)

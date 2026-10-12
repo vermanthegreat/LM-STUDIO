@@ -113,3 +113,35 @@ Behavior:
   as topics are ingested; there is no separate job state to corrupt.
 - Each recorded capture writes a counts-only command-log entry.
 - The ingest and discovery paths share the SQLite-only runtime restriction.
+
+## User summary ingestion and topic status
+
+`POST /community/discover` also accepts a Discourse **user summary**
+(`/u/<username>/summary.json`, top-level `user_summary`). The source URL must be the
+`/u/<username>/summary` page so the user is identified (a mismatch with `users[]` is a
+warning). **Status: implemented against the documented Discourse shape and a SYNTHETIC
+fixture only. Validation against the operator's real CommerceGov summary is PENDING**
+(it was not available when this was implemented); the "13 topics" expectation is
+unverified.
+
+Extracted: topic ids (union of `user_summary.topic_ids`, `topics[]` and
+`replies[].topic_id`, sorted by id), titles/slugs/post counts where `topics[]` has them
+(never invented), reply references (`topic_id` + `post_number`, stored in
+`community_user_replies`, unique per user/topic/post) and the numeric activity
+statistics present (`community_user_activity`, latest values). Topics reuse the
+discovery tables and identity `(forum_host, topic_id)`; replies reuse the post identity
+`(topic, post_number)`. A changed summary adds only new references.
+
+Topic status (`topic_statuses`, shown on `/community`), deterministic from stored data:
+
+| Status | Meaning |
+|---|---|
+| `pending` | discovered, nothing ingested |
+| `partial` | ingested, but fewer posts stored than reported, or a referenced reply post is not stored |
+| `complete` | no known gap |
+| `coverage_unknown` | ingested, source gave no post count; absence of a gap is not proof |
+
+The work queue is `pending` + `partial`, ordered as before; `next_topic` returns the
+first item. It is derived from the database, so it resumes after a restart and a
+re-ingested identical capture changes nothing. No browser or network access exists;
+the operator captures each topic and pastes it into the ingest form.

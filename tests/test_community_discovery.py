@@ -224,3 +224,113 @@ def test_discover_route_validation(client):
     assert r.status_code == 422
     r = client.post("/community/discover", data={"source_url": LIST_URL, "raw_text": "not json"})
     assert r.status_code == 422
+
+
+# ------------------------------------------------------------ user summary (SYNTHETIC)
+
+SUMMARY_URL = f"https://{HOST}/u/synthetic_user/summary"
+
+
+def _summary() -> str:
+    return _read("synthetic_user_summary.json")
+
+
+def test_parse_user_summary_extracts_identity_topics_replies_stats():
+    p = parse_discovery(_summary(), source_url=SUMMARY_URL)
+    assert p.kind == "user_summary" and p.username == "synthetic_user"
+    assert p.source_key == "user_summary:/u/synthetic_user/summary"
+    ids = [t.topic_id for t in p.topics]
+    assert len(ids) == 13 and ids == sorted(ids) and ids[0] == 90001
+    assert p.topics[0].title == "SYNTHETIC: Checkout extension question"
+    assert p.topics[0].url == TOPIC_URL and p.topics[0].posts_count == 5
+    assert p.topics[-1].title is None  # referenced only; nothing invented
+    assert [(r.topic_id, r.post_number) for r in p.replies] == [(90001, 3), (90001, 9), (91011, 2), (91012, 4)]
+    assert p.stats["post_count"] == 14 and "can_see_summary_stats" not in p.stats
+    assert p.errors == [] and p.warnings == []
+
+
+def test_user_summary_requires_identifiable_user_and_flags_bad_replies():
+    with pytest.raises(ValidationError) as e:
+        parse_discovery(_summary(), source_url=f"https://{HOST}/latest")
+    assert e.value.error_code == "community_user_summary_username_unknown"
+    data = json.loads(_summary())
+    data["user_summary"]["replies"] += [{"topic_id": 5}, {"topic_id": 90001, "post_number": 3}]
+    p = parse_discovery(json.dumps(data), source_url=SUMMARY_URL)
+    assert [x.code for x in p.errors] == ["invalid_reply_reference"] and any("more than once" in w for w in p.warnings)
+    data["users"] = [{"username": "someone_else"}]
+    assert any("unconfirmed" in w for w in parse_discovery(json.dumps(data), source_url=SUMMARY_URL).warnings)
+
+
+def test_user_summary_persists_provenance_replies_and_stats(store):
+    r = svc.record_discovery(store, content=_summary(), source_url=SUMMARY_URL)
+    assert r.kind == "user_summary" and len(r.new_topics) == 13 and r.new_replies == 4 and r.command_id
+    with sqlite3.connect(store.database_path) as conn:
+        assert conn.execute("SELECT kind, source_url FROM community_discovery_runs").fetchone() == ("user_summary", SUMMARY_URL)
+        assert conn.execute("SELECT COUNT(*) FROM community_discovered_topics").fetchone()[0] == 13
+        assert conn.execute("SELECT COUNT(*) FROM community_user_replies WHERE username_norm='synthetic_user'").fetchone()[0] == 4
+        assert json.loads(conn.execute("SELECT stats_json FROM community_user_activity").fetchone()[0])["days_visited"] == 12
+        assert conn.execute("SELECT COUNT(*) FROM community_discovery_sightings").fetchone()[0] == 13
+
+
+def test_user_summary_idempotent_and_dedupes_known_topics(store):
+    svc.record_discovery(store, content=_read("synthetic_listing_p1.json"), source_url=LIST_URL)  # overlaps the summary at 90001 only
+    first = svc.record_discovery(store, content=_summary(), source_url=SUMMARY_URL)
+    assert 90001 in first.pending_topics and 90001 not in first.new_topics and len(first.new_topics) == 12
+    again = svc.record_discovery(store, content=_summary(), source_url=SUMMARY_URL)
+    assert again.duplicate_capture
+    # A changed summary (one more reply) adds only the new reference, never duplicates.
+    data = json.loads(_summary())
+    data["user_summary"]["replies"].append({"topic_id": 91001, "post_number": 2})
+    changed = svc.record_discovery(store, content=json.dumps(data), source_url=SUMMARY_URL)
+    assert changed.new_replies == 1 and changed.new_topics == []
+    assert _count(store, "community_user_replies") == 5
+    assert _count(store, "community_discovered_topics") == 4 + 12  # listing's 4 + 12 new; 90001 not duplicated
+    assert _count(store, "community_user_activity") == 1
+
+
+def test_topic_status_pending_partial_complete_and_resume(store):
+    svc.record_discovery(store, content=_summary(), source_url=SUMMARY_URL)
+    status = {t["topic_id"]: t for t in svc.topic_statuses(store)}
+    assert {s["status"] for s in status.values()} == {"pending"} and len(status) == 13
+    assert [q["topic_id"] for q in svc.work_queue(store)] == sorted(status)  # deterministic
+    assert svc.next_topic(store)["topic_id"] == 90001
+
+    # v1 capture: 4 posts of the 5 the summary reports; reply #3 stored, reply #9 not.
+    ingest_capture(store, content=_read("synthetic_topic_v1.json"), source_url=TOPIC_URL)
+    t = {x["topic_id"]: x for x in svc.topic_statuses(store)}[90001]
+    assert t["status"] == "partial" and t["posts_stored"] == 4 and t["missing_reply_posts"] == [9]
+    assert 90001 in [q["topic_id"] for q in svc.work_queue(store)]
+
+    # "Restart": fresh store object; interrupted work resumes from the database alone.
+    reopened = SqliteContactStore(store.database_path)
+    assert svc.next_topic(reopened)["topic_id"] == 90001
+    ingest_capture(reopened, content=_read("synthetic_topic_v2.json"), source_url=TOPIC_URL)  # 5 posts
+    t = {x["topic_id"]: x for x in svc.topic_statuses(reopened)}[90001]
+    assert t["missing_reply_posts"] == [9] and t["status"] == "partial"  # post 9 still not in capture
+    assert len(svc.work_queue(reopened)) == 13
+    # Re-ingesting the same capture does not duplicate anything.
+    ingest_capture(reopened, content=_read("synthetic_topic_v2.json"), source_url=TOPIC_URL)
+    assert _count(reopened, "community_posts") == 5 and _count(reopened, "community_topics") == 1
+
+
+def test_complete_and_coverage_unknown_statuses(store):
+    data = json.loads(_summary())
+    data["user_summary"]["replies"] = [r for r in data["user_summary"]["replies"] if r["post_number"] != 9]
+    svc.record_discovery(store, content=json.dumps(data), source_url=SUMMARY_URL)
+    ingest_capture(store, content=_read("synthetic_topic_v2.json"), source_url=TOPIC_URL)
+    t = {x["topic_id"]: x for x in svc.topic_statuses(store)}[90001]
+    assert t["status"] == "complete" and t["missing_reply_posts"] == []
+    assert 90001 not in [q["topic_id"] for q in svc.work_queue(store)]
+    # A topic whose source reported no post count is never called "complete".
+    nocount = {"topic_list": {"topics": [{"id": 90001, "slug": "synthetic-checkout-extension-question"}]}}
+    s2 = SqliteContactStore(store.database_path.parent / "other.db"); s2.init_db()
+    svc.record_discovery(s2, content=json.dumps(nocount), source_url=LIST_URL)
+    ingest_capture(s2, content=_read("synthetic_topic_v1.json"), source_url=TOPIC_URL)
+    assert svc.topic_statuses(s2)[0]["status"] == "coverage_unknown"
+
+
+def test_user_summary_route_renders_queue_status(client):
+    r = client.post("/community/discover", data={"source_url": SUMMARY_URL, "raw_text": _summary()})
+    assert r.status_code == 200
+    assert "synthetic_user" in r.text and "Reply references: 4 in capture, 4 new" in r.text
+    assert "Waiting to ingest (13)" in r.text and "not ingested" in r.text

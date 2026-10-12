@@ -59,13 +59,14 @@
       <p class="msg">Identical capture already recorded; nothing was written.</p>
       {% endif %}
       <p>
-        {{ discovery_result.kind }} on <strong>{{ discovery_result.forum_host }}</strong> —
+        {{ discovery_result.kind }}{% if discovery_result.username %} for <strong>{{ discovery_result.username }}</strong>{% endif %} on <strong>{{ discovery_result.forum_host }}</strong> —
         {{ discovery_result.topics_in_capture }} topics:
         new {{ discovery_result.new_topics|length }},
         awaiting ingest {{ discovery_result.pending_topics|length }},
         already ingested {{ discovery_result.ingested_topics|length }},
         update available {{ discovery_result.update_available_topics|length }}
       </p>
+      {% if discovery_result.kind == 'user_summary' %}<p>Reply references: {{ discovery_result.replies_in_capture }} in capture, {{ discovery_result.new_replies }} new.</p>{% endif %}
       <p>
         Checkpoint: {{ discovery_result.high_water or '—' }}
         (previous {{ discovery_result.previous_high_water or 'none' }}).
@@ -79,7 +80,7 @@
 
     <div class="card">
       <h2>Record a topic listing / search capture</h2>
-      <p><small>Paste Discourse listing JSON (<code>topic_list.topics</code>) or search JSON you saved yourself, with the page URL it came from. This only records which topics exist; ingest each topic below. Nothing is fetched from the web.</small></p>
+      <p><small>Paste Discourse listing JSON (<code>topic_list.topics</code>), search JSON, or a user summary (<code>/u/&lt;name&gt;/summary.json</code>) you saved yourself, with the page URL it came from. This only records which topics exist; ingest each topic below. Nothing is fetched from the web.</small></p>
       <form method="post" action="/community/discover">
         <p><label>Listing or search page URL (required)<br>
           <input type="text" name="source_url" size="80" placeholder="https://community.example/latest"></label></p>
@@ -98,7 +99,7 @@
           <tr>
             <td>{{ q.title or '(title unknown)' }}</td>
             <td><a href="{{ q.url }}" rel="noopener noreferrer">{{ q.forum_host }} / {{ q.topic_id }}</a></td>
-            <td>{{ 'new' if q.state == 'new_topic' else 'update available (' ~ q.posts_stored ~ ' stored)' }}</td>
+            <td>{% if q.status == 'pending' %}not ingested{% else %}partial ({{ q.posts_stored }} stored{% if q.posts_count_seen is not none %} of {{ q.posts_count_seen }}{% endif %}{% if q.missing_reply_posts %}; your replies missing: {% for n in q.missing_reply_posts %}#{{ n }} {% endfor %}{% endif %}){% endif %}</td>
             <td>{{ q.posts_count_seen if q.posts_count_seen is not none else '—' }}</td>
             <td>{{ q.last_posted_at_seen or '—' }}</td>
           </tr>
