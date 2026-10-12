@@ -45,10 +45,13 @@ from ask_router import (
 from config import AppConfig
 from errors import AppError, ValidationError, parse_command_id
 from gmail_runtime import GmailRuntimeUnsupportedError
+import community_db
 from extractor import parse_and_save
 from intake import validate_parse_intake
 from repositories.factory import get_contact_store
 from security import assert_safe_mutation_request
+from providers.gmail_normalize import html_to_text
+from services.community_ingest_service import ingest_capture, validate_ingest_request
 from services.gmail_sync_service import gmail_integration_status, sync_gmail_label
 
 load_dotenv()
@@ -344,6 +347,89 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 "messages": messages,
                 "runtime_error": runtime_error,
             },
+        )
+
+    # ------------------------------------------------------------ community
+
+    def _community_db_path(request: Request) -> Path:
+        try:
+            return community_db.require_community_sqlite_runtime(request.app.state.store)
+        except community_db.CommunityRuntimeUnsupportedError as exc:
+            raise ValidationError(error_code=exc.error_code, message=exc.message, status_code=501) from None
+
+    def _community_topics(db_path: Path) -> list:
+        with db.get_conn(db_path) as conn:
+            community_db.ensure_community_tables(conn)
+            return community_db.list_topics(conn)
+
+    @application.get("/community", response_class=HTMLResponse)
+    def community_page(request: Request):
+        topics = _community_topics(_community_db_path(request))
+        return templates.TemplateResponse(
+            request,
+            "community.html",
+            {"request": request, "topics": topics, "result": None, "form": {}, "message": None},
+        )
+
+    @application.post("/community/ingest", response_class=HTMLResponse)
+    def community_ingest(
+        request: Request,
+        raw_text: str = Form(...),
+        source_url: str = Form(""),
+    ):
+        assert_safe_mutation_request(request, port=cfg.port)
+        db_path = _community_db_path(request)
+        text, url = validate_ingest_request(
+            raw_text=raw_text, source_url=source_url, max_chars=cfg.max_paste_chars
+        )
+        try:
+            result = ingest_capture(request.app.state.store, content=text, source_url=url)
+        except AppError:
+            raise
+        except Exception:
+            logger.exception("community ingest failed")
+            raise ValidationError(
+                error_code="community_ingest_failed",
+                message="Failed to ingest capture. No changes were committed.",
+                status_code=500,
+            ) from None
+        return templates.TemplateResponse(
+            request,
+            "community.html",
+            {
+                "request": request,
+                "topics": _community_topics(db_path),
+                "result": result,
+                "form": {"source_url": url},
+                "message": None,
+            },
+        )
+
+    @application.get("/community/topics/{topic_row_id}", response_class=HTMLResponse)
+    def community_topic_detail(request: Request, topic_row_id: int):
+        db_path = _community_db_path(request)
+        with db.get_conn(db_path) as conn:
+            community_db.ensure_community_tables(conn)
+            topic = community_db.get_topic(conn, topic_row_id)
+            if topic is None:
+                raise ValidationError(
+                    error_code="community_topic_not_found",
+                    message=f"Community topic {topic_row_id} was not found.",
+                    status_code=404,
+                )
+            posts = community_db.list_posts(conn, topic_row_id)
+            revisions = community_db.list_revisions(conn, topic_row_id)
+        by_post: dict[int, list] = {}
+        for rev in revisions:
+            rev["display"] = html_to_text(rev["body"]) if rev["body_format"] == "html" else rev["body"]
+            by_post.setdefault(rev["post_number"], []).append(rev)
+        for post in posts:
+            post["display"] = html_to_text(post["body"]) if post["body_format"] == "html" else post["body"]
+            post["revisions"] = by_post.get(post["post_number"], [])
+        return templates.TemplateResponse(
+            request,
+            "community_topic.html",
+            {"request": request, "topic": topic, "posts": posts},
         )
 
     # ------------------------------------------------------------ knowledge

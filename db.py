@@ -290,6 +290,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     ensure_knowledge_tables(conn)
 
+    from community_db import ensure_community_tables
+
+    ensure_community_tables(conn)
+
 
 def _json_dumps(obj: Any) -> Optional[str]:
     if obj is None:

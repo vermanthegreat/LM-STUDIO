@@ -1,0 +1,13 @@
+Topic: SYNTHETIC: Rendered text capture
+Category: Synthetic Category
+
+#1 @alice_dev 2025-02-01T09:00:00Z
+First post line one.
+
+Second paragraph of the first post.
+
+#2 @bob_partner 2025-02-01T10:00:00Z reply-to #1
+A reply.
+
+#3 @alice_dev 2025-02-01T11:00:00Z reply-to #2 edited 2025-02-01T11:30:00Z
+Follow up.

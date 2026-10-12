@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ topic.title or 'Community topic' }} — LM Studio</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <h1>{{ topic.title or '(title unknown)' }}</h1>
+    <nav>
+      <a href="/community">Back to Community</a>
+      <a href="/leads">Leads</a>
+      <a href="/ask">Ask Database</a>
+    </nav>
+  </header>
+  <main>
+    <div class="card">
+      <p><strong>Source:</strong> <a href="{{ topic.url }}" rel="noopener noreferrer" target="_blank">{{ topic.url }}</a></p>
+      <p><strong>Topic id:</strong> {{ topic.topic_id }} |
+         <strong>Category:</strong> {{ topic.category or 'unknown' }} |
+         <strong>Started by:</strong> {{ topic.author_username or 'unknown' }} |
+         <strong>Created:</strong> {{ topic.created_at_src or 'unknown' }}</p>
+      <p><strong>Posts stored:</strong> {{ posts|length }}
+         {% if topic.posts_count_declared is not none %}of {{ topic.posts_count_declared }} declared{% endif %}</p>
+    </div>
+    <div class="card">
+      <h2>Conversation (chronological by post number)</h2>
+      {% for p in posts %}
+      <article id="post-{{ p.post_number }}" style="margin-bottom:1.25rem;border-bottom:1px solid #ccc;padding-bottom:1rem;">
+        <p>
+          <strong>#{{ p.post_number }}</strong> — @{{ p.author_username }}
+          — {{ p.created_at_src or 'time unknown' }}
+          {% if p.reply_to_post_number %}— reply to #{{ p.reply_to_post_number }}{% endif %}
+          {% if p.revision_count %}<span class="badge warn">edited ({{ p.revision_count }} revision{{ 's' if p.revision_count != 1 }})</span>{% endif %}
+          <a href="{{ p.post_url }}" rel="noopener noreferrer" target="_blank">source</a>
+        </p>
+        <pre style="white-space:pre-wrap;font-family:inherit;">{{ p.display }}</pre>
+        {% if p.revisions %}
+        <details>
+          <summary>Previous versions ({{ p.revisions|length }})</summary>
+          {% for r in p.revisions %}
+          <p><small>Superseded {{ r.superseded_at[:19] }}</small></p>
+          <pre style="white-space:pre-wrap;font-size:0.85rem;">{{ r.display }}</pre>
+          {% endfor %}
+        </details>
+        {% endif %}
+      </article>
+      {% else %}
+      <p>No posts stored.</p>
+      {% endfor %}
+    </div>
+  </main>
+</body>
+</html>
