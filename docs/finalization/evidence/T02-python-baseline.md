@@ -59,3 +59,41 @@ test_shopify_pg_contact_projection, test_verified_email_truthfulness. Allowed pe
 **PASS (cloud scope).** Supported interpreter identified; suites use temporary stores and fakes;
 baseline failures classified. Local (GROK) should re-run the suite with Python 3.11+ on the
 workstation — A/E17 found only Python 3.10.11 via `py -0p`.
+
+## Correction 2026-10-18 — Windows TestClient isolation (`414e104`)
+
+**Reported (GROK_LOCAL, Windows 11, Python 3.12.10, fastapi 0.143.5, starlette 1.8.0, at `4d70862`):**
+26 failed, 315 passed, 23 skipped, 12 errors, all `IsolationViolation` on AF_INET connects to
+`127.0.0.1:<ephemeral>`.
+
+**Cause:** Windows has no AF_UNIX `socketpair`, so CPython's `socket.socketpair()` emulates it:
+bind `127.0.0.1:0` → `listen()` → `connect()` → `accept()`. asyncio calls `socket.socketpair()` for
+each event loop's self-pipe (`selector_events.py`, `proactor_events.py`), and TestClient's AnyIO
+portal starts a loop, so every TestClient test tripped the guard.
+
+**Reproduced on Linux** by forcing `socket._fallback_socketpair` for the whole session against the
+`4d70862` guard: **26 failed, 315 passed, 23 skipped, 12 errors**, 38 × `IsolationViolation ... ('127.0.0.1', <port>)`.
+That is identical to the Windows report.
+
+**Exception, exact conditions (all required):** an AF_INET/AF_INET6 `connect`/`connect_ex` is allowed
+only if (1) the current thread is inside `socket.socketpair()` (wrapped by the guard); (2) the target
+`(host, port)` equals a loopback listener on which `listen()` was called on that thread during that
+same call; (3) the call has not returned (the set is cleared in `finally`). Nested socketpair calls are
+refused. Everything else is still refused: arbitrary localhost (including in-process listeners),
+LM Studio 1234, PostgreSQL other than a disposable shell `TEST_DATABASE_URL`, Gmail, all remote hosts.
+The SQLite guard is unchanged.
+
+**Regression tests added (`tests/test_isolation_guard.py`, 7):** emulated socketpair works; asyncio
+loop starts on the emulation; TestClient request works on the emulation; a connect to port 1234 made
+*during* socketpair is refused; an in-process listener outside socketpair is refused; the socketpair
+listener endpoint is refused after the call returns; another thread cannot use a live socketpair
+listener.
+
+| Run | Result |
+|---|---|
+| Linux 3.11.17, normal | 360 passed, 23 skipped |
+| Linux 3.12, normal | 360 passed, 23 skipped |
+| Linux 3.11.17, Windows emulation forced, fixed guard | 360 passed, 23 skipped |
+| Linux 3.11.17, Windows emulation forced, `4d70862` guard | 26 failed, 315 passed, 23 skipped, 12 errors |
+
+Windows PASS is **not** claimed. GROK_LOCAL must re-run `python -m pytest tests/ -q` on Windows.

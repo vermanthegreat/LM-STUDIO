@@ -1,8 +1,8 @@
 # T05 / Gate 1 — local execution handoff (GROK_LOCAL)
 
 **Certify:** branch `claude/vigilant-franklin-wb2rsk` at the tip SHA that contains this file.
-Code under test = commit `563dbbf5c270105574446b6f0556b7d1dfb7c748` (T04 + Gate 1 script); later
-commits on the tip may change `docs/` only. Verify before starting (step 1).
+Code under test = commit `414e104cb3e329c468ea5fa0805692a8ab2e5de8` (T04 + Gate 1 script + Windows
+TestClient isolation fix); later commits on the tip may change `docs/` only. Verify before starting (step 1).
 
 **Scope:** real LM Studio + Qwen, `/ask` planner → registry → stored answer, on a **backup copy**.
 No Gmail, no production `/ask` audit writes, no primary-checkout changes, no Community access.
@@ -26,7 +26,7 @@ git fetch origin claude/vigilant-franklin-wb2rsk
 $TIP = git rev-parse origin/claude/vigilant-franklin-wb2rsk
 git worktree add "C:\Users\verman\Desktop\LM-STUDIO-gate1" $TIP
 cd "C:\Users\verman\Desktop\LM-STUDIO-gate1"
-git diff --stat 563dbbf5c270105574446b6f0556b7d1dfb7c748 HEAD -- . ":(exclude)docs"   # must print nothing
+git diff --stat 414e104cb3e329c468ea5fa0805692a8ab2e5de8 HEAD -- . ":(exclude)docs"   # must print nothing
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python --version                       # record; must be 3.11+
@@ -53,7 +53,7 @@ Get-FileHash C:\gate1\leads-gate1-copy.db -Algorithm SHA256   # record (pre-run 
 python -m pytest tests/ -q
 ```
 
-Expected: **353 passed, 23 skipped** (skips = `TEST_DATABASE_URL is not configured`). Any other
+Expected: **360 passed, 23 skipped** (skips = `TEST_DATABASE_URL is not configured`). Any other
 failure → FAIL, send the output (sanitized) back to CLAUDE_CLOUD.
 
 ## 4. Isolated app instance on port 8026
