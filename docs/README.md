@@ -11,6 +11,8 @@ assistant.
 | `tool-contracts.md` | Allowed agent tools, risk classes, and result envelopes |
 | `safety-and-communication.md` | Approval, privacy, injection, failure, and response rules |
 | `implementation-roadmap.md` | Phase order, acceptance criteria, and stop conditions |
+| `completion-spec.md` | Finalization scope (Phase F): what is authorized beyond earlier phases, and what is not |
+| `finalization/` | Finalization plan, task backlog (T01–T32), acceptance gates and evidence |
 | `agent-system-prompt.md` | ChatGPT/local-model runtime behavior prompt |
 | `first-patch-prompt.md` | Executable prompt for the immediate hardening patch |
 

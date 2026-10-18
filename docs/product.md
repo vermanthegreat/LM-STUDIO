@@ -59,7 +59,9 @@ in a later phase and must preserve source and verification state.
 
 - Generic autonomous browsing or scraping.
 - Arbitrary SQL agents.
-- Email sending, inbox synchronization, or campaign automation.
+- Campaign automation and autonomous email sending. Gmail synchronization and
+  operator-approved sending are scoped only by roadmap Phase G2 and
+  `completion-spec.md`; sending is not implemented yet.
 - Generic workflow engines such as n8n.
 - Multi-tenant SaaS, billing, teams, and enterprise permissions.
 - A broad CRM feature set unrelated to contact intelligence.

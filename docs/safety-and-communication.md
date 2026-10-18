@@ -21,13 +21,18 @@ single bounded reversible write and all targets are unambiguous. Otherwise:
 5. Execute atomically and record the result.
 
 Bulk, merge, archive, destructive, and external actions always require
-approval. Email sending is not supported.
+approval. Email sending is not supported in the current release; the only
+authorized future path is an explicit operator send of one approved, immutable
+draft snapshot (roadmap Phase G2, `completion-spec.md` section 7). No model,
+planner, `/ask` or MCP path may send.
 
 ## Privacy and logging
 
 - Keep operation local by default.
 - Do not transmit pasted content to services other than the configured local
-  model unless the user explicitly enables a named provider.
+  model unless the user explicitly enables a named provider. Stored message or
+  Community text may reach the local model only as a selected, bounded excerpt
+  (`completion-spec.md` section 6).
 - Redact credentials and avoid logging complete raw text, email bodies, or
   personal data.
 - Display contact data only as required by the user's query.

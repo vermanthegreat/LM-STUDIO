@@ -394,7 +394,8 @@ In scope:
 Out of scope:
 
 - autonomous email sending, or any automatic approval to send;
-- AI-generated or K1-contextual drafting (later separate phase);
+- AI-generated or K1-contextual drafting (later separate phase: local-model
+  suggestions are specified in `completion-spec.md` section 7);
 - autonomous follow-up actions;
 - Calendar integration (C0/C1);
 - scraping, browser automation, new external data collection;
@@ -418,7 +419,9 @@ Invariants:
 - A draft or send belongs to exactly one account and can only reference
   that account's threads.
 - Tokens and message bodies never appear in logs, the command log, prompts,
-  or the repository.
+  or the repository. Amended by `completion-spec.md` section 6: a selected,
+  bounded excerpt may be sent to the configured local model only, for
+  classification or draft assistance.
 - Tests never contact Gmail and never read real credentials or mailboxes.
 
 Acceptance criteria:
@@ -500,6 +503,13 @@ Mail arrives on one of four Gmail accounts
 G2 is complete only when criteria A–N pass in automated tests, gate G2-0 has
 been resolved, the policy documents above are updated, and the live
 certification (O) has been executed and recorded by the operator.
+
+## Phase F — finalization completion (SQLite)
+
+**Status:** Scope ratified in `completion-spec.md` (HUMAN acknowledgement
+pending); tasks, gates and evidence live in `docs/finalization/`. Phase F does
+not accept PostgreSQL and does not merge earlier phases' gates. Automated
+Community collection remains not authorized.
 
 ## Phase C0 — Google Calendar read-only context (future)
 
