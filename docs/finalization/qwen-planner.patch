@@ -1,0 +1,141 @@
+diff --git a/llm.py b/llm.py
+index a28f747..123120b 100644
+--- a/llm.py
++++ b/llm.py
+@@ -70,8 +70,13 @@ def call_lmstudio_for_text(
+     timeout_s: float = 8.0,
+     *,
+     system_prompt: str = "You are an intent classifier.",
++    reasoning_effort: Optional[str] = None,
+ ) -> Optional[str]:
+-    """Call LM Studio for short text with quick timeout. Returns raw or None on error."""
++    """Call LM Studio for short text with quick timeout. Returns raw or None on error.
++
++    Only ``message.content`` is parsed. Reasoning text is never treated as a command.
++    ``reasoning_effort`` is sent only when the caller sets it.
++    """
+     try:
+         messages = [
+             {"role": "system", "content": system_prompt},
+@@ -83,6 +88,8 @@ def call_lmstudio_for_text(
+             "temperature": 0.0,
+             "max_tokens": 512,
+         }
++        if reasoning_effort:
++            payload["reasoning_effort"] = reasoning_effort
+         with httpx.Client(timeout=timeout_s) as client:
+             resp = client.post(LM_ENDPOINT, json=payload)
+             if not resp.is_success:
+diff --git a/services/llm_planner.py b/services/llm_planner.py
+index dacb59e..7458031 100644
+--- a/services/llm_planner.py
++++ b/services/llm_planner.py
+@@ -18,7 +18,10 @@ _PLANNER_SYSTEM = (
+     "Return JSON only. Select one registered tool or ask for clarification. "
+     "Never invent tools, SQL, or facts."
+ )
+-_PLANNER_TIMEOUT_S = 8.0
++# Planner-only bound. Other LM Studio calls keep their own timeouts.
++# Reasoning is disabled, but this host still needed about 128s to emit the JSON.
++_PLANNER_TIMEOUT_S = 180.0
++_PLANNER_REASONING_EFFORT = "none"
+ 
+ 
+ def _tool_catalog() -> str:
+@@ -80,6 +83,7 @@ def plan_question_with_local_llm(
+         _build_planner_prompt(q),
+         timeout_s=timeout_s,
+         system_prompt=_PLANNER_SYSTEM,
++        reasoning_effort=_PLANNER_REASONING_EFFORT,
+     )
+     if not raw:
+         logger.info("Local LLM planner unavailable or returned no output")
+diff --git a/tests/test_ask_llm_planner.py b/tests/test_ask_llm_planner.py
+index e37ba7c..97855f1 100644
+--- a/tests/test_ask_llm_planner.py
++++ b/tests/test_ask_llm_planner.py
+@@ -5,11 +5,13 @@ from __future__ import annotations
+ from unittest.mock import patch
+ 
+ import db
++import llm
+ from ask_router import answer_question
+ from repositories.sqlite_store import SqliteContactStore
+ from services.command_log import InMemoryCommandLog
+ from services.command_service import CommandService
+-from tools.planner import PlannerToolCall
++from services.llm_planner import plan_question_with_local_llm
++from tools.planner import PlannerClarify, PlannerToolCall
+ 
+ 
+ def _seed(db_path):
+@@ -102,3 +104,69 @@ def test_use_llm_true_does_not_call_planner_for_deterministic_intent(tmp_path):
+ 
+     planner.assert_not_called()
+     assert result["intent"] == "leads_without_email"
++
++
++class _FakeResponse:
++    def __init__(self, payload):
++        self._payload = payload
++        self.is_success = True
++
++    def json(self):
++        return self._payload
++
++
++class _FakeClient:
++    captured = []
++
++    def __init__(self, timeout):
++        self.timeout = timeout
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        return False
++
++    def post(self, url, json):
++        self.captured.append(json)
++        return _FakeResponse(
++            {
++                "choices": [
++                    {
++                        "message": {
++                            "content": "thinking out loud",
++                            "reasoning_content": (
++                                '{"action":"tool","tool_name":"search_contacts","arguments":{}}'
++                            ),
++                        }
++                    }
++                ]
++            }
++        )
++
++
++def test_planner_requests_reasoning_off_and_ignores_reasoning_channel():
++    with patch("services.llm_planner.call_lmstudio_for_text", return_value=None) as caller:
++        assert plan_question_with_local_llm("Which partner agencies operate in Berlin?") is None
++
++    assert caller.call_args.kwargs["reasoning_effort"] == "none"
++    assert caller.call_args.kwargs["timeout_s"] == 180.0
++
++
++def test_text_call_omits_reasoning_effort_unless_requested():
++    _FakeClient.captured = []
++    with patch("llm.httpx.Client", _FakeClient):
++        assert llm.call_lmstudio_for_text("classify this") is None
++        assert llm.call_lmstudio_for_text("plan this", reasoning_effort="none") is None
++
++    assert "reasoning_effort" not in _FakeClient.captured[0]
++    assert _FakeClient.captured[1]["reasoning_effort"] == "none"
++
++
++def test_planner_accepts_content_json_only():
++    raw = '{"action":"clarify","question":"Which city?"}'
++    with patch("services.llm_planner.call_lmstudio_for_text", return_value=raw):
++        plan = plan_question_with_local_llm("where")
++
++    assert isinstance(plan, PlannerClarify)
++    assert plan.question == "Which city?"
