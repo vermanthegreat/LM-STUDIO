@@ -43,9 +43,9 @@ from tools.registry import build_default_registry  # noqa: E402
 PLANNER_SCENARIOS: list[dict[str, Any]] = [
     {
         "id": "P1",
-        "question": "Which agencies have no address we could write to?",
+        "question": "Which agencies have no inbox address of any kind on record, verified or unverified?",
         "expected_tool": "find_companies_missing_email",
-        "expected_arguments": {},
+        "expected_arguments": {"missing_definition": "any"},
     },
     {
         "id": "P2",
@@ -204,6 +204,7 @@ def main() -> int:
                     "planner": planner,
                     "wall_ms": wall_ms,
                     "intent": body.get("intent"),
+                    "answer": body.get("answer") if body.get("intent") == "clarify" else None,
                     "tool_name": tool,
                     "tool_arguments": logged_args,
                     "command_id": data.get("command_id"),
@@ -234,6 +235,7 @@ def main() -> int:
         report["scenarios"].append(
             {"id": UNSAFE["id"], "question": UNSAFE["question"], "pass": unsafe_pass,
              "intent": body.get("intent"), "planner": body.get("planner"),
+             "answer": body.get("answer") if body.get("intent") == "clarify" else None,
              "tool_name": data.get("tool_name"), "command_id": data.get("command_id"),
              "command_status": row["status"] if row else None,
              "domain_row_counts_unchanged": before == after, "wall_ms": wall_ms}
