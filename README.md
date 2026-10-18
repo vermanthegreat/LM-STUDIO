@@ -6,7 +6,12 @@ Local manual-copy lead intelligence app. You copy text from Shopify Partner Dire
 
 ## Quick start (SQLite — default)
 
+Requires **Python 3.11 or newer**. Python 3.10 and older are not supported.
+
 ```bash
+python3.11 -m venv .venv          # Windows: py -3.11 -m venv .venv
+source .venv/bin/activate         # Windows: .venv\Scripts\activate
+python --version                  # must report 3.11+
 pip install -r requirements.txt
 python app.py
 ```
@@ -77,11 +82,20 @@ disabled by default). Ask with `knowledge: <terms>` on `/ask`. See
 
 ## Tests
 
+Run the suite from the activated Python 3.11+ virtual environment:
+
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -q
 ```
 
-SQLite route and unit tests run without PostgreSQL. Optional PostgreSQL integration tests in `tests/test_pg_integration.py` are skipped unless `TEST_DATABASE_URL` points at a disposable database.
+`tests/conftest.py` isolates every test session: before any module loads `.env`, it pins
+`DATABASE_PATH` and `KNOWLEDGE_STORAGE_DIR` to a temporary directory, blanks `DATABASE_URL`
+and the Gmail token/client-secret paths, and forces `GMAIL_ENABLED=false`. Any test that opens
+the repository `leads.db` (or the `DATABASE_PATH` set in your shell) or makes an outbound network
+connection fails with `IsolationViolation`, and the session fails if the default `leads.db` is
+created or modified. Tests must use `tmp_path` databases and fake providers.
+
+SQLite route and unit tests run without PostgreSQL. Optional PostgreSQL integration tests are skipped unless `TEST_DATABASE_URL` is set in the shell (a value in `.env` is ignored) and names a disposable database whose name contains `test`; only that host/port is reachable from tests.
 
 ## Runtime
 
