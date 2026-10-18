@@ -46,6 +46,10 @@ class ToolValidationError(ToolRegistryError):
     """Raised when tool arguments fail schema validation."""
 
 
+class ToolExecutionError(ToolRegistryError):
+    """Raised when a tool handler fails unexpectedly during execution."""
+
+
 Handler = Callable[[ContactStore, BaseModel], ToolResult]
 
 

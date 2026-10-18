@@ -125,6 +125,30 @@ The planner produces one of:
 
 The model cannot define new tools, approval policy, SQL, or executable code.
 
+Planner request and failure attribution (`services/llm_planner.py`):
+
+- The prompt lists every registered tool with its risk class and a compact
+  argument signature generated from the tool's Pydantic input model.
+- Only the final `message.content` is parsed, as one JSON object (optionally in
+  one Markdown code fence). `reasoning_content`/`reasoning` is never parsed.
+- Planner-only settings: `LMSTUDIO_PLANNER_TIMEOUT` (default 180 s),
+  `LMSTUDIO_PLANNER_MAX_TOKENS` (default 512), `LMSTUDIO_PLANNER_REASONING_EFFORT`
+  (default `none`, sent as `reasoning_effort`; `omit` sends nothing). Whether a
+  given local model honours `reasoning_effort` is a local-runtime fact.
+- Failures are reported as `planner_timeout`, `planner_unavailable`,
+  `planner_http_error`, `planner_malformed_response`, `planner_empty_output`,
+  `planner_reasoning_only`, `planner_reasoning_in_content`, `planner_truncated`,
+  `planner_malformed_json` or `planner_invalid_plan`. `/ask` then falls back to
+  deterministic routing and returns a `planner` object
+  (`status`, `stage`, `error_code`, `elapsed_ms`, `timeout_s`, `model`,
+  `reasoning_effort`, `finish_reason`, `fallback`). A successful plan also returns
+  `planner` with `status: ok`, so model-selected answers are distinguishable from
+  deterministic ones.
+- Plan arguments are validated against the registry independently of the model;
+  an invalid plan is `rejected` and executes nothing.
+- A planner clarification is audited as a `planned` command with intent
+  `clarify` (awaiting the operator's next question).
+
 ## Result envelope
 
 All tools return:
@@ -140,4 +164,16 @@ All tools return:
 
 The communication layer may shorten wording but cannot change identifiers,
 counts, dates, verification states, or warnings.
+
+Command-log state for executed tools:
+
+- An `ok` read result is `succeeded`; an `error` envelope is `failed` with the
+  first warning (or `tool_result_error`) as `error_code`. An unexpected handler
+  exception is `failed` with `tool_execution_error`; a command never stays
+  `executing`.
+- Read results are returned in full to the caller, but the command log stores
+  only `tool_name`, `status`, `summary`, `record_count`, `returned_count`,
+  `warnings`, `provenance` and an identifier projection of each record (keys
+  `id`/`*_id`, recursively; at most 200). Write-proposal payloads are stored
+  unchanged because approval and apply depend on them.
 

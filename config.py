@@ -16,6 +16,16 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_optional_str(name: str, default: str | None) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value or value.lower() == "omit":
+        return None
+    return value
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None or not str(raw).strip():
@@ -33,6 +43,9 @@ class AppConfig:
     lmstudio_base_url: str = "http://localhost:1234/v1"
     lmstudio_model: str = "local-model"
     lmstudio_timeout: float = 60.0
+    planner_timeout: float = 180.0
+    planner_max_tokens: int = 512
+    planner_reasoning_effort: str | None = "none"
     log_level: str = "INFO"
     gmail_enabled: bool = False
     gmail_client_secret_path: Path | None = None
@@ -71,6 +84,9 @@ class AppConfig:
             or "http://localhost:1234/v1",
             lmstudio_model=os.getenv("LMSTUDIO_MODEL", "local-model").strip() or "local-model",
             lmstudio_timeout=float(os.getenv("LMSTUDIO_TIMEOUT", "60") or "60"),
+            planner_timeout=float(os.getenv("LMSTUDIO_PLANNER_TIMEOUT", "180") or "180"),
+            planner_max_tokens=_env_int("LMSTUDIO_PLANNER_MAX_TOKENS", 512),
+            planner_reasoning_effort=_env_optional_str("LMSTUDIO_PLANNER_REASONING_EFFORT", "none"),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             gmail_enabled=_env_bool("GMAIL_ENABLED", False),
             gmail_client_secret_path=Path(secret_path) if secret_path else None,

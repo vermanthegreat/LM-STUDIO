@@ -15,6 +15,7 @@ from persistence.session import get_engine, reset_cached_engines, session_scope
 from repositories.postgres_store import PostgresContactStore
 from sqlalchemy import select, text
 from tests.pg_support import reset_public_schema, run_alembic_upgrade
+from services.llm_planner import PlannerOutcome
 from tools.planner import PlannerToolCall
 from tools.registry import build_default_registry
 
@@ -170,6 +171,17 @@ def test_ask_unverified_list_includes_proposed_and_excludes_verified(pg_app):
     assert "verified" not in statuses
 
 
+def _planner_outcome(plan):
+    return PlannerOutcome(
+        plan=plan,
+        error_code=None if plan else "planner_unavailable",
+        elapsed_ms=0,
+        timeout_s=180.0,
+        model="local-model",
+        reasoning_effort="none",
+    )
+
+
 def test_ask_use_llm_planner_routes_read_tool_without_live_lm_studio(pg_app):
     _, store, _ = pg_app
     planner_payload = PlannerToolCall(
@@ -177,7 +189,7 @@ def test_ask_use_llm_planner_routes_read_tool_without_live_lm_studio(pg_app):
         arguments={"text": "Phase3", "limit": 10},
         reason="Find pasted organization.",
     )
-    with patch("services.llm_planner.plan_question_with_local_llm", return_value=planner_payload):
+    with patch("services.llm_planner.run_local_planner", return_value=_planner_outcome(planner_payload)):
         with patch("extractor.extract_structured", return_value=(PARSE_PAYLOAD, "llm-raw")):
             parse_and_save("website", "Phase3 Paste Co", store=store)
 
@@ -190,7 +202,7 @@ def test_ask_use_llm_planner_routes_read_tool_without_live_lm_studio(pg_app):
 
 def test_ask_use_llm_survives_unavailable_local_planner(pg_app):
     _, store, _ = pg_app
-    with patch("services.llm_planner.plan_question_with_local_llm", return_value=None):
+    with patch("services.llm_planner.run_local_planner", return_value=_planner_outcome(None)):
         with patch("ask_router.call_lmstudio_for_text", return_value=None):
             result = answer_question("what is the meaning of life", use_llm=True, store=store)
 

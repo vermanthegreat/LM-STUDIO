@@ -169,6 +169,17 @@ def execute_planner_read_tool_call(
             tool_name=entry.tool_name,
         )
 
+    if result.status == "error":
+        # The handler returned an error envelope; the command is FAILED, not succeeded.
+        return _planner_error(
+            intent="tool_error",
+            error_code=entry.error_code or "tool_result_error",
+            message=result.summary,
+            entry_id=entry.id,
+            command_status=entry.status.value,
+            tool_name=entry.tool_name,
+        )
+
     return {
         "status": "ok",
         "tool_name": entry.tool_name,

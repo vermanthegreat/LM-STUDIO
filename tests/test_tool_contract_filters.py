@@ -217,7 +217,7 @@ def test_deterministic_followups_path_unchanged_without_llm(tmp_path):
     _seed_followups(db_path)
     store = SqliteContactStore(db_path)
 
-    with patch("services.llm_planner.plan_question_with_local_llm") as planner:
+    with patch("services.llm_planner.run_local_planner") as planner:
         result = answer_question("show follow-ups due", use_llm=False, store=store)
 
     planner.assert_not_called()

@@ -95,6 +95,9 @@ Configuration must be environment-driven and validated at startup:
 - `LMSTUDIO_BASE_URL`
 - `LMSTUDIO_MODEL`
 - `LMSTUDIO_TIMEOUT`
+- `LMSTUDIO_PLANNER_TIMEOUT`, `LMSTUDIO_PLANNER_MAX_TOKENS`,
+  `LMSTUDIO_PLANNER_REASONING_EFFORT` — `/ask` planner only
+  (see `tool-contracts.md` "Planner output")
 - `MAX_PASTE_CHARS`
 - `LOG_LEVEL`
 - `GMAIL_ENABLED` — enable Phase G0 Gmail read-only intake (default `false`)

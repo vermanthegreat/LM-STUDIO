@@ -18,9 +18,54 @@ from services.write_proposal_authority import load_stored_write_proposal
 from services.write_proposals import apply_write_proposal, finalize_recovered_apply
 from tools.envelope import ToolResult
 from tools.planner import PlannerClarify, PlannerToolCall
-from tools.registry import ToolRegistry, ToolRegistryError, UnknownToolError, build_default_registry
+from tools.registry import (
+    ToolExecutionError,
+    ToolRegistry,
+    ToolRegistryError,
+    UnknownToolError,
+    build_default_registry,
+)
 from tools.risk import RiskClass
 from tools.write_handlers import WriteProposalError
+
+
+_SAFE_SUMMARY_MAX_RECORDS = 200
+
+
+def _identifier_projection(value: Any) -> Any:
+    """Keep only identifier keys (``id``/``*_id``) from a record, recursively."""
+    if not isinstance(value, dict):
+        return None
+    kept: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "id" or key.endswith("_id"):
+            if item is None or isinstance(item, (str, int)):
+                kept[key] = item
+        elif isinstance(item, dict):
+            nested = _identifier_projection(item)
+            if nested:
+                kept[key] = nested
+    return kept
+
+
+def safe_read_summary(result: ToolResult) -> dict[str, Any]:
+    """Audit summary of a read result: status, counts and record identifiers only.
+
+    Full records (names, emails, message text) are returned to the caller but are
+    not persisted in the command log.
+    """
+    records = [_identifier_projection(r) for r in result.records[:_SAFE_SUMMARY_MAX_RECORDS]]
+    return {
+        "tool_name": result.tool_name,
+        "status": result.status,
+        "summary": result.summary,
+        "record_count": result.record_count,
+        "returned_count": len(result.records),
+        "records": records,
+        "records_truncated": len(result.records) > _SAFE_SUMMARY_MAX_RECORDS,
+        "warnings": list(result.warnings),
+        "provenance": list(result.provenance),
+    }
 
 
 class CommandService:
@@ -76,12 +121,24 @@ class CommandService:
             entry.error_message = str(exc)
             self.command_log.update(entry)
             raise
+        except Exception as exc:
+            # Never leave a command stuck in EXECUTING; the message may hold private data.
+            transition(entry, CommandStatus.FAILED)
+            entry.error_code = "tool_execution_error"
+            entry.error_message = f"{type(exc).__name__} during {entry.tool_name}"
+            self.command_log.update(entry)
+            raise ToolExecutionError(entry.error_message) from exc
 
         if spec.risk_class.creates_write_proposal:
             return self._store_write_proposal(entry, result)
 
-        transition(entry, CommandStatus.SUCCEEDED)
-        entry.result_summary = result.model_dump(mode="json")
+        entry.result_summary = safe_read_summary(result)
+        if result.status == "error":
+            transition(entry, CommandStatus.FAILED)
+            entry.error_code = result.warnings[0] if result.warnings else "tool_result_error"
+            entry.error_message = result.summary
+        else:
+            transition(entry, CommandStatus.SUCCEEDED)
         self.command_log.update(entry)
         result.command_id = entry.id
         return result

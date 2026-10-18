@@ -44,6 +44,10 @@
     <div class="card">
       <h2>Answer <span class="badge">{{ result.intent }}</span></h2>
       <pre class="answer">{{ result.answer }}</pre>
+      {% if result.planner %}
+      <p class="muted">Local planner: {{ result.planner.status }}{% if result.planner.error_code %} ({{ result.planner.error_code }}){% endif %},
+        {{ result.planner.elapsed_ms }} ms of {{ result.planner.timeout_s }} s limit{% if result.planner.fallback %}; answered by deterministic fallback{% endif %}.</p>
+      {% endif %}
     </div>
     {% endif %}
   </main>

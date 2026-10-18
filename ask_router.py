@@ -121,33 +121,52 @@ def answer_question(
         )
 
     intent = _deterministic_intent(q)
+    planner_meta: Optional[Dict[str, Any]] = None
 
     if intent.name == "unknown" and use_llm:
-        from services.llm_planner import plan_question_with_local_llm
+        from services import llm_planner
 
-        plan = plan_question_with_local_llm(q)
+        outcome = llm_planner.run_local_planner(q)
+        planner_meta = outcome.metadata()
+        plan = outcome.plan
         if isinstance(plan, PlannerToolCall):
-            return execute_planner_tool_route(
+            response = execute_planner_tool_route(
                 q,
                 plan.model_dump(mode="json"),
                 store=store,
                 command_service=command_service,
             )
+            return {**response, "planner": planner_meta}
         if isinstance(plan, PlannerClarify):
+            service = command_service or CommandService(store)
+            entry = service.receive(q)
+            service.clarify(entry, plan)
             return {
                 "question": q,
                 "intent": "clarify",
                 "answer": plan.question,
-                "data": {"action": "clarify"},
+                "data": {
+                    "action": "clarify",
+                    "command_id": str(entry.id),
+                    "command_status": entry.status.value,
+                },
+                "planner": planner_meta,
             }
+        # Planner failed: fall back deterministically and disclose why.
+        planner_meta["fallback"] = "deterministic"
         intent = _llm_intent(q)
 
     if intent.name == "unknown":
         intent = _fallback_search_intent(q)
 
+    def _disclose(response: Dict[str, Any]) -> Dict[str, Any]:
+        return {**response, "planner": planner_meta} if planner_meta else response
+
     if intent.name == "knowledge_search":
-        return _answer_knowledge_question(
-            q, intent, use_llm=use_llm, store=store, command_service=command_service
+        return _disclose(
+            _answer_knowledge_question(
+                q, intent, use_llm=use_llm, store=store, command_service=command_service
+            )
         )
 
     if intent.name in _TOOL_ROUTED_INTENTS:
@@ -165,10 +184,12 @@ def answer_question(
                 polished = _polish_answer(q, answer, tool_response["data"])
                 if polished:
                     answer = polished
-            return {
-                **tool_response,
-                "answer": answer,
-            }
+            return _disclose(
+                {
+                    **tool_response,
+                    "answer": answer,
+                }
+            )
 
     result = _execute_intent(intent, store=store)
     answer = result["answer"]
@@ -178,12 +199,12 @@ def answer_question(
         if polished:
             answer = polished
 
-    return {
+    return _disclose({
         "question": q,
         "intent": result["intent"],
         "answer": answer,
         "data": result.get("data"),
-    }
+    })
 
 
 _KNOWLEDGE_PREFIXES = (
