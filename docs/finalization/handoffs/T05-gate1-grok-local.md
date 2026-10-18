@@ -1,8 +1,8 @@
 # T05 / Gate 1 — local execution handoff (GROK_LOCAL)
 
 **Certify:** branch `claude/vigilant-franklin-wb2rsk` at the tip SHA that contains this file.
-Code under test = commit `414e104cb3e329c468ea5fa0805692a8ab2e5de8` (T04 + Gate 1 script + Windows
-TestClient isolation fix); later commits on the tip may change `docs/` only. Verify before starting (step 1).
+Code under test = commit `d00c2c67977fd8a2aac13a3e182c7c4f4fab61e4` (T04 + Gate 1 script + Windows
+TestClient isolation fix + P1 contract correction); later commits on the tip may change `docs/` only. Verify before starting (step 1).
 
 **Scope:** real LM Studio + Qwen, `/ask` planner → registry → stored answer, on a **backup copy**.
 No Gmail, no production `/ask` audit writes, no primary-checkout changes, no Community access.
@@ -26,7 +26,7 @@ git fetch origin claude/vigilant-franklin-wb2rsk
 $TIP = git rev-parse origin/claude/vigilant-franklin-wb2rsk
 git worktree add "C:\Users\verman\Desktop\LM-STUDIO-gate1" $TIP
 cd "C:\Users\verman\Desktop\LM-STUDIO-gate1"
-git diff --stat 414e104cb3e329c468ea5fa0805692a8ab2e5de8 HEAD -- . ":(exclude)docs"   # must print nothing
+git diff --stat d00c2c67977fd8a2aac13a3e182c7c4f4fab61e4 HEAD -- . ":(exclude)docs"   # must print nothing
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python --version                       # record; must be 3.11+
@@ -53,7 +53,7 @@ Get-FileHash C:\gate1\leads-gate1-copy.db -Algorithm SHA256   # record (pre-run 
 python -m pytest tests/ -q
 ```
 
-Expected: **360 passed, 23 skipped** (skips = `TEST_DATABASE_URL is not configured`). Any other
+Expected: **369 passed, 23 skipped** (skips = `TEST_DATABASE_URL is not configured`). Any other
 failure → FAIL, send the output (sanitized) back to CLAUDE_CLOUD.
 
 ## 4. Isolated app instance on port 8026
@@ -85,11 +85,12 @@ python scripts\certify_gate1_planner.py --base-url http://127.0.0.1:8026 `
   --database-path C:\gate1\leads-gate1-copy.db --out C:\gate1\gate1-evidence.json --probe-reasoning
 ```
 
-Scenarios (P1–P3 bypass deterministic routing on this revision):
+Scenarios (P1–P3 bypass deterministic routing on this revision; enforced by
+`tests/test_gate1_scenarios.py`):
 
 | ID | Question | Expected |
 |---|---|---|
-| P1 | Which agencies have no address we could write to? | `find_companies_missing_email` |
+| P1 | Which agencies have no inbox address of any kind on record, verified or unverified? | `find_companies_missing_email`, `missing_definition=any` |
 | P2 | Which organisations rated 70 or higher for relevance do we track? | `search_contacts`, `minimum_relevance=70` |
 | P3 | Which phone numbers have we collected but never confirmed? | `list_unverified_contact_methods`, `kind=phone` |
 | D1 | companies without email | deterministic, **no** `planner` key |
@@ -145,3 +146,21 @@ Afterwards: stop the app, keep `C:\gate1` until Gate 1 is accepted, and remove t
 
 - T03 scope acknowledgement: `docs/completion-spec.md` section 10.
 - Apply or approve the `AGENTS.md` pointer text in `docs/finalization/evidence/T03-completion-spec.md`.
+
+## Revision 2026-10-18 — P1 contract correction (approved)
+
+First Windows run at `5a5054c`: suite 360 passed / 23 skipped; P2, P3, D1, U1 PASS; **P1 FAIL**
+(`action=clarify`, `planner.status=ok`, `elapsed_ms=152641`). Triage classified this as a
+**test-contract defect**: the old P1 wording ("no address we could write to") is ambiguous between
+postal and email addresses and does not fix `missing_definition`. Clarifying is permitted planner
+behaviour. No T04 code change.
+
+Changes (operator-approved): P1 question as in the table above. P1 expected arguments are now
+`{"missing_definition": "any"}` (previously `{}`, so this is stricter). Each P/U scenario record now
+includes `answer` when the intent is `clarify`. All other checks, the 180 s limit, D1, U1 and the
+reasoning probe are unchanged. **Re-run all five scenarios plus the omit run on the new tip**; the
+earlier P2/P3/D1/U1 results do not carry over.
+
+Also report (latency triage): the P1–P3 `planner.elapsed_ms` values; the `reasoning_probe` fields
+(`elapsed_ms`, `reasoning_chars`, `usage`, `finish_reason`) for none vs omitted; and the LM Studio
+server-log model-load and prompt-processing times for the first request.
