@@ -75,3 +75,160 @@ def test_non_disposable_test_database_url_is_rejected():
     assert conftest._disposable_test_database_url("") == ""
     url = "postgresql://u:p@localhost:5432/contacts_test"
     assert conftest._disposable_test_database_url(url) == url
+
+
+# --- Windows socketpair() emulation (asyncio self-pipe / TestClient) -----------
+
+
+def _windows_style_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+    """CPython's socketpair() emulation used on Windows (no AF_UNIX socketpair)."""
+    fallback = getattr(socket, "_fallback_socketpair", None)
+    if fallback is not None:
+        return fallback(family, type, proto)
+    lsock = socket.socket(family, type, proto)
+    try:
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen()
+        addr, port = lsock.getsockname()[:2]
+        csock = socket.socket(family, type, proto)
+        csock.setblocking(False)
+        try:
+            csock.connect((addr, port))
+        except (BlockingIOError, InterruptedError):
+            pass
+        csock.setblocking(True)
+        ssock, _ = lsock.accept()
+    finally:
+        lsock.close()
+    return ssock, csock
+
+
+@pytest.fixture
+def windows_socketpair(monkeypatch):
+    monkeypatch.setattr(conftest, "_real_socketpair", _windows_style_socketpair)
+
+
+def test_emulated_socketpair_loopback_is_allowed(windows_socketpair):
+    a, b = socket.socketpair()
+    try:
+        assert a.family == socket.AF_INET
+        a.sendall(b"ping")
+        assert b.recv(4) == b"ping"
+    finally:
+        a.close()
+        b.close()
+
+
+def test_asyncio_event_loop_starts_with_emulated_socketpair(windows_socketpair):
+    import asyncio
+
+    loop = asyncio.SelectorEventLoop()
+    try:
+        assert loop.run_until_complete(asyncio.sleep(0, result="ok")) == "ok"
+    finally:
+        loop.close()
+
+
+def test_testclient_request_works_with_emulated_socketpair(windows_socketpair, tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import create_app
+    from config import AppConfig
+
+    cfg = AppConfig(database_path=tmp_path / "routes.db", port=8025)
+    with TestClient(create_app(cfg), base_url="http://127.0.0.1:8025") as client:
+        assert client.get("/ask").status_code == 200
+
+
+def test_socketpair_window_does_not_open_other_loopback_ports(monkeypatch):
+    attempted = {}
+
+    def pair_that_also_dials_lm_studio(*args, **kwargs):
+        pair = _windows_style_socketpair()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.connect(("127.0.0.1", 1234))
+            except conftest.IsolationViolation:
+                attempted["refused"] = True
+        return pair
+
+    monkeypatch.setattr(conftest, "_real_socketpair", pair_that_also_dials_lm_studio)
+    a, b = socket.socketpair()
+    a.close()
+    b.close()
+    assert attempted == {"refused": True}
+
+
+def test_in_process_listener_outside_socketpair_is_refused():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            with pytest.raises(conftest.IsolationViolation):
+                client.connect(("127.0.0.1", port))
+
+
+def test_socketpair_listener_is_forgotten_after_the_call(windows_socketpair, monkeypatch):
+    endpoints = []
+    real_listen = conftest._real_socket_listen
+
+    def recording_listen(self, *args):
+        result = real_listen(self, *args)
+        endpoints.append(self.getsockname()[:2])
+        return result
+
+    monkeypatch.setattr(conftest, "_real_socket_listen", recording_listen)
+    a, b = socket.socketpair()
+    a.close()
+    b.close()
+    assert len(endpoints) == 1
+    assert conftest._socketpair_state.listeners is None
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with pytest.raises(conftest.IsolationViolation):
+            sock.connect(endpoints[0])
+
+
+def test_other_thread_cannot_use_socketpair_window(monkeypatch):
+    import threading
+
+    endpoint = {}
+    listening = threading.Event()
+    release = threading.Event()
+
+    def slow_pair(*args, **kwargs):
+        lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            lsock.bind(("127.0.0.1", 0))
+            lsock.listen()
+            endpoint["value"] = lsock.getsockname()[:2]
+            listening.set()
+            release.wait(5)
+            csock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            csock.connect(endpoint["value"])
+            ssock, _ = lsock.accept()
+        finally:
+            lsock.close()
+        return ssock, csock
+
+    monkeypatch.setattr(conftest, "_real_socketpair", slow_pair)
+    outcome = {}
+
+    def run_pair():
+        a, b = socket.socketpair()
+        outcome["paired"] = True
+        a.close()
+        b.close()
+
+    worker = threading.Thread(target=run_pair)
+    worker.start()
+    assert listening.wait(5)
+    try:
+        # The listener is live and registered for the worker thread only.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            with pytest.raises(conftest.IsolationViolation):
+                sock.connect(endpoint["value"])
+    finally:
+        release.set()
+        worker.join(5)
+    assert outcome == {"paired": True}

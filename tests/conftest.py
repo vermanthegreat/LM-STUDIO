@@ -10,8 +10,10 @@ network service. This module runs before any test module is imported, so it:
 2. Refuses ``sqlite3`` connections to the default repository ``leads.db`` and to
    any ``DATABASE_PATH`` configured in the invoking shell. Default function
    arguments bound to ``db.DB_PATH`` are therefore caught at connect time.
-3. Refuses outbound INET/INET6 socket connections. The only exception is the
-   host/port of an explicitly supplied disposable ``TEST_DATABASE_URL``.
+3. Refuses outbound INET/INET6 socket connections. The exceptions are the
+   host/port of an explicitly supplied disposable ``TEST_DATABASE_URL`` and the
+   loopback connect inside ``socket.socketpair()``'s Windows emulation, to the
+   listener that same call created (asyncio's event-loop self-pipe).
 
 ``TEST_DATABASE_URL`` is honoured only when it is set in the invoking process
 environment (never from ``.env``) and names a database whose name contains
@@ -24,6 +26,7 @@ import os
 import socket
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -137,8 +140,54 @@ def _endpoint_allowed(address: object) -> bool:
     return False
 
 
+# --- socket.socketpair() emulation (Windows) ---------------------------------
+# Windows has no AF_UNIX socketpair, so CPython's socket.socketpair() binds a
+# listener on 127.0.0.1:0, listen()s, then connect()s a second socket to it.
+# asyncio uses socketpair() for every event loop's self-pipe
+# (selector_events/proactor_events), so TestClient's AnyIO portal hits this path.
+# The only loopback connect allowed is: on the same thread, while
+# socket.socketpair() is running, to a listener that this socketpair() call
+# itself created. Any other localhost or remote endpoint stays refused.
+_socketpair_state = threading.local()
+_real_socketpair = socket.socketpair
+_real_socket_listen = socket.socket.listen
+
+
+def _guarded_socketpair(*args, **kwargs):
+    if getattr(_socketpair_state, "listeners", None) is not None:
+        raise IsolationViolation("Nested socket.socketpair() is not expected in tests.")
+    _socketpair_state.listeners = set()
+    try:
+        return _real_socketpair(*args, **kwargs)
+    finally:
+        _socketpair_state.listeners = None
+
+
+def _guarded_listen(self, *args):
+    result = _real_socket_listen(self, *args)
+    listeners = getattr(_socketpair_state, "listeners", None)
+    if listeners is not None and self.family in (socket.AF_INET, socket.AF_INET6):
+        host, port = self.getsockname()[:2]
+        if host in _LOOPBACK_ALIASES:
+            listeners.add((host, port))
+    return result
+
+
+def _socketpair_endpoint(address: object) -> bool:
+    listeners = getattr(_socketpair_state, "listeners", None)
+    if not listeners or not isinstance(address, tuple) or len(address) < 2:
+        return False
+    return (str(address[0]), int(address[1])) in listeners
+
+
+socket.socketpair = _guarded_socketpair
+socket.socket.listen = _guarded_listen
+
+
 def _check_socket(sock: socket.socket, address: object) -> None:
-    if sock.family in (socket.AF_INET, socket.AF_INET6) and not _endpoint_allowed(address):
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return
+    if not _endpoint_allowed(address) and not _socketpair_endpoint(address):
         raise IsolationViolation(
             f"Test attempted a network connection to {address!r}. "
             "Use a fake provider or transport instead."
