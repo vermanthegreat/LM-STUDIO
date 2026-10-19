@@ -20,7 +20,14 @@ History: the first run at `5a5054c` failed P1 (`clarify`, 152 641 ms). Triage cl
 test-contract defect (ambiguous wording), and the operator approved a correction (`d00c2c6`):
 stricter P1 arguments, no planner change. The Windows TestClient isolation fix is `414e104`.
 
-Not supplied in the cloud report (kept in the local evidence folder): per-scenario `elapsed_ms`,
-reasoning-probe figures and command ids. The planner is certified **only** for the configuration
+Local record `C:\gate1\run-78b0cdf-20261019\gate1-final-record.json` (confirmed 2026-10-19):
+P1 3625 ms, P2 3264 ms, P3 3375 ms, U1 3171 ms (all well under the 180 s limit). The ask page shows
+`Local planner: ok` with the 180 s limit. The copy database changed during the run (expected:
+startup init and command-log rows); the live database hash did not change.
+
+**Omitted-reasoning run (`LMSTUDIO_PLANNER_REASONING_EFFORT=omit`): P2 FAILED.** That configuration
+is **not certified**. `reasoning_effort=none` is a required part of the certified configuration and
+must not be removed or defaulted away. The P1 152 s outlier at `5a5054c` is consistent with this:
+latency and selection depend on the reasoning setting. The planner is certified **only** for the configuration
 above. T04 code is frozen. Later changes to `ask_router.py`, the registry, `command_service.py` or
 `llm*.py` (including T06's merge) require focused Gate 1 re-verification under T08.

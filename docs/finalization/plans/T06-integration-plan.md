@@ -20,14 +20,20 @@ merge was run in a scratch worktree to measure conflicts; nothing from it was co
 3. `AGENTS.md` pointer text (`evidence/T03-completion-spec.md`), applied or approved by HUMAN:
    **outstanding**.
 4. Refs unchanged from the table above at execution time. If any has moved, stop and re-plan.
-5. Integration branch decision (HUMAN): see "Branch" below.
+5. Integration branch decision (HUMAN): **decided 2026-10-19:** `claude/vigilant-franklin-wb2rsk`;
+   no `codex/finalization-integration` branch unless HUMAN says so; nothing to `main` before Gate 2.
+6. Only committed refs are merged. The uncommitted local planner edits in the operator's
+   contact-branch checkout (`llm.py`, `services/llm_planner.py`, `tests/test_ask_llm_planner.py`,
+   i.e. the preserved patch) are **excluded** from T06. Their reviewed form is already in T04.
 
 ## Branch
 
 Backlog B/D name a separate `codex/finalization-integration` branch. This session may push only to
 `claude/vigilant-franklin-wb2rsk`, which is already isolated from `main` and carries the certified
-T02–T05 commits. **Recommended:** perform T06 on this branch, so the merge commit's first parent is
-`78b0cdf`. A separate branch needs explicit permission to create and push it. `main` is not touched;
+T02–T05 commits. **Decided:** perform T06 on this branch. The merge commit's first parent will be the branch tip,
+a docs-only descendant of `78b0cdf` (currently `257b77c` or later). Verify before merging with
+`git diff --stat 78b0cdf HEAD -- . ':(exclude)docs'` (must be empty), so the code side is exactly
+the certified `78b0cdf`. A separate branch needs explicit permission to create and push it. `main` is not touched;
 promotion waits for Gate 2 (T08).
 
 ## Procedure
